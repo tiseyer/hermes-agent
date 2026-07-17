@@ -122,7 +122,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "review"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4916,7 +4916,7 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, tenant FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -4964,6 +4964,66 @@ def block_task(
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
             routed_to = "todo"
+            _blocked_task = get_task(conn, task_id)
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_blocked",
+                task_id,
+                board=get_current_board(),
+                assignee=_blocked_task.assignee if _blocked_task else None,
+                run_id=run_id,
+                reason=reason,
+            )
+            return True
+
+        # Review blocks route to the review column instead of ``blocked``.
+        # The reviewer profile is resolved from the task's tenant (project):
+        # goya → goya-reviewer, voicera → voicera-reviewer.
+        # Unknown tenants fall back to the generic "reviewer" profile.
+        # TODO: unknown-tenant fallback silently hangs the card in review if
+        # no "reviewer" profile exists. Better: route to blocked with an
+        # explicit "no reviewer configured for tenant X" message so the
+        # operator sees it instead of the card silently sitting in review.
+        if kind == "review":
+            task_tenant = cur_row["tenant"] if "tenant" in cur_row.keys() else None
+            _reviewer_map = {
+                "goya": "goya-reviewer",
+                "voicera": "voicera-reviewer",
+            }
+            reviewer = _reviewer_map.get(task_tenant, "reviewer")
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       assignee      = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (reviewer, kind, task_id) if expected_run_id is None
+                else (reviewer, kind, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="blocked", status="blocked",
+                error=f"review requested → {reviewer}",
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="blocked",
+                    summary=f"review requested → {reviewer}",
+                )
+            _append_event(
+                conn, task_id, "blocked",
+                {"reason": reason, "kind": kind,
+                 "reviewer": reviewer, "tenant": task_tenant},
+                run_id=run_id,
+            )
+            routed_to = "review"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
