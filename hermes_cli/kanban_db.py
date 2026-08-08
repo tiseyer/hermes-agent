@@ -6486,7 +6486,18 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    New branches are rooted on the freshest reachable remote base (upstream
+    tracking ref, else the remote's default branch, else local ``HEAD`` when
+    offline/no-remote) via the shared ``hermes_cli.worktree_base`` resolver —
+    the same contract ``cli.py``'s ``hermes -w`` bootstrap uses. Without
+    this, a dispatcher running from a standalone clone whose local ``HEAD``
+    lags ``origin/main`` would silently root every new task branch on that
+    stale base (see task t_c3e3ed9c). An EXISTING branch is always attached
+    as-is — never rebased or re-based here — so branch-attach semantics for
+    resumed/decompose-child tasks are unaffected by this change.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -6494,12 +6505,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+    base_ref = "HEAD"
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        from hermes_cli.worktree_base import resolve_worktree_base
+        base_ref, _label = resolve_worktree_base(str(repo_root))
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -6508,6 +6522,22 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         timeout=60,
         check=False,
     )
+    if result.returncode != 0 and base_ref != "HEAD":
+        # Branching from the resolved remote ref failed for any reason (e.g.
+        # a partial fetch left the ref unusable) — retry from local HEAD so
+        # worktree creation never hard-fails purely on a sync hiccup. Mirrors
+        # cli.py's _setup_worktree retry-on-remote-base-failure behavior.
+        fallback_cmd = [
+            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
+            str(target), "HEAD",
+        ]
+        result = subprocess.run(
+            fallback_cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
