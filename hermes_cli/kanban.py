@@ -80,6 +80,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "parent_id": t.parent_id,
+        "initiative_id": t.initiative_id,
     }
 
 

@@ -2678,22 +2678,31 @@ def create_task(
                 hier_initiative = (str(initiative_id).strip() or None) if initiative_id else None
                 if hier_parent:
                     prow = conn.execute(
-                        "SELECT id, initiative_id FROM tasks WHERE id = ?",
+                        "SELECT id, initiative_id, tenant FROM tasks WHERE id = ?",
                         (hier_parent,),
                     ).fetchone()
                     if prow is None:
                         raise ValueError(f"unknown hierarchy parent task: {hier_parent}")
                     if hier_initiative is None:
                         hier_initiative = prow["initiative_id"] or prow["id"]
+                    if tenant is None:
+                        # Members inherit the family's tenant so tenant-filtered
+                        # boards (and the drill-down) keep the whole initiative
+                        # together instead of dropping untagged member cards.
+                        tenant = prow["tenant"]
                 if hier_initiative:
-                    if conn.execute(
-                        "SELECT 1 FROM tasks WHERE id = ?", (hier_initiative,)
-                    ).fetchone() is None:
+                    irow = conn.execute(
+                        "SELECT id, tenant FROM tasks WHERE id = ?",
+                        (hier_initiative,),
+                    ).fetchone()
+                    if irow is None:
                         raise ValueError(f"unknown initiative task: {hier_initiative}")
                     if hier_parent is None:
                         # Membership without an explicit parent card: hang the
                         # card directly under the initiative root.
                         hier_parent = hier_initiative
+                    if tenant is None:
+                        tenant = irow["tenant"]
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -10159,7 +10168,11 @@ def initiative_rollups(
     where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
     params: list = []
     if tenant:
-        where += " AND tenant = ?"
+        # Filter over the ROOT card's tenant: the initiative belongs to its
+        # root, and legacy member rows may predate tenant inheritance.
+        where += (
+            " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
+        )
         params.append(tenant)
     rows = conn.execute(
         f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
