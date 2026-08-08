@@ -195,6 +195,48 @@
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
 
+  // ---- Focus mode / initiative helpers ------------------------------------
+  // Deterministic family marker color per initiative id. A supplementary
+  // signal only — grouping is always ALSO visible via header, breadcrumb
+  // and titles (accessibility), never via color alone.
+  function initiativeColor(id) {
+    if (!id) return null;
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) {
+      hash = ((hash << 5) - hash + id.charCodeAt(i)) | 0;
+    }
+    const hue = ((hash % 360) + 360) % 360;
+    return `hsl(${hue}, 62%, 52%)`;
+  }
+
+  const VALID_VIEWS = { focus: true, drilldown: true, all: true };
+
+  function readViewFromUrl() {
+    try {
+      const qs = new URLSearchParams(window.location.search);
+      let view = qs.get("view") || "focus";
+      if (!VALID_VIEWS[view]) view = "focus";
+      let initiative = qs.get("initiative") || null;
+      if (view === "drilldown" && !initiative) view = "focus";
+      return { view, initiative };
+    } catch (_e) {
+      return { view: "focus", initiative: null };
+    }
+  }
+
+  function writeViewToUrl(view, initiative) {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("view", view);
+      if (view === "drilldown" && initiative) {
+        url.searchParams.set("initiative", initiative);
+      } else {
+        url.searchParams.delete("initiative");
+      }
+      window.history.replaceState(null, "", url.toString());
+    } catch (_e) { /* URL sync is best-effort */ }
+  }
+
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
   // path changes are a single edit.
@@ -530,6 +572,12 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
+    // --- focus / drill-down view state (URL-bookmarkable) ------------------
+    const initialView = useMemo(readViewFromUrl, []);
+    const [view, setView] = useState(initialView.view);
+    const [drillInitiative, setDrillInitiative] = useState(initialView.initiative);
+    useEffect(function () { writeViewToUrl(view, drillInitiative); }, [view, drillInitiative]);
+
     const [selectedTaskId, setSelectedTaskId] = useState(null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
@@ -569,6 +617,8 @@
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
+      qs.set("view", view);
+      if (view === "drilldown" && drillInitiative) qs.set("initiative", drillInitiative);
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
@@ -580,7 +630,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+    }, [tenantFilter, includeArchived, board, view, drillInitiative]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -797,6 +847,12 @@
     }, [selectedIds, loadBoard, board]);
 
     const createTask = useCallback(function (body) {
+      // Cards created while drilled into an initiative join that
+      // initiative automatically — otherwise they would be invisible in
+      // the very view they were created from.
+      if (view === "drilldown" && drillInitiative && !body.initiative_id && !body.parent_task_id) {
+        body = Object.assign({}, body, { initiative_id: drillInitiative });
+      }
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -813,7 +869,7 @@
         loadBoardList();  // refresh counts in the switcher
         return res;
       });
-    }, [loadBoard, loadBoardList, board, t]);
+    }, [loadBoard, loadBoardList, board, t, view, drillInitiative]);
 
     const toggleSelected = useCallback(function (id, additive) {
       setSelectedIds(function (prev) {
@@ -1007,6 +1063,23 @@
       }).catch(function (e) { setError(String(e.message || e)); });
     }, [selectedIds, board, loadBoard, t]);
 
+    // --- focus / drill-down navigation --------------------------------------
+    const openDrilldown = useCallback(function (rootId) {
+      if (!rootId) return;
+      setSelectedTaskId(null);      // close the drawer; the board becomes the Ablauf view
+      setDrillInitiative(rootId);
+      setView("drilldown");
+    }, []);
+    const backToFocus = useCallback(function () {
+      setView("focus");
+      setDrillInitiative(null);
+    }, []);
+    const switchView = useCallback(function (nextView) {
+      if (nextView === "drilldown") return;    // only reachable via a card's Ablauf button
+      setView(nextView);
+      if (nextView !== "drilldown") setDrillInitiative(null);
+    }, []);
+
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
       return h("div", { className: "p-8 text-sm text-muted-foreground" },
@@ -1028,7 +1101,7 @@
     const renderMd = !config || config.render_markdown !== false;
 
     return h(ErrorBoundary, null,
-      h("div", { className: "hermes-kanban flex flex-col gap-4" },
+      h("div", { className: cn("hermes-kanban flex flex-col gap-4", "hermes-kanban--view-" + view) },
         h(BoardSwitcher, {
           board: board,
           boardList: boardList,
@@ -1043,6 +1116,19 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
+        h(ViewTabs, { view: view, onSwitch: switchView }),
+        view === "drilldown" ? h("div", { className: "hermes-kanban-breadcrumb-row" },
+          h("button", {
+            className: "hermes-kanban-breadcrumb",
+            onClick: backToFocus,
+          }, tx(t, "focus.backToAll", "← Alle Hauptaufgaben")),
+        ) : null,
+        view === "drilldown" && boardData.initiative_root
+          ? h(InitiativeHeader, {
+              root: boardData.initiative_root,
+              onOpen: setSelectedTaskId,
+            })
+          : null,
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1094,6 +1180,7 @@
           boardSlug: board,
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
+          onOpenDrilldown: openDrilldown,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
@@ -1101,6 +1188,109 @@
           eventTick: taskEventTick[selectedTaskId] || 0,
         }) : null,
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Focus mode building blocks: view switcher, rollup widgets, drill-down
+  // header. The rollup data comes from the server (task.initiative /
+  // board.initiative_root) and is computed purely from the task hierarchy —
+  // depends_on links never feed these widgets.
+  // -------------------------------------------------------------------------
+
+  function ViewTabs(props) {
+    const { t } = useI18n();
+    const tabs = [
+      { key: "focus", label: tx(t, "focus.tabFocus", "Fokus") },
+      { key: "all", label: tx(t, "focus.tabAll", "Alle Karten") },
+    ];
+    if (props.view === "drilldown") {
+      tabs.splice(1, 0, { key: "drilldown", label: tx(t, "focus.tabFlow", "Ablauf") });
+    }
+    return h("div", { className: "hermes-kanban-view-tabs", role: "tablist" },
+      tabs.map(function (tab) {
+        return h("button", {
+          key: tab.key,
+          role: "tab",
+          "aria-selected": props.view === tab.key,
+          className: cn(
+            "hermes-kanban-view-tab",
+            props.view === tab.key ? "hermes-kanban-view-tab--active" : "",
+          ),
+          onClick: function () { props.onSwitch(tab.key); },
+          disabled: tab.key === "drilldown",
+        }, tab.label);
+      }),
+    );
+  }
+
+  function ProgressBar(props) {
+    const total = props.total || 0;
+    const done = props.done || 0;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    return h("div", {
+      className: "hermes-kanban-progressbar",
+      role: "progressbar",
+      "aria-valuemin": 0, "aria-valuemax": total, "aria-valuenow": done,
+      title: `${done}/${total}`,
+    },
+      h("div", { className: "hermes-kanban-progressbar-fill", style: { width: pct + "%" } }),
+    );
+  }
+
+  function RollupCounters(props) {
+    const { t } = useI18n();
+    const r = props.rollup;
+    if (!r) return null;
+    const parts = [];
+    if (r.running > 0) {
+      parts.push(h("span", { key: "run", className: "hermes-kanban-roll hermes-kanban-roll--running" },
+        "● ", r.running, " ", tx(t, "focus.running", "läuft")));
+    }
+    if (r.waiting > 0) {
+      parts.push(h("span", { key: "wait", className: "hermes-kanban-roll hermes-kanban-roll--waiting" },
+        "◌ ", r.waiting, " ", tx(t, "focus.waiting", r.waiting === 1 ? "wartet" : "warten")));
+    }
+    if (r.review > 0) {
+      parts.push(h("span", { key: "rev", className: "hermes-kanban-roll hermes-kanban-roll--review" },
+        "◔ ", r.review, " Review"));
+    }
+    if (r.blocked > 0) {
+      parts.push(h("span", { key: "blk", className: "hermes-kanban-roll hermes-kanban-roll--blocked" },
+        "✗ ", r.blocked, " ", tx(t, "focus.blocked", "blockiert")));
+    }
+    if (r.needs_go > 0) {
+      parts.push(h("span", { key: "go", className: "hermes-kanban-roll hermes-kanban-roll--go" },
+        "! ", r.needs_go, " ", tx(t, "focus.needsGo", "braucht GO")));
+    }
+    if (parts.length === 0) return null;
+    return h("div", { className: "hermes-kanban-roll-row" }, parts);
+  }
+
+  function InitiativeHeader(props) {
+    const { t } = useI18n();
+    const task = props.root && props.root.task;
+    const rollup = props.root && props.root.rollup;
+    if (!task) return null;
+    const marker = initiativeColor(task.id);
+    return h("div", {
+      className: "hermes-kanban-initiative-header",
+      style: marker ? { borderLeft: `4px solid ${marker}` } : null,
+      onClick: function () { props.onOpen(task.id); },
+      role: "button",
+      tabIndex: 0,
+      onKeyDown: function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); props.onOpen(task.id); }
+      },
+    },
+      h("div", { className: "hermes-kanban-initiative-header-title" }, task.title),
+      h("div", { className: "hermes-kanban-initiative-header-meta" },
+        task.tenant ? h(Badge, { variant: "outline", className: "hermes-kanban-tag" }, task.tenant) : null,
+        rollup ? h("span", { className: "hermes-kanban-initiative-progress-label" },
+          `${rollup.done}/${rollup.total} ${tx(t, "focus.done", "erledigt")}`) : null,
+      ),
+      rollup ? h(ProgressBar, { done: rollup.done, total: rollup.total }) : null,
+      rollup ? h(RollupCounters, { rollup: rollup }) : null,
     );
   }
 
@@ -2656,17 +2846,25 @@
 
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
+    // Initiative rollup (focus mode): present on initiative-root cards.
+    // Family marker: roots use their own id, members their initiative's id,
+    // so the whole family shares one color marker across views.
+    const rollup = t.initiative;
+    const familyId = rollup ? t.id : t.initiative_id;
+    const marker = initiativeColor(familyId);
 
     return h("div", {
       ref: cardRef,
       "data-task-id": t.id,
       className: cn(
         "hermes-kanban-card",
+        rollup ? "hermes-kanban-card--initiative" : "",
         props.selected ? "hermes-kanban-card--selected" : "",
         props.failed ? "hermes-kanban-card--failed" : "",
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
+      style: marker ? { borderLeft: `4px solid ${marker}`, borderRadius: "var(--radius)" } : null,
       draggable: true,
       tabIndex: 0,
       role: "button",
@@ -2735,6 +2933,25 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          rollup ? h("div", { className: "hermes-kanban-card-rollup" },
+            h("div", { className: "hermes-kanban-card-rollup-progress" },
+              h(ProgressBar, { done: rollup.done, total: rollup.total }),
+              h("span", { className: "hermes-kanban-initiative-progress-label" },
+                `${rollup.done}/${rollup.total} ${tx(i18n, "focus.done", "erledigt")}`),
+            ),
+            h(RollupCounters, { rollup: rollup }),
+            rollup.active && rollup.active.length > 0
+              ? h("div", { className: "hermes-kanban-card-active-step",
+                           title: rollup.active.map(function (a) { return a.title; }).join(", ") },
+                  tx(i18n, "focus.current", "Aktuell:"), " ",
+                  rollup.active[0].title,
+                  rollup.active[0].assignee ? ` (${rollup.active[0].assignee})` : "")
+              : null,
+            rollup.needs_go > 0 && rollup.go_titles && rollup.go_titles.length > 0
+              ? h("div", { className: "hermes-kanban-card-go-step" },
+                  tx(i18n, "focus.goNeeded", "GO nötig:"), " ", rollup.go_titles[0])
+              : null,
+          ) : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3227,6 +3444,7 @@
             props.onClose();
             if (props.onOpenTask) props.onOpenTask(taskId);
           },
+          onOpenDrilldown: props.onOpenDrilldown,
         }) : null,
         data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
           h(Input, {
@@ -3356,6 +3574,81 @@
     );
   }
 
+  // ---- Drawer section "Ablauf" --------------------------------------------
+  // Compact list of an initiative's member steps, rendered ABOVE result/
+  // runs/comments. Clicking a row opens that child's detail view; the
+  // button below switches the board into the drill-down (Ablauf) view.
+  function flowStepIcon(step) {
+    if (step.needs_go) return { icon: "!", cls: "go" };
+    if (step.status === "done") return { icon: "●", cls: "done" };
+    if (step.status === "running") return { icon: "◷", cls: "running" };
+    if (step.status === "blocked") return { icon: "✗", cls: "blocked" };
+    if (step.status === "review") return { icon: "◔", cls: "review" };
+    return { icon: "◌", cls: "waiting" };
+  }
+
+  function flowStepStatusText(step, i18n) {
+    if (step.needs_go) return tx(i18n, "focus.needsGo", "braucht GO");
+    if (step.waiting_on && step.waiting_on.length > 0) {
+      return tx(i18n, "focus.waitingOn", "wartet auf") + " " + step.waiting_on.join(", ");
+    }
+    const map = {
+      done: tx(i18n, "focus.stepDone", "erledigt"),
+      running: tx(i18n, "focus.running", "läuft"),
+      review: "Review",
+      blocked: tx(i18n, "focus.blocked", "blockiert"),
+      ready: tx(i18n, "focus.stepReady", "bereit"),
+    };
+    return map[step.status] || tx(i18n, "focus.stepWaiting", "wartet");
+  }
+
+  function FlowSection(props) {
+    const { t: i18n } = useI18n();
+    const flow = props.flow;
+    if (!flow || !flow.steps || flow.steps.length === 0) return null;
+    return h("div", { className: "hermes-kanban-flow" },
+      h("div", { className: "hermes-kanban-flow-head" },
+        h("span", { className: "hermes-kanban-flow-title" },
+          tx(i18n, "focus.flow", "Ablauf"), " · ",
+          `${flow.progress.done}/${flow.progress.total} ${tx(i18n, "focus.done", "erledigt")}`),
+      ),
+      h("div", { className: "hermes-kanban-flow-steps" },
+        flow.steps.map(function (step) {
+          const ic = flowStepIcon(step);
+          return h("div", {
+            key: step.id,
+            className: "hermes-kanban-flow-step",
+            role: "button",
+            tabIndex: 0,
+            onClick: function () { if (props.onOpenTask) props.onOpenTask(step.id); },
+            onKeyDown: function (e) {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                if (props.onOpenTask) props.onOpenTask(step.id);
+              }
+            },
+          },
+            h("span", { className: cn("hermes-kanban-flow-icon", "hermes-kanban-flow-icon--" + ic.cls) }, ic.icon),
+            h("span", { className: "hermes-kanban-flow-step-title" }, step.title),
+            step.needs_go
+              ? h(Badge, { className: "hermes-kanban-flow-go-badge" }, "GO")
+              : null,
+            h("span", { className: "hermes-kanban-flow-step-status" },
+              flowStepStatusText(step, i18n),
+              step.assignee && step.status === "running" ? ` (${step.assignee})` : ""),
+          );
+        }),
+      ),
+      props.onOpenDrilldown
+        ? h(Button, {
+            variant: "outline",
+            className: "hermes-kanban-flow-open-board",
+            onClick: function () { props.onOpenDrilldown(flow.root.id); },
+          }, tx(i18n, "focus.openOnBoard", "Ablauf auf Board öffnen"))
+        : null,
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -3382,6 +3675,11 @@
               onClick: function () { props.setEditing(true); },
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
+      h(FlowSection, {
+        flow: props.data.flow,
+        onOpenTask: props.onOpenTask,
+        onOpenDrilldown: props.onOpenDrilldown,
+      }),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),

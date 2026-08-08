@@ -1590,3 +1590,257 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ======================================================================
+   Focus mode / initiatives (Fokusmodus, Drill-down, Ablauf)
+   ====================================================================== */
+
+/* ---- View switcher tabs ---------------------------------------------- */
+
+.hermes-kanban-view-tabs {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-self: flex-start;
+  background: color-mix(in srgb, var(--color-card) 85%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.2rem;
+}
+
+.hermes-kanban-view-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.3rem 0.75rem;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+}
+
+.hermes-kanban-view-tab--active {
+  background: var(--color-accent, color-mix(in srgb, var(--color-ring) 15%, transparent));
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-view-tab:disabled { cursor: default; }
+
+/* ---- Breadcrumb / back navigation ------------------------------------ */
+
+.hermes-kanban-breadcrumb-row { display: flex; }
+
+.hermes-kanban-breadcrumb {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 0.15rem 0.25rem;
+  cursor: pointer;
+}
+.hermes-kanban-breadcrumb:hover { color: var(--color-foreground); }
+
+/* ---- Drill-down initiative header ------------------------------------ */
+
+.hermes-kanban-initiative-header {
+  background: color-mix(in srgb, var(--color-card) 92%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  cursor: pointer;
+}
+.hermes-kanban-initiative-header:hover {
+  box-shadow: 0 0 0 1px var(--color-ring) inset;
+}
+
+.hermes-kanban-initiative-header-title {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.hermes-kanban-initiative-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-initiative-progress-label {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- Progress bar ------------------------------------------------------ */
+
+.hermes-kanban-progressbar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-muted-foreground) 20%, transparent);
+  overflow: hidden;
+  min-width: 60px;
+}
+
+.hermes-kanban-progressbar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--color-ring);
+  transition: width 200ms ease;
+}
+
+/* ---- Rollup counter row ------------------------------------------------ */
+
+.hermes-kanban-roll-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  font-size: 0.75rem;
+}
+
+.hermes-kanban-roll { white-space: nowrap; color: var(--color-muted-foreground); }
+.hermes-kanban-roll--running { color: var(--color-chart-2, #2f9e6e); }
+.hermes-kanban-roll--blocked,
+.hermes-kanban-roll--go { color: var(--color-destructive, #d14a4a); font-weight: 600; }
+.hermes-kanban-roll--review { color: var(--color-chart-4, #b58a2f); }
+
+/* ---- Initiative root cards in focus view -------------------------------- */
+
+.hermes-kanban-card--initiative .hermes-kanban-card-title {
+  font-size: 0.92rem;
+  font-weight: 650;
+}
+
+.hermes-kanban-card-rollup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.hermes-kanban-card-rollup-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hermes-kanban-card-active-step,
+.hermes-kanban-card-go-step {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hermes-kanban-card-go-step { color: var(--color-destructive, #d14a4a); }
+
+/* ---- Compact member cards in drill-down --------------------------------- */
+
+.hermes-kanban--view-drilldown .hermes-kanban-card-content { padding: 0.35rem 0.5rem !important; gap: 0.2rem; }
+.hermes-kanban--view-drilldown .hermes-kanban-card-title { font-size: 0.8rem; }
+.hermes-kanban--view-drilldown .hermes-kanban-card-meta { font-size: 0.7rem; }
+
+/* ---- Drawer "Ablauf" section --------------------------------------------- */
+
+.hermes-kanban-flow {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  background: color-mix(in srgb, var(--color-card) 92%, transparent);
+}
+
+.hermes-kanban-flow-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-flow-steps {
+  display: flex;
+  flex-direction: column;
+}
+
+.hermes-kanban-flow-step {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.25rem 0.25rem;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+.hermes-kanban-flow-step:hover { background: color-mix(in srgb, var(--color-ring) 8%, transparent); }
+
+.hermes-kanban-flow-icon { width: 1rem; text-align: center; flex: 0 0 auto; }
+.hermes-kanban-flow-icon--done { color: var(--color-chart-2, #2f9e6e); }
+.hermes-kanban-flow-icon--running { color: var(--color-ring); }
+.hermes-kanban-flow-icon--blocked,
+.hermes-kanban-flow-icon--go { color: var(--color-destructive, #d14a4a); font-weight: 700; }
+.hermes-kanban-flow-icon--review { color: var(--color-chart-4, #b58a2f); }
+.hermes-kanban-flow-icon--waiting { color: var(--color-muted-foreground); }
+
+.hermes-kanban-flow-step-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-kanban-flow-step-status {
+  flex: 0 1 auto;
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+
+.hermes-kanban-flow-go-badge {
+  background: var(--color-destructive, #d14a4a) !important;
+  color: #fff !important;
+  font-size: 0.62rem !important;
+}
+
+.hermes-kanban-flow-open-board { align-self: flex-start; margin-top: 0.2rem; }
+
+/* ---- Mobile (375px): focus cards stack, drill-down scrolls --------------- */
+
+@media (max-width: 480px) {
+  /* Focus view: single stacked lane — Hauptaufgaben-Karten untereinander,
+     Spalten in voller Breite. Leere Spalten einklappen. */
+  .hermes-kanban--view-focus .hermes-kanban-columns {
+    flex-direction: column;
+    overflow-x: visible;
+  }
+  .hermes-kanban--view-focus .hermes-kanban-column {
+    flex: 1 1 auto;
+    width: 100%;
+    max-height: none;
+    min-height: 0;
+  }
+  .hermes-kanban--view-focus .hermes-kanban-column:not(:has(.hermes-kanban-card)) {
+    display: none;
+  }
+  /* Drill-down + Alle Karten behalten den horizontalen Spalten-Scroll,
+     nur schmalere Spalten, damit die Nachbarspalte anreißt. */
+  .hermes-kanban--view-drilldown .hermes-kanban-column,
+  .hermes-kanban--view-all .hermes-kanban-column {
+    flex: 0 0 240px;
+  }
+  .hermes-kanban-view-tabs { align-self: stretch; }
+  .hermes-kanban-view-tab { flex: 1; }
+}

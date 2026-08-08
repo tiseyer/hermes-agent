@@ -915,6 +915,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Task hierarchy (human structuring, orthogonal to task_links):
+    # ``parent_id`` = direct parent card, ``initiative_id`` = root
+    # initiative across arbitrarily deep chains. Both None for
+    # top-level / standalone cards.
+    parent_id: Optional[str] = None
+    initiative_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1004,14 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            parent_id=(
+                row["parent_id"] if "parent_id" in keys and row["parent_id"] else None
+            ),
+            initiative_id=(
+                row["initiative_id"]
+                if "initiative_id" in keys and row["initiative_id"]
+                else None
             ),
         )
 
@@ -1179,7 +1193,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Task HIERARCHY (human structuring): the direct parent card of this
+    -- card. Orthogonal to ``task_links`` (machine scheduling/ordering) —
+    -- hierarchy is NEVER derived from dependency edges and vice versa.
+    -- NULL = this card is itself a top-level card (Hauptaufgabe).
+    parent_id            TEXT,
+    -- Root initiative of this card, stable across arbitrarily deep
+    -- parent chains (a grandchild carries the same initiative_id as its
+    -- parent). NULL = this card IS an initiative root / standalone card.
+    initiative_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1995,6 +2018,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "parent_id" not in cols:
+        # Task hierarchy (human structuring): direct parent card. Orthogonal
+        # to task_links (scheduling). Existing rows get NULL = top-level.
+        _add_column_if_missing(conn, "tasks", "parent_id", "parent_id TEXT")
+
+    if "initiative_id" not in cols:
+        # Root initiative of the card (stable across nesting levels).
+        # NULL = the card is itself an initiative root / standalone card.
+        _add_column_if_missing(
+            conn, "tasks", "initiative_id", "initiative_id TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2008,6 +2043,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_initiative_id ON tasks(initiative_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2417,6 +2458,8 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    parent_task_id: Optional[str] = None,
+    initiative_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2440,6 +2483,14 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``parent_task_id`` / ``initiative_id`` place the card in the task
+    HIERARCHY (human structuring, e.g. a step under a Hauptaufgabe).
+    This is orthogonal to ``parents`` (task_links), which stays purely a
+    scheduling/ordering relation. When only ``parent_task_id`` is given
+    the initiative is derived from the parent (its ``initiative_id``, or
+    the parent itself when the parent is a root). Hierarchy never
+    affects readiness/dispatch — only how boards group and display.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2620,6 +2671,30 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # Resolve HIERARCHY placement (orthogonal to the dependency
+                # ``parents`` above; see docstring). Explicit initiative_id
+                # wins; otherwise derive it from the hierarchy parent.
+                hier_parent = (str(parent_task_id).strip() or None) if parent_task_id else None
+                hier_initiative = (str(initiative_id).strip() or None) if initiative_id else None
+                if hier_parent:
+                    prow = conn.execute(
+                        "SELECT id, initiative_id FROM tasks WHERE id = ?",
+                        (hier_parent,),
+                    ).fetchone()
+                    if prow is None:
+                        raise ValueError(f"unknown hierarchy parent task: {hier_parent}")
+                    if hier_initiative is None:
+                        hier_initiative = prow["initiative_id"] or prow["id"]
+                if hier_initiative:
+                    if conn.execute(
+                        "SELECT 1 FROM tasks WHERE id = ?", (hier_initiative,)
+                    ).fetchone() is None:
+                        raise ValueError(f"unknown initiative task: {hier_initiative}")
+                    if hier_parent is None:
+                        # Membership without an explicit parent card: hang the
+                        # card directly under the initiative root.
+                        hier_parent = hier_initiative
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -2645,8 +2720,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, merge_group, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        parent_id, initiative_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2670,6 +2746,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        hier_parent,
+                        hier_initiative,
                     ),
                 )
                 for pid in parents:
@@ -2689,6 +2767,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "parent_task_id": hier_parent,
+                        "initiative_id": hier_initiative,
                     },
                 )
             return task_id
@@ -5695,8 +5775,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "initiative_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -5710,6 +5790,12 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # Hierarchy: every decomposed child hangs directly under the root
+        # card and inherits the root's initiative (or the root itself when
+        # the root is a top-level Hauptaufgabe). This is what keeps
+        # auto-decomposed machine steps grouped under ONE focus card
+        # instead of flooding the board as peer cards.
+        child_initiative = root_row["initiative_id"] or root_row["id"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5735,8 +5821,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " parent_id, initiative_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5747,6 +5834,8 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    task_id,
+                    child_initiative,
                 ),
             )
             _append_event(
@@ -9994,3 +10083,131 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Initiative / focus-mode aggregation
+# ---------------------------------------------------------------------------
+
+# Statuses that count as "waiting" in an initiative rollup — the child
+# exists but no worker is on it yet.
+_ROLLUP_WAITING_STATUSES = {"triage", "todo", "scheduled", "ready"}
+
+
+def go_gated_task_ids(conn: sqlite3.Connection) -> set[str]:
+    """Ids of tasks that were parked by the GO gate and are still parked.
+
+    The GO gate has no dedicated column — its durable representation is
+    the ``go_gate_held`` event plus ``assignee='till'`` (see
+    ``_dispatch_once_locked``). A card stops counting as GO-gated as
+    soon as it completes or a human re-assigns it.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT e.task_id FROM task_events e "
+        "JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'go_gate_held' AND t.assignee = 'till' "
+        "AND t.status NOT IN ('done', 'archived')"
+    ).fetchall()
+    return {r["task_id"] for r in rows}
+
+
+def initiative_members(conn: sqlite3.Connection, initiative_id: str) -> list[Task]:
+    """All member cards of an initiative (excluding the root itself).
+
+    Membership is defined EXCLUSIVELY by ``tasks.initiative_id`` — never
+    by ``task_links``. Dependency edges between members therefore cannot
+    change what belongs to an initiative.
+    """
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE initiative_id = ? AND id != ? "
+        "ORDER BY created_at ASC, id ASC",
+        (initiative_id, initiative_id),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def initiative_rollups(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+) -> dict[str, dict]:
+    """Aggregate member state per initiative root id.
+
+    Returns ``{root_id: rollup}`` where rollup is::
+
+        {
+            "total": int, "done": int, "running": int, "waiting": int,
+            "review": int, "blocked": int, "needs_go": int, "failed": int,
+            "active": [{"id","title","assignee"}, ...],   # running members
+            "go_titles": [str, ...],                        # GO-parked members
+            "agg_status": "running|blocked|review|done" | None,
+        }
+
+    ``agg_status`` is the initiative's aggregated board status; ``None``
+    means "no signal from members" (caller falls back to the root's own
+    status, e.g. a freshly decomposed initiative that has not started).
+
+    Precedence: a member needing human GO (or hard-blocked) beats
+    running — the focus board is a decision instrument, so the human
+    signal must win. Then running > review > done.
+
+    DECISION: this reads ONLY ``tasks`` (hierarchy columns + status) and
+    the ``go_gate_held`` events. ``task_links`` (depends_on/ordering) is
+    deliberately never consulted — dependencies must not influence the
+    focus view.
+    """
+    where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
+    params: list = []
+    if tenant:
+        where += " AND tenant = ?"
+        params.append(tenant)
+    rows = conn.execute(
+        f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
+        "ORDER BY created_at ASC, id ASC",
+        params,
+    ).fetchall()
+    go_ids = go_gated_task_ids(conn)
+
+    rollups: dict[str, dict] = {}
+    for r in rows:
+        root = r["initiative_id"]
+        if r["id"] == root:
+            continue
+        agg = rollups.setdefault(root, {
+            "total": 0, "done": 0, "running": 0, "waiting": 0,
+            "review": 0, "blocked": 0, "needs_go": 0, "failed": 0,
+            "active": [], "go_titles": [],
+        })
+        status = r["status"]
+        agg["total"] += 1
+        needs_go = r["id"] in go_ids
+        if needs_go:
+            agg["needs_go"] += 1
+            agg["go_titles"].append(r["title"])
+        if status == "done":
+            agg["done"] += 1
+        elif status == "running":
+            agg["running"] += 1
+            agg["active"].append(
+                {"id": r["id"], "title": r["title"], "assignee": r["assignee"]}
+            )
+        elif status == "review":
+            agg["review"] += 1
+        elif status == "blocked":
+            agg["blocked"] += 1
+        elif status in _ROLLUP_WAITING_STATUSES:
+            if not needs_go:
+                agg["waiting"] += 1
+
+    for agg in rollups.values():
+        if agg["needs_go"] > 0 or agg["blocked"] > 0:
+            agg["agg_status"] = "blocked"
+        elif agg["running"] > 0:
+            agg["agg_status"] = "running"
+        elif agg["review"] > 0:
+            agg["agg_status"] = "review"
+        elif agg["total"] > 0 and agg["done"] == agg["total"]:
+            agg["agg_status"] = "done"
+        else:
+            agg["agg_status"] = None
+    return rollups

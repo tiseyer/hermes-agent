@@ -309,7 +309,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
-                          help="Parent task id (repeatable)")
+                          help="DEPENDENCY parent task id (repeatable): this "
+                               "task becomes ready only after all listed "
+                               "tasks are done (task_links / scheduling). "
+                               "For the human task HIERARCHY use "
+                               "--parent-task / --initiative instead.")
+    p_create.add_argument("--parent-task", default=None, dest="parent_task",
+                          metavar="ID",
+                          help="HIERARCHY parent card (Hauptaufgabe/step "
+                               "this card belongs under). Purely structural: "
+                               "groups the card into its initiative for the "
+                               "focus board, never affects scheduling. The "
+                               "initiative is derived from the parent "
+                               "automatically.")
+    p_create.add_argument("--initiative", default=None, dest="initiative",
+                          metavar="ID",
+                          help="Initiative/root card this card belongs to "
+                               "(explicit override; usually derived from "
+                               "--parent-task).")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -1373,6 +1390,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            parent_task_id=getattr(args, "parent_task", None),
+            initiative_id=getattr(args, "initiative", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
