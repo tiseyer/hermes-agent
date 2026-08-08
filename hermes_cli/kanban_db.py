@@ -5293,6 +5293,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    auto_promote: bool = True,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -5309,6 +5310,12 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
+
+    ``auto_promote=False`` skips the trailing ``recompute_ready()`` call, so
+    the task lands and stays in ``todo`` instead of immediately becoming
+    spawnable. Used by the gateway's unattended auto-decompose sweep, which
+    must never hand a freshly-specified task straight to a spawnable state
+    without an orchestrator's explicit promotion.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -5372,7 +5379,10 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    #
+    # Skipped when auto_promote=False — see docstring above.
+    if auto_promote:
+        recompute_ready(conn)
     return True
 
 
@@ -5489,6 +5499,30 @@ def decompose_triage_task(
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
+        #
+        # Guardrail: a writing child (workspace_kind == "worktree") must
+        # NEVER literally share the root's worktree directory/branch —
+        # two workers editing the same git checkout concurrently is a
+        # data-loss and branch-corruption hazard (interleaved commits,
+        # lost writes, a `git status` that lies to whichever worker
+        # reads it last). Resolve the underlying repo root once from the
+        # root's worktree path so every worktree-kind child gets its own
+        # linked worktree + deterministic branch under that same repo,
+        # instead of inheriting the exact checkout dir the way a `dir`
+        # workspace safely can (a shared plain directory has no VCS
+        # concurrency hazard; a shared worktree does).
+        _root_repo_root: Optional[str] = None
+        if root_ws_kind == "worktree" and root_ws_path:
+            try:
+                _common = _git_common_dir(Path(root_ws_path))
+                if _common is not None:
+                    # `--git-common-dir` on a linked worktree resolves to
+                    # <main-repo>/.git; its parent is the main repo root.
+                    _candidate = _common.parent if _common.name == ".git" else _common
+                    if _candidate.is_dir():
+                        _root_repo_root = str(_candidate)
+            except Exception:
+                _root_repo_root = None
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -5500,8 +5534,19 @@ def decompose_triage_task(
             # child can't accidentally point a 'dir' at the root's
             # worktree path or vice versa).
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
+            child_branch_name: Optional[str] = None
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
+            elif child_ws_kind == "worktree" and root_ws_kind == "worktree":
+                # Never hand this child the root's own worktree dir. Anchor
+                # on the same repo (when resolvable) so a fresh linked
+                # worktree + deterministic branch is materialized for it at
+                # dispatch time; if the repo root can't be resolved, fall
+                # back to workspace_path=None so the board's configured
+                # default_workdir anchors it instead — still never the
+                # root's literal checkout.
+                child_ws_path = _root_repo_root
+                child_branch_name = f"kanban/{new_id}"
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
@@ -5509,8 +5554,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5518,6 +5563,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_branch_name,
                     tenant,
                     now,
                     (author or "decomposer"),

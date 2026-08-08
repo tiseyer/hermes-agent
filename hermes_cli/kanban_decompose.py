@@ -273,6 +273,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    auto_promote: Optional[bool] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -280,6 +281,19 @@ def decompose_task(
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+
+    ``auto_promote`` controls whether the resulting children (fan-out
+    case) or the freshly-specified single task (no-fanout case) are
+    immediately promoted out of ``todo`` into ``ready``/spawnable state.
+
+    - ``None`` (default, used by the manual ``hermes kanban decompose``
+      CLI / dashboard action): resolves from
+      ``kanban.auto_promote_children`` in config, same as before.
+    - Explicit ``True``/``False``: overrides config. The gateway's
+      **automatic** triage-sweep path (``_auto_decompose_tick``) always
+      passes ``False`` here — an unattended background sweep must never
+      hand a task straight to a spawnable state; an orchestrator has to
+      explicitly promote it first (``hermes kanban promote`` / dashboard).
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
@@ -294,7 +308,10 @@ def decompose_task(
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+    if auto_promote is None:
+        auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+    else:
+        auto_promote = bool(auto_promote)
     roster, valid_names = _build_roster()
 
     try:
@@ -351,11 +368,18 @@ def decompose_task(
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
         assignee_val = None
+        assignee_was_invalid = False
         if not task.assignee:
+            raw_assignee = parsed.get("assignee")
             assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
+                raw_assignee,
                 default_assignee=default_assignee,
                 valid_names=valid_names,
+            )
+            assignee_was_invalid = (
+                isinstance(raw_assignee, str)
+                and raw_assignee.strip()
+                and raw_assignee.strip() not in valid_names
             )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
@@ -369,11 +393,31 @@ def decompose_task(
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
+                auto_promote=auto_promote,
             )
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        if assignee_was_invalid:
+            # Guardrail: an unknown/invalid assignee must never disappear
+            # into a silent rewrite — the task keeps a durable, visible
+            # trace (comment + event) of what the decomposer actually
+            # picked, so an operator scanning the board sees the routing
+            # decision was NOT what the LLM intended.
+            try:
+                with kb.connect_closing() as conn:
+                    kb.add_comment(
+                        conn, task_id, "auto-decomposer",
+                        f"⚠ decomposer picked unknown assignee {parsed.get('assignee')!r} "
+                        f"— routed to default_assignee {default_assignee!r} instead. "
+                        "Verify the profile roster / description if this profile should exist.",
+                    )
+            except Exception:
+                logger.debug(
+                    "decompose: failed to record invalid-assignee comment for %s",
+                    task_id, exc_info=True,
+                )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -388,6 +432,7 @@ def decompose_task(
     # Rewrite invalid assignees to the default fallback. Never leave a
     # task with assignee=None — the user explicitly does not want that.
     children: list[dict] = []
+    invalid_assignee_by_idx: dict[int, str] = {}
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
             return DecomposeOutcome(
@@ -417,6 +462,7 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
+            invalid_assignee_by_idx[idx] = assignee.strip()
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
@@ -449,6 +495,29 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
+
+    if invalid_assignee_by_idx:
+        # Guardrail: an unknown/invalid assignee must never disappear into a
+        # silent rewrite. Leave a durable, visible trace (comment) on each
+        # affected child so an operator scanning the board — or a later
+        # `kanban_show` — sees the routing decision was NOT what the LLM
+        # intended, rather than an ordinary deliberate assignment.
+        for idx, picked in invalid_assignee_by_idx.items():
+            cid = child_ids[idx]
+            try:
+                with kb.connect_closing() as conn:
+                    kb.add_comment(
+                        conn, cid, "auto-decomposer",
+                        f"⚠ decomposer picked unknown assignee {picked!r} for this "
+                        f"child — routed to default_assignee {default_assignee!r} "
+                        "instead. Verify the profile roster / description if this "
+                        "profile should exist.",
+                    )
+            except Exception:
+                logger.debug(
+                    "decompose: failed to record invalid-assignee comment for %s",
+                    cid, exc_info=True,
+                )
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",

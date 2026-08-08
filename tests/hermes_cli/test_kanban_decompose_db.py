@@ -228,3 +228,66 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_decompose_worktree_children_never_share_root_worktree_dir(kanban_home, tmp_path, monkeypatch):
+    """Guardrail: writing children (workspace_kind=worktree) must never
+    literally inherit the root's own worktree checkout path — two workers
+    committing into the same git working tree concurrently is a data-loss
+    hazard. Each worktree-kind child must get its own path/branch, distinct
+    from the root's and from each other."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("root\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    root_worktree = repo / ".worktrees" / "root-task"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "wt/root-task", str(root_worktree), "HEAD"],
+        cwd=repo, check=True,
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="codegen root", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(root_worktree),
+            branch_name="wt/root-task", triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "part A", "assignee": "worker"},
+                {"title": "part B", "assignee": "worker", "parents": [0]},
+            ],
+            author="decomposer",
+        )
+    assert child_ids and len(child_ids) == 2
+
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        c0 = kb.get_task(conn, child_ids[0])
+        c1 = kb.get_task(conn, child_ids[1])
+
+    for child in (c0, c1):
+        assert child.workspace_kind == "worktree"
+        # Never literally the root's checkout dir.
+        assert child.workspace_path != str(root_worktree)
+        # Never the root's branch either.
+        assert child.branch_name != "wt/root-task"
+        assert child.branch_name is not None
+    # Distinct children must not collide with each other either.
+    assert c0.branch_name != c1.branch_name
+    assert (c0.workspace_path, c0.branch_name) != (c1.workspace_path, c1.branch_name)
+
+    # Anchored on the same underlying repo (resolved from the root's
+    # worktree) so `resolve_workspace` materializes a fresh linked
+    # worktree per child under <repo>/.worktrees/<child-id> rather than
+    # guessing at the dispatcher's CWD.
+    assert c0.workspace_path == str(repo)
+    assert c1.workspace_path == str(repo)

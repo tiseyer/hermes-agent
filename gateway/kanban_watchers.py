@@ -1175,6 +1175,18 @@ class GatewayKanbanWatchersMixin:
                         try:
                             outcome = _decomp.decompose_task(
                                 tid, author="auto-decomposer",
+                                # Never let the unattended background sweep
+                                # hand a task straight to a spawnable state
+                                # (ready/todo-with-no-parents). Auto-decompose
+                                # only prepares the workgraph; an orchestrator
+                                # (human or profile) must explicitly promote
+                                # via `hermes kanban promote` / dashboard
+                                # before any child or single-task spec can
+                                # spawn a worker. See card guardrail: auto
+                                # fan-out previously landed children directly
+                                # in 'ready', letting them dispatch with zero
+                                # human/orchestrator review of the graph.
+                                auto_promote=False,
                             )
                         except Exception:
                             logger.exception(

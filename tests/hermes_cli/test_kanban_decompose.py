@@ -349,3 +349,154 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+def test_decompose_auto_promote_false_fanout_keeps_children_in_todo(kanban_home):
+    """Guardrail: the gateway's unattended auto-decompose sweep passes
+    auto_promote=False explicitly. Children must land and STAY in 'todo'
+    — never auto-promoted to 'ready' — until an orchestrator explicitly
+    promotes them (hermes kanban promote / dashboard)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer", auto_promote=False)
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        child = kb.get_task(conn, outcome.child_ids[0])
+    # Root flips to todo (holding the graph) — never auto-spawnable by
+    # the sweep either.
+    assert root.status == "todo"
+    # Child has no internal parents, but auto_promote=False must have
+    # blocked the recompute_ready() call that would otherwise flip a
+    # parent-free child straight to 'ready'.
+    assert child.status == "todo"
+
+
+def test_decompose_auto_promote_false_single_task_keeps_todo(kanban_home):
+    """Same guardrail for the fanout=false (single-task) path."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="just one thing", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "**Goal**\nDo the thing.",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer", auto_promote=False)
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    # Must stay in 'todo' — auto_promote=False must suppress the
+    # recompute_ready() call inside specify_triage_task.
+    assert task.status == "todo"
+
+
+def test_decompose_invalid_assignee_leaves_visible_comment_single_task(kanban_home):
+    """An LLM-picked assignee that isn't a real profile must not vanish
+    into a silent rewrite to default_assignee — a durable comment records
+    what actually happened."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="route me safely", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "Route to fallback.",
+        "assignee": "made_up_profile",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task.assignee == "fallback"
+    assert any("made_up_profile" in (c.body or "") for c in comments)
+
+
+def test_decompose_invalid_assignee_leaves_visible_comment_fanout(kanban_home):
+    """Same guardrail for fan-out children: an invalid per-child assignee
+    must leave a visible trace on that child, not disappear silently."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test",
+        "tasks": [
+            {"title": "do X", "body": "", "assignee": "made_up_profile", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "orchestrator_profile": "orchestrator",
+                    "default_assignee": "fallback",
+                }
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    cid = outcome.child_ids[0]
+    with kb.connect() as conn:
+        child = kb.get_task(conn, cid)
+        comments = kb.list_comments(conn, cid)
+    assert child.assignee == "fallback"
+    assert any("made_up_profile" in (c.body or "") for c in comments)
