@@ -1116,6 +1116,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_expires        INTEGER,
     tenant               TEXT,
     result               TEXT,
+    -- Optional merge-group tag: tasks sharing the same value are merged
+    -- as a unit by the merger card. NULL = independent task.
+    merge_group          TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
@@ -1977,6 +1980,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # generic human blocker — same behaviour they had before the column.
         _add_column_if_missing(conn, "tasks", "block_kind", "block_kind TEXT")
 
+    if "merge_group" not in cols:
+        # Optional merge-group tag: tasks sharing the same value are merged
+        # as a unit by the merger card. NULL = independent task.
+        _add_column_if_missing(conn, "tasks", "merge_group", "merge_group TEXT")
+
     if "block_recurrences" not in cols:
         # Unblock-loop counter. Existing rows start at 0, so the loop breaker
         # only begins counting from the first re-block after this migration.
@@ -2404,6 +2412,7 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    merge_group: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2634,10 +2643,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, tenant, merge_group, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2653,6 +2662,7 @@ def create_task(
                         branch_name,
                         project_id,
                         tenant,
+                        merge_group,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -3444,6 +3454,16 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
+            # Parent-less ``todo`` tasks are deliberate backlog — a card
+            # sitting in todo with NO dependency links was placed there by
+            # an operator (or a decompose flow that will promote its own
+            # children explicitly). Auto-promoting them here meant every
+            # recompute_ready() sweep (decompose, archive, dispatch tick)
+            # launched unrelated backlog cards board-wide (t_60b203d0 /
+            # goal "orchestrator-autonomy" §1). Only dependency-gated tasks
+            # — or blocked tasks recovering from a parent-wait — promote.
+            if not parents and cur_status == "todo":
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4087,6 +4107,153 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class DoneVerificationError(ValueError):
+    """Raised by ``complete_task`` when a review-gated completion fails
+    reality verification (remote commit / preview URL / test evidence).
+
+    The task is routed back to ``ready`` with the findings as a comment
+    before this is raised, so the board state already reflects the
+    rejection when the worker sees the error. ``.findings`` carries the
+    structured list. ValueError subclass for the same reason as
+    ``HallucinatedCardsError`` — existing tool-error handlers treat it
+    as a recoverable user error.
+    """
+
+    def __init__(self, findings: list[str], task_id: str):
+        self.findings = list(findings)
+        self.task_id = task_id
+        super().__init__(
+            "done-verification failed — task returned to 'ready': "
+            + "; ".join(findings)
+        )
+
+
+_DONE_VERIFY_TEST_EVIDENCE_RE = re.compile(
+    r"(?i)(pytest|unittest|vitest|jest|npm test|cargo test|go test"
+    r"|tests?\s+(pass(ed)?|green|bestanden|gr(ü|u)n)"
+    r"|\btests?:\s"           # a documented "Tests: ..." section
+    r"|\bpass(ed)?\b|\bbestanden\b"
+    r"|\b\d+\s+passed\b|\ballen?\s+tests?\b)"
+)
+_DONE_VERIFY_URL_RE = re.compile(r"https?://[^\s)>\"'\]]+")
+
+
+def _verify_done_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+) -> list[str]:
+    """Reality-check a review-gated completion. Returns findings ([] = ok).
+
+    Checks (goal "orchestrator-autonomy" §2 — Done-Verifikation):
+      1. The task branch exists on the remote (``git ls-remote``): a
+         reviewer-green card whose commits never reached origin is not
+         done.
+      2. If a preview URL is present (``metadata["preview_url"]`` or a
+         preview-ish URL in summary/result), it must answer < 400.
+      3. Test evidence is documented (``metadata["tests_run"]`` or
+         test-result prose in summary/result).
+
+    Only applies to worktree tasks completing out of the review flow
+    (``block_kind == 'review'``); everything else returns [] untouched.
+    Disable globally with ``HERMES_KANBAN_VERIFY_DONE=0``.
+    """
+    if os.environ.get("HERMES_KANBAN_VERIFY_DONE", "1").strip() in ("0", "false", "no"):
+        return []
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, block_kind "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return []
+    if row["block_kind"] != "review" or row["workspace_kind"] != "worktree":
+        return []
+
+    findings: list[str] = []
+    branch = (row["branch_name"] or "").strip()
+
+    # 1. Remote commit present?
+    repo_root: Optional[Path] = None
+    if row["workspace_path"]:
+        ws = Path(row["workspace_path"]).expanduser()
+        if ws.exists():
+            common = _git_common_dir(ws)
+            if common is not None:
+                repo_root = common.parent
+    if branch and repo_root is not None:
+        try:
+            ls = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-remote", "origin",
+                 f"refs/heads/{branch}"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if ls.returncode != 0:
+                findings.append(
+                    f"git ls-remote failed for origin/{branch}: "
+                    + (ls.stderr or "").strip()[:200]
+                )
+            elif not (ls.stdout or "").strip():
+                findings.append(
+                    f"branch {branch!r} is NOT on the remote — the reviewed "
+                    "commits were never pushed"
+                )
+        except Exception as exc:
+            findings.append(f"remote check errored: {exc}")
+    elif branch and repo_root is None:
+        findings.append(
+            "cannot resolve the task worktree to verify the remote push "
+            f"(workspace_path={row['workspace_path']!r})"
+        )
+
+    # 2. Preview URL live?
+    preview_url = None
+    if isinstance(metadata, dict) and isinstance(metadata.get("preview_url"), str):
+        preview_url = metadata["preview_url"].strip()
+    if not preview_url:
+        scan = " ".join(filter(None, [summary, result]))
+        for m in _DONE_VERIFY_URL_RE.finditer(scan):
+            if "preview" in m.group(0).lower():
+                preview_url = m.group(0).rstrip(".,;:")
+                break
+    if preview_url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(preview_url, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if int(getattr(resp, "status", 200)) >= 400:
+                    findings.append(
+                        f"preview URL {preview_url} answered HTTP {resp.status}"
+                    )
+        except Exception as exc:
+            findings.append(
+                f"preview URL {preview_url} is not reachable: {exc}"
+            )
+
+    # 3. Test evidence documented?
+    tests_documented = False
+    if isinstance(metadata, dict):
+        tr = metadata.get("tests_run")
+        if isinstance(tr, (list, tuple)) and len(tr) > 0:
+            tests_documented = True
+        elif isinstance(tr, str) and tr.strip():
+            tests_documented = True
+    if not tests_documented:
+        scan = " ".join(filter(None, [summary, result]))
+        if _DONE_VERIFY_TEST_EVIDENCE_RE.search(scan):
+            tests_documented = True
+    if not tests_documented:
+        findings.append(
+            "no test evidence documented (metadata.tests_run empty and no "
+            "test-result mention in summary/result)"
+        )
+
+    return findings
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4157,6 +4324,52 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Done-Verifikation (goal "orchestrator-autonomy" §2): a reviewer-green
+    # worktree card is only 'done' when reality agrees — remote commit
+    # present, preview (if any) live, tests documented. On mismatch the
+    # card goes back to 'ready' with the concrete findings as a comment
+    # and the completion is rejected.
+    verify_findings = _verify_done_evidence(
+        conn, task_id, summary=summary, result=result, metadata=metadata,
+    )
+    if verify_findings:
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'ready',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                """,
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="gave_up", status="failed",
+                    summary="done-verification failed: "
+                    + "; ".join(verify_findings),
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Done-Verifikation fehlgeschlagen — Karte zurück auf "
+                        "'ready'. Befund:\n- " + "\n- ".join(verify_findings),
+                        now,
+                    ),
+                )
+                _append_event(
+                    conn, task_id, "done_verification_failed",
+                    {"findings": verify_findings}, run_id=run_id,
+                )
+        raise DoneVerificationError(verify_findings, task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -4985,11 +5198,7 @@ def block_task(
         # operator sees it instead of the card silently sitting in review.
         if kind == "review":
             task_tenant = cur_row["tenant"] if "tenant" in cur_row.keys() else None
-            _reviewer_map = {
-                "goya": "goya-reviewer",
-                "voicera": "voicera-reviewer",
-            }
-            reviewer = _reviewer_map.get(task_tenant, "reviewer")
+            reviewer = _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5370,9 +5579,26 @@ def specify_triage_task(
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
-    # with no open parents flips straight to 'ready' here instead of
+    # with open-but-done parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
     recompute_ready(conn)
+    # Specifying IS the explicit promotion intent — recompute_ready no
+    # longer promotes parent-less todo cards board-wide, so a specified
+    # task without dependency links is promoted here, scoped to exactly
+    # this task id.
+    with write_txn(conn):
+        has_parents = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if has_parents is None:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                _append_event(conn, task_id, "promoted", None)
     return True
 
 
@@ -5589,13 +5815,29 @@ def decompose_triage_task(
             },
         )
 
-    # Outside the write_txn: promote parent-free children to 'ready'
-    # so the dispatcher picks them up on its next tick. Same pattern
-    # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
-    # for manual-review-first workflows.
+    # Outside the write_txn: promote THIS decomposition's parent-free
+    # children to 'ready' so the dispatcher picks them up on its next
+    # tick. Explicitly scoped to the just-created child ids —
+    # recompute_ready() no longer sweeps parent-less todo cards
+    # board-wide (that launched unrelated backlog cards; see the guard
+    # in recompute_ready). When auto_promote is False children stay in
+    # 'todo' until the user manually promotes them — useful for
+    # manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        parent_free = [
+            child_ids[i] for i, c in enumerate(children)
+            if not (c.get("parents") or [])
+        ]
+        if parent_free:
+            with write_txn(conn):
+                for cid in parent_free:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'ready' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (cid,),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(conn, cid, "promoted", None)
     return child_ids
 
 
@@ -5665,12 +5907,43 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
+        # Children gated on the deleted task lose that gate. Remember them
+        # BEFORE dropping the links: recompute_ready no longer promotes
+        # parent-less todo cards board-wide, so the promotion below must be
+        # scoped to exactly these former children.
+        former_children = [
+            r["child_id"] for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,),
+            ).fetchall()
+        ]
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
+    # Scoped promotion for the deleted task's former children whose LAST
+    # open gate was the deleted parent (i.e. no remaining unfinished
+    # parents). Mirrors the done/archived promotion semantics.
+    if former_children:
+        with write_txn(conn):
+            for cid in former_children:
+                open_parent = conn.execute(
+                    "SELECT 1 FROM tasks t "
+                    "JOIN task_links l ON l.parent_id = t.id "
+                    "WHERE l.child_id = ? "
+                    "AND t.status NOT IN ('done', 'archived') LIMIT 1",
+                    (cid,),
+                ).fetchone()
+                if open_parent is None:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'ready' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (cid,),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(conn, cid, "promoted", None)
     return True
 
 
@@ -5797,7 +6070,18 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    New branches are rooted on the freshest reachable remote base (upstream
+    tracking ref, else the remote's default branch, else local ``HEAD`` when
+    offline/no-remote) via the shared ``hermes_cli.worktree_base`` resolver —
+    the same contract ``cli.py``'s ``hermes -w`` bootstrap uses. Without
+    this, a dispatcher running from a standalone clone whose local ``HEAD``
+    lags ``origin/main`` would silently root every new task branch on that
+    stale base (see task t_c3e3ed9c). An EXISTING branch is always attached
+    as-is — never rebased or re-based here — so branch-attach semantics for
+    resumed/decompose-child tasks are unaffected by this change.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -5805,12 +6089,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+    base_ref = "HEAD"
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        from hermes_cli.worktree_base import resolve_worktree_base
+        base_ref, _label = resolve_worktree_base(str(repo_root))
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -5819,6 +6106,22 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         timeout=60,
         check=False,
     )
+    if result.returncode != 0 and base_ref != "HEAD":
+        # Branching from the resolved remote ref failed for any reason (e.g.
+        # a partial fetch left the ref unusable) — retry from local HEAD so
+        # worktree creation never hard-fails purely on a sync hiccup. Mirrors
+        # cli.py's _setup_worktree retry-on-remote-base-failure behavior.
+        fallback_cmd = [
+            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
+            str(target), "HEAD",
+        ]
+        result = subprocess.run(
+            fallback_cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
@@ -5895,6 +6198,165 @@ def _resolve_worktree_workspace(
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _maybe_repair_stale_worktree(workspace: Path) -> Optional[dict]:
+    """Detect + auto-repair a worktree whose branch sits on a stale base.
+
+    Called by the dispatcher before (re)spawning a coder into an EXISTING
+    worktree. When the branch does not contain the current remote base
+    (upstream/default-branch tip), the orchestrator repairs it instead of
+    letting the coder run into conflicts (goal "orchestrator-autonomy" §3
+    / Canary 2):
+
+      * no unique commits on the branch → hard-reset the branch onto the
+        fresh base (nothing of value is lost; uncommitted dirt in a
+        dispatcher-managed worktree between runs is not preserved work).
+      * unique commits present → attempt ``git rebase`` onto the base;
+        on conflict, abort the rebase and report (the coder handles it).
+
+    Returns a repair-report dict when something was detected/attempted,
+    else None (worktree already current). Never raises — repair is
+    best-effort and the spawn proceeds regardless.
+    """
+    try:
+        from hermes_cli.worktree_base import resolve_worktree_base
+        base_ref, base_label = resolve_worktree_base(str(workspace))
+        if base_ref == "HEAD":
+            return None  # offline / no remote — nothing to compare against
+        def _git(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", str(workspace), *args],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        base_tip = _git("rev-parse", "--verify", "--quiet", base_ref)
+        if base_tip.returncode != 0:
+            return None
+        base_sha = base_tip.stdout.strip()
+        contains = _git("merge-base", "--is-ancestor", base_sha, "HEAD")
+        if contains.returncode == 0:
+            return None  # branch already contains the current base
+        unique = _git("rev-list", "--count", f"{base_ref}..HEAD")
+        unique_count = int((unique.stdout or "0").strip() or 0)
+        if unique_count == 0:
+            reset = _git("reset", "--hard", base_sha)
+            return {
+                "action": "reset",
+                "base": base_label,
+                "base_sha": base_sha[:12],
+                "ok": reset.returncode == 0,
+                "detail": (reset.stderr or reset.stdout or "").strip()[:200],
+            }
+        rebase = _git("rebase", base_sha, timeout=120)
+        if rebase.returncode != 0:
+            _git("rebase", "--abort")
+            return {
+                "action": "rebase_conflict",
+                "base": base_label,
+                "base_sha": base_sha[:12],
+                "ok": False,
+                "detail": (rebase.stderr or rebase.stdout or "").strip()[:300],
+            }
+        return {
+            "action": "rebase",
+            "base": base_label,
+            "base_sha": base_sha[:12],
+            "ok": True,
+            "detail": f"{unique_count} eigene Commits auf frische Basis rebased",
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("stale-worktree repair failed for %s: %s", workspace, exc)
+        return None
+
+
+def _resolve_review_worktree_workspace(
+    task: Task, *, board: Optional[str] = None
+) -> tuple[Path, str]:
+    """Materialize a SEPARATE reviewer worktree for a review-claimed task.
+
+    Reviewers must never share the coder's worktree (they could corrupt
+    in-progress state, and they'd review the local tree instead of what
+    was actually pushed). This resolves the repo root from the coder's
+    worktree (or the board default_workdir), fetches the task branch from
+    ``origin``, and materializes ``<repo>/.worktrees/<task-id>-review``
+    checked out at ``origin/<branch>`` (detached). Falls back to the
+    local branch tip when the branch was never pushed — the reviewer is
+    expected to flag the missing push as a finding.
+
+    The task row's ``workspace_path`` is deliberately NOT the target:
+    callers must not persist this path onto the task, so a review
+    rejection sends the coder back to their own original worktree.
+    """
+    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+
+    # Resolve the main repo root. The coder's workspace_path is a linked
+    # worktree — its git-common-dir points into the main checkout.
+    repo_root: Optional[Path] = None
+    if task.workspace_path:
+        coder_ws = Path(task.workspace_path).expanduser()
+        if coder_ws.exists():
+            common = _git_common_dir(coder_ws)
+            if common is not None:
+                # <repo>/.git → repo root is its parent
+                repo_root = common.parent
+    if repo_root is None:
+        board_slug = board if board else get_current_board()
+        board_default = (
+            read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+        if not board_default:
+            raise ValueError(
+                f"review task {task.id}: cannot resolve a repo root for the "
+                f"reviewer worktree (no coder workspace, and board "
+                f"{board_slug!r} has no default_workdir)"
+            )
+        repo_root = _git_toplevel(Path(board_default).expanduser())
+        if repo_root is None:
+            raise ValueError(
+                f"review task {task.id}: board default_workdir "
+                f"{board_default!r} is not inside a git repo"
+            )
+
+    target = repo_root / ".worktrees" / f"{task.id}-review"
+
+    # Fetch the branch so origin/<branch> reflects what the coder pushed.
+    # Best-effort: offline review of the local tip is better than a
+    # hard-failed dispatch.
+    subprocess.run(
+        ["git", "-C", str(repo_root), "fetch", "origin", branch_name],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    remote_ref = f"origin/{branch_name}"
+    has_remote = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+         remote_ref],
+        capture_output=True, text=True, timeout=30, check=False,
+    ).returncode == 0
+    review_ref = remote_ref if has_remote else branch_name
+
+    if target.exists() and _is_linked_worktree_checkout(target):
+        # Reuse the existing reviewer worktree but sync it to the ref
+        # under review — a re-review after a coder fix must see the new
+        # push, not the previous round's checkout.
+        subprocess.run(
+            ["git", "-C", str(target), "checkout", "--detach", review_ref],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return target, branch_name
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "add", "--detach",
+         str(target), review_ref],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"reviewer worktree add failed for {target} at {review_ref}: "
+            f"{stderr}"
+        )
+    return target, branch_name
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -7304,6 +7766,84 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+# Cards whose title/body demands smoke-test / deploy / live actions must
+# never start unattended from the default-assignee fallback — they wait
+# for an explicit human GO (goal "orchestrator-autonomy" / Canary 4).
+_GO_GATE_RE = re.compile(
+    r"(?i)\b(smoke[- ]?tests?|smoke\b|deploy(ment|s|en)?\b|go[- ]?live"
+    r"|live[- ]?(gang|schalt\w*|aktivierung)|production|prod[- ]?release)"
+)
+
+# Tenant → reviewer profile routing. Used by the review block path and
+# the loop-detection diagnosis routing so both always agree.
+_TENANT_REVIEWER_MAP = {
+    "goya": "goya-reviewer",
+    "voicera": "voicera-reviewer",
+}
+
+# Run outcomes that count as "the worker failed at the task" for loop
+# detection. Rate-limits and reclaims are infrastructure noise, not
+# evidence the approach is wrong.
+_LOOP_FAILURE_OUTCOMES = ("crashed", "timed_out", "gave_up", "spawn_failed", "failed")
+
+
+def _normalize_failure_signature(text: Optional[str]) -> Optional[str]:
+    """Collapse a failure error/summary to a comparable signature.
+
+    First non-empty line, lowercased, whitespace collapsed, volatile
+    tokens (hex ids, pids, timestamps) stripped so 'same file / same
+    test / same error' compares equal across two runs.
+    """
+    if not text:
+        return None
+    line = ""
+    for candidate in str(text).strip().splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    if not line:
+        return None
+    line = line.lower()
+    line = re.sub(r"0x[0-9a-f]+", "<hex>", line)
+    line = re.sub(r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2})?\b", "<ts>", line)
+    line = re.sub(r"\bpid[= ]?\d+\b", "<pid>", line)
+    line = re.sub(r"\s+", " ", line)
+    return line[:300] or None
+
+
+def check_failure_loop(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Detect a worker failing twice in a row at the SAME thing.
+
+    Returns ``{"signature": ..., "runs": [run_id, run_id]}`` when the two
+    most recent ended runs both failed (outcome in
+    :data:`_LOOP_FAILURE_OUTCOMES`) with the same normalized failure
+    signature — the trigger for the orchestrator to STOP the third
+    attempt and switch to diagnosis (goal "orchestrator-autonomy" §4).
+    Returns ``None`` otherwise.
+    """
+    runs = conn.execute(
+        "SELECT id, outcome, error, summary FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if len(runs) < 2:
+        return None
+    sigs = []
+    for r in runs:
+        if r["outcome"] not in _LOOP_FAILURE_OUTCOMES:
+            return None
+        sig = _normalize_failure_signature(r["error"] or r["summary"])
+        if sig is None:
+            return None
+        sigs.append(sig)
+    if sigs[0] != sigs[1]:
+        return None
+    return {"signature": sigs[0], "runs": [runs[0]["id"], runs[1]["id"]]}
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -7401,6 +7941,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
+
+    # 2b. Failure loop: the worker failed twice in a row at the SAME
+    #     thing. A third identical attempt is wasted budget — the
+    #     dispatcher routes the task to the reviewer for a diagnosis
+    #     check instead (see the loop_detected handling in
+    #     ``_dispatch_once_locked``).
+    if check_failure_loop(conn, task_id) is not None:
+        return "loop_detected"
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
@@ -7649,7 +8197,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, body FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7708,6 +8256,48 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): Smoke-, Deploy-
+        # und Live-Karten dürfen NIE ungefragt vom default-Fallback starten.
+        # Ohne expliziten menschlichen Assignee (oder mit 'default') werden
+        # sie an 'till' geparkt — kein Hermes-Profil, also nicht spawnbar —
+        # bis ein Mensch GO gibt (Assignee auf ein echtes Profil setzt).
+        # Explizit von Hand einem Profil zugewiesene Karten passieren das
+        # Gate unverändert.
+        if (not row_assignee or row_assignee == "default") and _GO_GATE_RE.search(
+            f"{row['title'] or ''}\n{row['body'] or ''}"
+        ):
+            result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = 'till' "
+                        "WHERE id = ? AND status = 'ready' "
+                        "AND (assignee IS NULL OR assignee = '' "
+                        "     OR assignee = 'default')",
+                        (row["id"],),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "go_gate_held",
+                            {"assignee": "till",
+                             "reason": "smoke/deploy/live card requires "
+                                       "explicit human GO"},
+                        )
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "GO-Gate: Diese Karte verlangt Smoke/Deploy/"
+                                "Live-Aktionen und wird nicht automatisch "
+                                "gestartet. Assignee auf 'till' gesetzt — "
+                                "für GO einem echten Profil zuweisen.",
+                                int(time.time()),
+                            ),
+                        )
+            continue
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -7798,6 +8388,59 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if guard_reason == "loop_detected" and not dry_run:
+                # Two consecutive failures at the same thing — do NOT
+                # burn a third identical attempt. Route the card to the
+                # reviewer as a DIAGNOSIS check: the reviewer verifies
+                # whether the failure diagnosis is correct (not the next
+                # fix). Only after a confirmed diagnosis should a newly
+                # phrased coder task continue the work (goal
+                # "orchestrator-autonomy" §4).
+                loop_info = check_failure_loop(conn, row["id"]) or {}
+                _loop_task = get_task(conn, row["id"])
+                reviewer = _TENANT_REVIEWER_MAP.get(
+                    _loop_task.tenant if _loop_task else None, "reviewer",
+                )
+                with write_txn(conn):
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status     = 'review',
+                               assignee   = ?,
+                               block_kind = 'review'
+                         WHERE id = ? AND status = 'ready'
+                           AND claim_lock IS NULL
+                        """,
+                        (reviewer, row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "Loop erkannt: zwei aufeinanderfolgende "
+                                "Fehlversuche an derselben Stelle — "
+                                f"Signatur: {loop_info.get('signature')!r}. "
+                                "Dritter identischer Versuch gestoppt. "
+                                "DIAGNOSE-AUFTRAG an den Reviewer: Prüfe, ob "
+                                "die Fehlerdiagnose der letzten beiden Runs "
+                                "stimmt — NICHT den nächsten Fix bauen. "
+                                "Ergebnis als Kommentar dokumentieren; danach "
+                                "wird ein neu formulierter Coder-Auftrag "
+                                "erstellt.",
+                                int(time.time()),
+                            ),
+                        )
+                        _append_event(
+                            conn, row["id"], "loop_detected",
+                            {"signature": loop_info.get("signature"),
+                             "runs": loop_info.get("runs"),
+                             "routed_to": reviewer},
+                        )
+                continue
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
@@ -7840,6 +8483,34 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Blocker-Auto-Resolution (goal §3 / Canary 2): a worktree
+            # whose branch sits on a stale base is repaired here —
+            # reset/rebase onto the fresh remote base — instead of
+            # letting the coder run into avoidable conflicts or
+            # escalating a purely technical blocker to a human.
+            repair = _maybe_repair_stale_worktree(Path(workspace))
+            if repair is not None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, claimed.id, "worktree_repaired", repair,
+                    )
+                    if repair.get("action") == "rebase_conflict":
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                claimed.id,
+                                "orchestrator",
+                                "Worktree-Basis ist veraltet und der "
+                                "Auto-Rebase schlug fehl (Konflikt). Bitte "
+                                "im Worktree auf die aktuelle Remote-Basis "
+                                f"({repair.get('base')}) rebasen, bevor du "
+                                "weiterarbeitest. Detail: "
+                                + str(repair.get("detail") or ""),
+                                int(time.time()),
+                            ),
+                        )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -7915,9 +8586,15 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
-            resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                # Reviewer isolation: NEVER reuse the coder's worktree.
+                # Materialize a separate  <repo>/.worktrees/<id>-review
+                # checkout at origin/<coder-branch> so the reviewer sees
+                # exactly what was pushed and cannot corrupt the coder's
+                # in-progress tree (goal "orchestrator-autonomy" §5).
+                workspace, _rv_branch = _resolve_review_worktree_workspace(
+                    claimed, board=board
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -7928,17 +8605,30 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Do NOT persist the reviewer worktree onto the task row —
+            # workspace_path must keep pointing at the coder's worktree so
+            # a review rejection sends the coder back to their own tree.
+            # The reviewer subprocess still lands in the right place: the
+            # spawn passes `workspace` as cwd / HERMES_KANBAN_WORKSPACE /
+            # TERMINAL_CWD explicitly. In-memory only:
+            claimed.workspace_path = str(workspace)
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "review_worktree",
+                    {"path": str(workspace),
+                     "branch": (claimed.branch_name or "").strip() or None},
+                )
+        else:
+            # Persist the resolved workspace path so the worker can cd there.
+            set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # NOTE (2026-07-28): sdlc-review skill was a planned but never-built
+        # phantom.  Reviewers run from their SOUL + Brain Prüf-Katalog
+        # which covers the full review logic.  This line previously
+        # force-loaded the missing skill, causing every reviewer to crash
+        # at startup.  Reverted to empty — reviewers self-sufficient.
+        claimed.skills = []
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

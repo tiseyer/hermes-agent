@@ -5464,6 +5464,21 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── Pending async delegation grace period ────────────
+                # When a kanban worker spawned a background subagent
+                # (e.g. orchestrator -> recon via delegate_task), the
+                # stop-guard must not penalise turns spent waiting for
+                # the subagent result.  Reset the nudge counter on every
+                # turn while a delegation is in flight so the worker
+                # gets as many turns as it needs — capped by a timeout
+                # so a crashed / never-returning subagent can't hang
+                # the worker forever.
+                _delegation_spawned_at = getattr(agent, "_delegation_spawned_at", None)
+                if _delegation_spawned_at:
+                    import time as _time
+                    if _time.time() - _delegation_spawned_at < 300:
+                        agent._kanban_stop_nudges = 0
+
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the

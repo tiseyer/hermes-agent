@@ -3924,7 +3924,7 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == []  # no forced skills; reviewers self-sufficient
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

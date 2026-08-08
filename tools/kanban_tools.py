@@ -637,6 +637,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.DoneVerificationError as verify_err:
+                # The orchestrator's reality check rejected the completion.
+                # The card is ALREADY back in 'ready' with the findings as
+                # a comment — the worker must not retry kanban_complete
+                # blindly; the findings need to be fixed first (push the
+                # branch, bring the preview up, document the tests).
+                return tool_error(
+                    "kanban_complete rejected by done-verification: "
+                    + "; ".join(verify_err.findings)
+                    + ". The card was returned to 'ready' with these findings "
+                    "as a comment. Fix the findings (push the branch / bring "
+                    "the preview up / document test results), then complete "
+                    "again on the next run."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -1075,6 +1089,7 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    merge_group = args.get("merge_group")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1157,6 +1172,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                merge_group=merge_group,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1793,6 +1809,17 @@ KANBAN_CREATE_SCHEMA = {
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
+                ),
+            },
+            "merge_group": {
+                "type": "string",
+                "description": (
+                    "Optional group tag. When multiple tasks share the same "
+                    "merge_group value, the merger treats them as a unit: "
+                    "all member branches are merged into a single commit "
+                    "on develop. The merger card for the group stays in "
+                    "todo until all member cards reach done (enforced via "
+                    "parent/child links)."
                 ),
             },
             "triage": {
