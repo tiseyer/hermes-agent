@@ -417,3 +417,49 @@ class TestGatewayApprovalAllowPermanent:
         renderer hides "Always allow"."""
         payload = self._capture_gateway_payload("curl https://bit.ly/abc", "gw-no-perm")
         assert payload["allow_permanent"] is False
+
+
+class TestKanbanOwnBranchForcePushExemption:
+    """--force-with-lease on the worker's OWN task branch bypasses the gate."""
+
+    def _check(self, cmd, monkeypatch, task="t_2323adbe"):
+        from tools.approval import _is_kanban_own_branch_force_push
+        if task is not None:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        return _is_kanban_own_branch_force_push(cmd)
+
+    def test_own_branch_with_lease_allowed(self, monkeypatch):
+        assert self._check(
+            "git push --force-with-lease origin wt/t_2323adbe", monkeypatch)
+
+    def test_bare_force_stays_gated(self, monkeypatch):
+        assert not self._check(
+            "git push --force origin wt/t_2323adbe", monkeypatch)
+
+    def test_no_task_env_stays_gated(self, monkeypatch):
+        assert not self._check(
+            "git push --force-with-lease origin wt/t_2323adbe",
+            monkeypatch, task=None)
+
+    def test_foreign_branch_stays_gated(self, monkeypatch):
+        assert not self._check(
+            "git push --force-with-lease origin wt/t_other", monkeypatch)
+
+    def test_shared_branch_refspec_stays_gated(self, monkeypatch):
+        assert not self._check(
+            "git push --force-with-lease origin wt/t_2323adbe:develop",
+            monkeypatch)
+
+    def test_chained_command_stays_gated(self, monkeypatch):
+        assert not self._check(
+            "git push --force-with-lease origin wt/t_2323adbe; rm -rf /tmp/x",
+            monkeypatch)
+
+    def test_check_dangerous_command_end_to_end(self, monkeypatch):
+        from tools.approval import check_dangerous_command
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_2323adbe")
+        res = check_dangerous_command(
+            "git push --force-with-lease origin wt/t_2323adbe", "local")
+        assert res["approved"] is True
