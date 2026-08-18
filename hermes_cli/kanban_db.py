@@ -7911,27 +7911,39 @@ def _normalize_failure_signature(text: Optional[str]) -> Optional[str]:
 
 def check_failure_loop(
     conn: sqlite3.Connection, task_id: str,
+    *,
+    outcomes: Optional[tuple[str, ...]] = None,
+    profile: Optional[str] = None,
 ) -> Optional[dict]:
     """Detect a worker failing twice in a row at the SAME thing.
 
     Returns ``{"signature": ..., "runs": [run_id, run_id]}`` when the two
     most recent ended runs both failed (outcome in
-    :data:`_LOOP_FAILURE_OUTCOMES`) with the same normalized failure
-    signature — the trigger for the orchestrator to STOP the third
-    attempt and switch to diagnosis (goal "orchestrator-autonomy" §4).
-    Returns ``None`` otherwise.
+    :data:`_LOOP_FAILURE_OUTCOMES`, or the explicit ``outcomes`` override)
+    with the same normalized failure signature — the trigger for the
+    orchestrator to STOP the third attempt and switch to diagnosis (goal
+    "orchestrator-autonomy" §4). Returns ``None`` otherwise.
+
+    ``profile`` restricts the window to runs of that worker profile —
+    used by the review-loop brake so a reviewer is only judged by its
+    OWN runs, not by the coder failures that routed the card to review.
     """
-    runs = conn.execute(
+    _outcomes = outcomes if outcomes is not None else _LOOP_FAILURE_OUTCOMES
+    query = (
         "SELECT id, outcome, error, summary FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC, id DESC LIMIT 2",
-        (task_id,),
-    ).fetchall()
+    )
+    params: list = [task_id]
+    if profile is not None:
+        query += "AND profile = ? "
+        params.append(profile)
+    query += "ORDER BY ended_at DESC, id DESC LIMIT 2"
+    runs = conn.execute(query, params).fetchall()
     if len(runs) < 2:
         return None
     sigs = []
     for r in runs:
-        if r["outcome"] not in _LOOP_FAILURE_OUTCOMES:
+        if r["outcome"] not in _outcomes:
             return None
         sig = _normalize_failure_signature(r["error"] or r["summary"])
         if sig is None:
@@ -8669,6 +8681,60 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        # Loop brake for review runs: a reviewer that failed twice in a
+        # row at the same thing must not get a third identical attempt
+        # (themeColor card burned 5 runs this way). Unlike the ready
+        # path we cannot route "to the reviewer for diagnosis" — this IS
+        # the reviewer — so park the card at the human with the loop
+        # signature. blocked@till is a terminal state per the board
+        # invariant; review-with-no-progress is not.
+        # Scope: only the reviewer's OWN ended runs (profile filter) and
+        # only real run outcomes — spawn_failed stays with the existing
+        # consecutive_failures circuit breaker (gave_up → auto_block).
+        review_loop = check_failure_loop(
+            conn, row["id"],
+            profile=row["assignee"],
+            outcomes=("crashed", "timed_out", "gave_up", "failed", "blocked"),
+        )
+        if review_loop is not None:
+            result.respawn_guarded.append((row["id"], "review_loop_detected"))
+            if not dry_run:
+                with write_txn(conn):
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status     = 'blocked',
+                               assignee   = 'till',
+                               block_kind = 'needs_input'
+                         WHERE id = ? AND status = 'review'
+                           AND claim_lock IS NULL
+                        """,
+                        (row["id"],),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "Review-Loop erkannt: zwei aufeinanderfolgende "
+                                "Reviewer-Fehlversuche mit identischer Signatur "
+                                f"— {review_loop.get('signature')!r}. Dritter "
+                                "identischer Review-Run gestoppt; Karte "
+                                "eskaliert an till (needs_input). Bitte "
+                                "Reviewer-Logs der letzten beiden Runs prüfen.",
+                                int(time.time()),
+                            ),
+                        )
+                        _append_event(
+                            conn, row["id"], "review_loop_detected",
+                            {"signature": review_loop.get("signature"),
+                             "runs": review_loop.get("runs"),
+                             "routed_to": "till"},
+                        )
             continue
         try:
             from hermes_cli.profiles import profile_exists

@@ -3992,6 +3992,70 @@ def test_has_spawnable_review_false_on_empty(kanban_home):
         assert kb.has_spawnable_review(conn) is False
 
 
+def test_review_loop_brake_escalates_to_till(kanban_home, all_assignees_spawnable):
+    """Two identical failed reviewer runs park the card at till, no 3rd run.
+
+    Regression for the themeColor card that burned 5 review runs: the
+    review dispatch column had no loop brake. The brake only counts the
+    reviewer's OWN runs (profile filter) with real run outcomes.
+    """
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (2, 1):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, ?, 'ended', "
+                "'gave_up', ?, ?, ?)",
+                (t, "reviewer", "reviewer stalled at step X", now - i * 60,
+                 now - i * 60 + 30),
+            )
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert spawns == [], "review loop must not spawn a third identical run"
+    assert ("review_loop_detected" in [r[1] for r in res.respawn_guarded])
+    assert task.status == "blocked"
+    assert task.assignee == "till"
+    assert "review_loop_detected" in events
+
+
+def test_review_loop_brake_ignores_coder_failures(
+    kanban_home, all_assignees_spawnable,
+):
+    """Coder failures that routed the card to review must not trip the
+    review brake — the reviewer deserves its first diagnosis run."""
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="diagnose me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (2, 1):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, ?, 'ended', "
+                "'crashed', ?, ?, ?)",
+                (t, "voicera-coder", "exit 128: develop already used", now - i * 60,
+                 now - i * 60 + 30),
+            )
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+    assert spawns == [t], "reviewer must get its first run despite coder loop"
+    assert task.status == "running"
+
+
 def test_has_spawnable_review_false_when_only_terminal_lanes(
     kanban_home, monkeypatch,
 ):
