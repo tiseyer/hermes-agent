@@ -8027,21 +8027,21 @@ def check_failure_loop(
     orchestrator to STOP the third attempt and switch to diagnosis (goal
     "orchestrator-autonomy" §4). Returns ``None`` otherwise.
 
-    ``profile`` restricts the window to runs of that worker profile —
-    used by the review-loop brake so a reviewer is only judged by its
-    OWN runs, not by the coder failures that routed the card to review.
+    ``profile`` requires the two most recent ended runs (of ANY profile)
+    to BOTH belong to that profile — used by the review-loop brake so a
+    reviewer is only judged by its own consecutive runs. A run by a
+    different profile in between (e.g. the implementer re-ran after a
+    rejection) resets the window: that is fresh progress, not a loop.
     """
     _outcomes = outcomes if outcomes is not None else _LOOP_FAILURE_OUTCOMES
-    query = (
-        "SELECT id, outcome, error, summary FROM task_runs "
+    runs = conn.execute(
+        "SELECT id, profile, outcome, error, summary FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-    )
-    params: list = [task_id]
-    if profile is not None:
-        query += "AND profile = ? "
-        params.append(profile)
-    query += "ORDER BY ended_at DESC, id DESC LIMIT 2"
-    runs = conn.execute(query, params).fetchall()
+        "ORDER BY ended_at DESC, id DESC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if profile is not None and any(r["profile"] != profile for r in runs):
+        return None
     if len(runs) < 2:
         return None
     sigs = []

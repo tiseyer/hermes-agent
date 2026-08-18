@@ -4105,6 +4105,41 @@ def test_review_loop_brake_ignores_coder_failures(
     assert task.status == "running"
 
 
+def test_review_loop_brake_resets_on_interleaved_implementer_run(
+    kanban_home, all_assignees_spawnable,
+):
+    """An implementer run AFTER two identical reviewer failures resets the
+    loop window — the card earned a fresh review, not an escalation.
+    (Live-repro: coder fixed + pushed, brake still fired on stale runs.)"""
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="re-review me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (3, 2):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, 'reviewer', "
+                "'ended', 'gave_up', 'reviewer stalled at step X', ?, ?)",
+                (t, now - i * 60, now - i * 60 + 30),
+            )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "error, started_at, ended_at) VALUES (?, 'voicera-coder', "
+            "'ended', 'blocked', 'review requested → reviewer', ?, ?)",
+            (t, now - 60, now - 30),
+        )
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+    assert spawns == [t], "fresh implementer run must reset the review loop"
+    assert task.status == "running"
+
+
 def test_has_spawnable_review_false_when_only_terminal_lanes(
     kanban_home, monkeypatch,
 ):
