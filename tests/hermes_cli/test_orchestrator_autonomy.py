@@ -251,10 +251,20 @@ def test_go_gate_holds_unassigned_smoke_card(kanban_home, all_assignees_spawnabl
         )
         assert spawned == []
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        # GO-gated cards park as blocked@till (board invariant: waiting
+        # on a human == blocked), sticky against recompute_ready.
+        assert task.status == "blocked"
         assert task.assignee == "till"
+        assert task.block_kind == "needs_input"
         events = [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
         assert events
+        blocked_events = [
+            e for e in kb.list_events(conn, tid) if e.kind == "blocked"
+        ]
+        assert blocked_events, "go gate must write a sticky blocked event"
+        # Sticky: a recompute pass must not promote it back to ready.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
 
 
 def test_go_gate_lets_explicit_profile_assignment_through(

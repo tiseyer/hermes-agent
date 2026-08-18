@@ -8379,8 +8379,16 @@ def _dispatch_once_locked(
             result.skipped_nonspawnable.append(row["id"])
             if not dry_run:
                 with write_txn(conn):
+                    # Park as blocked@till, not ready@till: the board
+                    # invariant says every waiting-on-a-human card is
+                    # ``blocked`` — a GO-gated card sitting in ``ready``
+                    # reads as "stuck" on every board scan. The sticky
+                    # ``blocked`` event keeps recompute_ready from
+                    # ping-ponging it back; the human GO is an explicit
+                    # unblock + assignee change.
                     cur = conn.execute(
-                        "UPDATE tasks SET assignee = 'till' "
+                        "UPDATE tasks SET assignee = 'till', "
+                        "status = 'blocked', block_kind = 'needs_input' "
                         "WHERE id = ? AND status = 'ready' "
                         "AND (assignee IS NULL OR assignee = '' "
                         "     OR assignee = 'default')",
@@ -8388,8 +8396,14 @@ def _dispatch_once_locked(
                     )
                     if cur.rowcount == 1:
                         _append_event(
+                            conn, row["id"], "blocked",
+                            {"kind": "needs_input",
+                             "reason": "go_gate: smoke/deploy/live card "
+                                       "requires explicit human GO"},
+                        )
+                        _append_event(
                             conn, row["id"], "go_gate_held",
-                            {"assignee": "till",
+                            {"assignee": "till", "status": "blocked",
                              "reason": "smoke/deploy/live card requires "
                                        "explicit human GO"},
                         )
