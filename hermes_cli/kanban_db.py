@@ -4268,13 +4268,24 @@ def _verify_done_evidence(
     if os.environ.get("HERMES_KANBAN_VERIFY_DONE", "1").strip() in ("0", "false", "no"):
         return []
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path, branch_name, block_kind "
-        "FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path, branch_name, block_kind, "
+        "goal_mode FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return []
-    if row["block_kind"] != "review" or row["workspace_kind"] != "worktree":
+    # Review-flow completions AND goal_mode worktree completions are
+    # reality-checked. goal_mode coders used to slip past this gate by
+    # completing directly (their kind='review' block was rejected), which
+    # let a false "pushed" claim reach done (live t_05914cf9: summary
+    # claimed a remote commit, ls-remote showed nothing).
+    _goal_mode_worktree = bool(
+        ("goal_mode" in row.keys() and row["goal_mode"])
+        and row["workspace_kind"] == "worktree"
+    )
+    if not _goal_mode_worktree and (
+        row["block_kind"] != "review" or row["workspace_kind"] != "worktree"
+    ):
         return []
 
     findings: list[str] = []

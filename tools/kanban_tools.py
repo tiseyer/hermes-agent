@@ -194,7 +194,11 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+# 'review' is deliberately allowed: the review handoff is not an escape
+# hatch from the goal loop — it routes to the reviewer whose approval
+# goes through the done-verification gate. Rejecting it forced coders
+# into direct kanban_complete, bypassing review entirely (live t_05914cf9).
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "review"})
 
 
 def _goal_judge_available() -> bool:

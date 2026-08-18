@@ -332,3 +332,27 @@ def test_review_dispatch_uses_separate_reviewer_worktree(
         assert not (review_ws / "dirt.txt").exists()
         # Coder's workspace_path on the task row is untouched.
         assert kb.get_task(conn, tid).workspace_path == str(coder_wt)
+
+
+def test_done_verification_covers_goal_mode_direct_complete(
+    kanban_home, repo_with_remote,
+):
+    """A goal_mode worktree coder completing WITHOUT the review flow is
+    still reality-checked — an unpushed branch must not reach done
+    (live-repro t_05914cf9: false 'pushed' claim slipped past the gate)."""
+    with kb.connect() as conn:
+        wt = repo_with_remote.parent / "wt-goal"
+        kb._ensure_git_worktree(repo_with_remote, wt, "wt/goal-branch")
+        tid = kb.create_task(
+            conn, title="goal worktree task", assignee="alice",
+            workspace_kind="worktree", workspace_path=str(wt),
+            branch_name="wt/goal-branch", tenant="voicera", goal_mode=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?", (tid,),
+        )
+        claimed = kb.claim_task(conn, tid)
+        with pytest.raises(kb.DoneVerificationError):
+            kb.complete_task(
+                conn, tid, result="done", summary="pushed and tested",
+            )
