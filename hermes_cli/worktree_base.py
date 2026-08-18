@@ -109,6 +109,14 @@ def resolve_worktree_base(
             return ref, f"{ref} (cached — {reason})"
         return "HEAD", f"HEAD (local — {reason}, no cached {ref})"
 
+    # 0. Explicit override — an operator/board that knows the integration
+    #    branch pins it here (e.g. HERMES_WORKTREE_BASE_REF=origin/develop).
+    import os as _os
+    _override = (_os.environ.get("HERMES_WORKTREE_BASE_REF") or "").strip()
+    if _override and "/" in _override:
+        remote, branch = _override.split("/", 1)
+        return _refresh(remote, branch, _override)
+
     # 1. Current branch's upstream, if it tracks one.
     try:
         up = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
@@ -119,6 +127,17 @@ def resolve_worktree_base(
                 return _refresh(remote, branch, upstream)
     except Exception as e:
         _log.debug("worktree base: upstream resolution failed: %s", e)
+
+    # 1.5. Git-flow integration branch. Repos that carry an
+    #      ``origin/develop`` integrate there, not on the remote default
+    #      branch — a task branch rooted on origin/main in such a repo is
+    #      born ~N commits stale and every coder must rebase before work
+    #      (live-repro: wt/t_31521123 landed 20 commits behind develop).
+    try:
+        if _ref_exists("refs/remotes/origin/develop"):
+            return _refresh("origin", "develop", "origin/develop")
+    except Exception as e:
+        _log.debug("worktree base: develop-branch check failed: %s", e)
 
     # 2. Remote default branch (origin/HEAD).
     try:

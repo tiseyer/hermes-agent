@@ -173,3 +173,52 @@ class TestDispatcherWorktreeBranchesFromRemoteTip:
         second_target = clone / ".worktrees" / "second"
         kb._ensure_git_worktree(clone, second_target, branch)
         assert _head(second_target) == remote_head
+
+
+def test_resolver_prefers_origin_develop_over_default_branch(tmp_path):
+    """A repo carrying origin/develop integrates there — new task branches
+    must root on origin/develop, not the remote default branch (main).
+    Live-repro: wt/t_31521123 was born 20 commits behind develop."""
+    from hermes_cli.worktree_base import resolve_worktree_base
+
+    remote = tmp_path / "remote.git"
+    _run(["git", "init", "--bare", str(remote)], tmp_path)
+    clone = tmp_path / "clone"
+    _run(["git", "clone", str(remote), str(clone)], tmp_path)
+    _run(["git", "config", "user.email", "t@example.com"], clone)
+    _run(["git", "config", "user.name", "t"], clone)
+    _commit(clone, "a.txt", "on main")
+    _run(["git", "branch", "-M", "main"], clone)
+    _run(["git", "push", "-u", "origin", "main"], clone)
+    _run(["git", "checkout", "-b", "develop"], clone)
+    _commit(clone, "b.txt", "on develop")
+    _run(["git", "push", "-u", "origin", "develop"], clone)
+    develop_sha = _head(clone)
+    # Detach like the live root checkout (no upstream for step 1).
+    _run(["git", "checkout", "--detach", "main"], clone)
+
+    base_ref, label = resolve_worktree_base(str(clone))
+    assert base_ref == "origin/develop", (base_ref, label)
+
+
+def test_resolver_env_override_wins(tmp_path, monkeypatch):
+    """HERMES_WORKTREE_BASE_REF pins the base ref explicitly."""
+    from hermes_cli.worktree_base import resolve_worktree_base
+
+    remote = tmp_path / "remote.git"
+    _run(["git", "init", "--bare", str(remote)], tmp_path)
+    clone = tmp_path / "clone"
+    _run(["git", "clone", str(remote), str(clone)], tmp_path)
+    _run(["git", "config", "user.email", "t@example.com"], clone)
+    _run(["git", "config", "user.name", "t"], clone)
+    _commit(clone, "a.txt", "on main")
+    _run(["git", "branch", "-M", "main"], clone)
+    _run(["git", "push", "-u", "origin", "main"], clone)
+    _run(["git", "checkout", "-b", "release"], clone)
+    _commit(clone, "r.txt", "on release")
+    _run(["git", "push", "-u", "origin", "release"], clone)
+    _run(["git", "checkout", "--detach", "main"], clone)
+
+    monkeypatch.setenv("HERMES_WORKTREE_BASE_REF", "origin/release")
+    base_ref, label = resolve_worktree_base(str(clone))
+    assert base_ref == "origin/release", (base_ref, label)
