@@ -5123,3 +5123,47 @@ def test_created_blocked_card_is_sticky_against_recompute(kanban_home):
         assert kb.get_task(conn, smoke).status == "blocked"
         kinds = [e.kind for e in kb.list_events(conn, smoke)]
         assert "blocked" in kinds
+
+
+def test_dispatch_remaps_generic_assignee_to_tenant_profile(
+    kanban_home, monkeypatch,
+):
+    """A ready card assigned to a role name ('reviewer') with a tenant whose
+    prefixed profile exists ('voicera-reviewer') is remapped and spawned
+    instead of hanging in ready forever (live-repro t_0f5f947a)."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "profile_exists",
+        lambda name: name in ("voicera-reviewer",),
+    )
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append((task.id, task.assignee))
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="Review something", assignee="reviewer",
+            tenant="voicera",
+        )
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert spawns and spawns[0][1] == "voicera-reviewer"
+    assert task.assignee == "voicera-reviewer"
+    assert "assignee_remapped" in events
+
+
+def test_dispatch_nonexistent_assignee_without_tenant_stays_skipped(
+    kanban_home, monkeypatch,
+):
+    """No tenant → no remap target; card stays skipped_nonspawnable."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="human lane", assignee="till")
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 42)
+    assert t in res.skipped_nonspawnable

@@ -8425,7 +8425,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, title, body FROM tasks "
+        "SELECT id, assignee, title, body, tenant FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8598,14 +8598,44 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+            # Self-heal generic machine assignees before giving up: a
+            # planner naming a role ('reviewer', 'coder') instead of the
+            # tenant profile ('voicera-reviewer') left the card in ready
+            # forever — skipped_nonspawnable every tick with no diagnosis
+            # (live-repro: t_0f5f947a ready@reviewer). If the tenant-
+            # prefixed profile exists, remap and fall through to spawn.
+            _task_tenant = row["tenant"] if "tenant" in row.keys() else None
+            _remapped = (
+                f"{_task_tenant}-{row_assignee}" if _task_tenant else None
+            )
+            if (
+                _remapped
+                and profile_exists(_remapped)
+                and not dry_run
+            ):
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = ? "
+                        "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                        (_remapped, row["id"], row_assignee),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "assignee_remapped",
+                            {"from": row_assignee, "to": _remapped,
+                             "reason": "profile does not exist; tenant-"
+                                       "prefixed profile does"},
+                        )
+                        row_assignee = _remapped
+            if not profile_exists(row_assignee):
+                # Bucket separately from skipped_unassigned: the operator
+                # cannot fix this by assigning a profile (the assignee IS
+                # the intended owner — a terminal lane, e.g. 'till').
+                # Health telemetry uses this distinction to suppress
+                # spurious "stuck" warnings on multi-lane setups where
+                # the ready queue is steadily full of human-pulled work.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
