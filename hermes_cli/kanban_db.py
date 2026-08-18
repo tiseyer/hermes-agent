@@ -5218,7 +5218,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, tenant FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, tenant, assignee "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -5288,6 +5289,108 @@ def block_task(
         if kind == "review":
             task_tenant = cur_row["tenant"] if "tenant" in cur_row.keys() else None
             reviewer = _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+            cur_assignee = (
+                cur_row["assignee"] if "assignee" in cur_row.keys() else None
+            )
+            if cur_assignee == reviewer:
+                # The REVIEWER itself blocked with kind='review': that is
+                # a rejection ("changes requested"), not a review request.
+                # Without this branch the card stayed review@reviewer and
+                # the dispatcher respawned the reviewer forever (the
+                # themeColor rejection loop). Route the card back to the
+                # original implementer — latest run profile that isn't
+                # the reviewer — as a fresh ready card.
+                impl_row = conn.execute(
+                    "SELECT profile FROM task_runs "
+                    "WHERE task_id = ? AND profile IS NOT NULL "
+                    "AND profile != ? ORDER BY id DESC LIMIT 1",
+                    (task_id, reviewer),
+                ).fetchone()
+                implementer = impl_row["profile"] if impl_row else None
+                if implementer:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'ready',
+                               assignee      = ?,
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = NULL
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """ + (
+                            "" if expected_run_id is None
+                            else " AND current_run_id = ?"
+                        ),
+                        (implementer, task_id) if expected_run_id is None
+                        else (implementer, task_id, int(expected_run_id)),
+                    )
+                    if cur.rowcount != 1:
+                        return False
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        error=f"review rejected → {implementer}: {reason}",
+                    )
+                    if run_id is None:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id, outcome="blocked",
+                            summary=f"review rejected → {implementer}",
+                        )
+                    _append_event(
+                        conn, task_id, "review_rejected",
+                        {"reason": reason, "reviewer": reviewer,
+                         "implementer": implementer, "tenant": task_tenant},
+                        run_id=run_id,
+                    )
+                    conn.execute(
+                        "INSERT INTO task_comments "
+                        "(task_id, author, body, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            task_id, reviewer,
+                            f"REVIEW REJECTED — zurück an {implementer}: "
+                            f"{reason}",
+                            int(time.time()),
+                        ),
+                    )
+                    return True
+                # No implementer derivable — park at the human instead of
+                # spinning the reviewer again.
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + (
+                        "" if expected_run_id is None
+                        else " AND current_run_id = ?"
+                    ),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    error=f"review rejected, no implementer found: {reason}",
+                )
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"reason": f"review rejected, no implementer "
+                               f"derivable: {reason}",
+                     "kind": "needs_input", "reviewer": reviewer},
+                    run_id=run_id,
+                )
+                return True
             cur = conn.execute(
                 """
                 UPDATE tasks

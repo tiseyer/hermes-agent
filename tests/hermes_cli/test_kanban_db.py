@@ -3992,6 +3992,55 @@ def test_has_spawnable_review_false_on_empty(kanban_home):
         assert kb.has_spawnable_review(conn) is False
 
 
+def test_reviewer_review_block_routes_back_to_implementer(kanban_home):
+    """A reviewer blocking kind='review' is a REJECTION → card returns to
+    the original implementer as ready, instead of respawning the reviewer
+    forever (themeColor rejection loop)."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="fix footer", assignee="voicera-coder",
+            tenant="voicera",
+        )
+        now = int(__import__("time").time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "started_at, ended_at) VALUES (?, 'voicera-coder', 'ended', "
+            "'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', "
+            "assignee = 'voicera-reviewer' WHERE id = ?", (t,),
+        )
+        assert kb.block_task(
+            conn, t, reason="ROT: footer not visible", kind="review",
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "voicera-coder"
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "review_rejected" in kinds
+
+
+def test_coder_review_block_still_routes_to_reviewer(kanban_home):
+    """The normal handoff is untouched: a coder blocking kind='review'
+    sends the card to the tenant reviewer in status review."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="build footer", assignee="voicera-coder",
+            tenant="voicera",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?", (t,),
+        )
+        assert kb.block_task(
+            conn, t, reason="Review requested", kind="review",
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "voicera-reviewer"
+
+
 def test_review_loop_brake_escalates_to_till(kanban_home, all_assignees_spawnable):
     """Two identical failed reviewer runs park the card at till, no 3rd run.
 
