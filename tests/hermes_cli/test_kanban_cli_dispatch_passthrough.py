@@ -17,16 +17,42 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _is_hermes_module(name: str) -> bool:
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    The hermes modules are evicted from sys.modules so the in-test
+    imports bind the isolated HERMES_HOME — but the ORIGINAL module
+    objects must be restored afterwards. Leaving the fresh copies in
+    place split-brains every later test module that bound
+    ``hermes_cli.kanban_db`` at import time (stale module object) against
+    production code importing the new one: plugin-hook singletons,
+    the worker-exit registry, and monkeypatches all land in the wrong
+    module. That was the root cause of 17 order-dependent failures in
+    the full `-k kanban` run.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    saved = {}
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+        if _is_hermes_module(mod):
+            saved[mod] = sys.modules.pop(mod)
+    try:
+        yield test_home
+    finally:
+        for mod in list(sys.modules.keys()):
+            if _is_hermes_module(mod):
+                del sys.modules[mod]
+        sys.modules.update(saved)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

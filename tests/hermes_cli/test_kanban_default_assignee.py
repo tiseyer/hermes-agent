@@ -14,20 +14,38 @@ import tempfile
 import pytest
 
 
+def _is_hermes_module(name: str) -> bool:
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    The hermes modules are evicted so the in-test import binds the fresh
+    HERMES_HOME — and the ORIGINAL module objects are restored afterwards.
+    Leaving fresh copies in sys.modules split-brains later test modules
+    (their import-time ``kb`` binding goes stale against re-imported
+    singletons: plugin hooks, worker-exit registry, monkeypatch targets).
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
+    saved = {}
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+        if _is_hermes_module(mod):
+            saved[mod] = sys.modules.pop(mod)
     from hermes_cli import kanban_db
-    yield kanban_db, test_home
-    # Cleanup is best-effort; tempfile dir survives but pytest isolation
-    # gives each test its own monkeypatched HERMES_HOME so no cross-test
-    # contamination.
+    try:
+        yield kanban_db, test_home
+    finally:
+        for mod in list(sys.modules.keys()):
+            if _is_hermes_module(mod):
+                del sys.modules[mod]
+        sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):

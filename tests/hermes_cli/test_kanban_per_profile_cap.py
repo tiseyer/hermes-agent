@@ -14,18 +14,38 @@ import tempfile
 import pytest
 
 
+def _is_hermes_module(name: str) -> bool:
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
+
+
 @pytest.fixture()
 def isolated_kanban_home_with_profiles(monkeypatch):
-    """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
+    """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles.
+
+    Evicted hermes modules are restored afterwards — leaving the fresh
+    copies in sys.modules split-brains later test modules against their
+    import-time bindings (plugin-hook singletons, monkeypatch targets).
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_")
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    saved = {}
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+        if _is_hermes_module(mod):
+            saved[mod] = sys.modules.pop(mod)
     from hermes_cli import kanban_db
-    yield kanban_db
+    try:
+        yield kanban_db
+    finally:
+        for mod in list(sys.modules.keys()):
+            if _is_hermes_module(mod):
+                del sys.modules[mod]
+        sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):
