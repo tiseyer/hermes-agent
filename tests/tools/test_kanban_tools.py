@@ -88,12 +88,14 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_list" not in names
 
 
-def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
-    """Task scope wins over profile config for board-routing tools.
+def test_worker_with_kanban_toolset_keeps_read_only_board_discovery(monkeypatch, tmp_path):
+    """Task scope hides mutating board routing, but keeps kanban_list.
 
-    Even if a worker process happens to also have ``toolsets: [kanban]``
-    in its config, the HERMES_KANBAN_TASK env var means it's a focused
-    worker and must not see kanban_list / kanban_unblock.
+    A dispatcher-spawned worker whose profile explicitly opts into the
+    kanban toolset is the orchestrator surface (orchestrators are
+    themselves dispatched as tasks). It needs read-only board discovery
+    (kanban_list) for the pre-coder file-conflict check, but must never
+    see kanban_unblock — unblocking is for the out-of-task surface.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -109,12 +111,11 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
-    assert {
-        "kanban_list",
-        "kanban_unblock",
-    }.isdisjoint(kanban), (
-        f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+    assert "kanban_list" in kanban, (
+        f"kanban_list missing from task-scoped orchestrator schema: {kanban}"
+    )
+    assert "kanban_unblock" not in kanban, (
+        "kanban_unblock leaked into task-scoped worker schema"
     )
 
 

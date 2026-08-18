@@ -80,16 +80,31 @@ def _check_kanban_mode() -> bool:
 
 
 def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
+    """Board-mutating routing tools (kanban_unblock) are intentionally
     hidden from task workers.
 
     Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
+    lifecycle tools (complete/block/heartbeat), not unblock board
+    state. Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_board_read_mode() -> bool:
+    """Read-only board discovery (kanban_list).
+
+    Available to any profile that explicitly opts into the kanban
+    toolset — including dispatcher-spawned orchestrator workers
+    (``HERMES_KANBAN_TASK`` set). Orchestrators are themselves
+    dispatched as tasks but still need to enumerate running cards
+    (e.g. the pre-coder file-conflict check); hiding kanban_list from
+    them forced capability self-blocks. Focused workers (coder,
+    reviewer profiles) don't opt into the kanban toolset, so they
+    still never see this tool.
+    """
     return _profile_has_kanban_toolset()
 
 
@@ -442,9 +457,15 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
-    guard = _require_orchestrator_tool("kanban_list")
-    if guard:
-        return guard
+    # Read-only listing is allowed for task-scoped orchestrator workers
+    # whose profile opts into the kanban toolset; only block workers
+    # that never had board discovery in their surface.
+    if os.environ.get("HERMES_KANBAN_TASK") and not _profile_has_kanban_toolset():
+        return tool_error(
+            "kanban_list is available only to profiles with the kanban "
+            "toolset; dispatcher-spawned workers must use kanban_show for "
+            "their assigned task."
+        )
     assignee = args.get("assignee")
     status = args.get("status")
     tenant = args.get("tenant")
@@ -1108,6 +1129,27 @@ def _handle_create(args: dict, **kw) -> str:
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
+    workspace_fallback_note = None
+    if workspace_kind == "worktree" and workspace_path is None:
+        # A worktree card without a path is doomed: the dispatcher fails
+        # it deterministically at spawn time ("workspace_kind=worktree
+        # but no workspace_path"). Board-level default_workdir (resolved
+        # in create_task) can still fill the path; when the board has no
+        # default either, degrade to scratch at create time so the card
+        # stays runnable instead of spawn-failing twice and giving up.
+        try:
+            from hermes_cli.kanban_db import get_current_board, read_board_metadata
+            _board_slug = args.get("board") or get_current_board()
+            if not read_board_metadata(_board_slug).get("default_workdir"):
+                workspace_kind = "scratch"
+                workspace_fallback_note = (
+                    "workspace_kind=worktree had no workspace_path and the "
+                    "board has no default_workdir; created as scratch. Pass "
+                    "workspace_path (e.g. the project repo root) to get a "
+                    "real worktree."
+                )
+        except Exception:
+            pass
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -1178,11 +1220,14 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
-            return _ok(
+            _ok_kwargs = dict(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
             )
+            if workspace_fallback_note:
+                _ok_kwargs["workspace_note"] = workspace_fallback_note
+            return _ok(**_ok_kwargs)
         finally:
             conn.close()
     except ValueError as e:
@@ -1955,7 +2000,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LIST_SCHEMA,
     handler=_handle_list,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=_check_kanban_board_read_mode,
     emoji="📋",
 )
 
