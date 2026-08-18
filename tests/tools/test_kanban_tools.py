@@ -1484,7 +1484,13 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     # Ceiling raised 5_500 → 8_500 after the review-routing/push-before-review
     # and board-column rules were folded into the guidance (local commits
     # 4970bee22/c829b0326 grew it to ~7k chars intentionally).
-    assert 1_500 < len(KANBAN_GUIDANCE) < 8_500, (
+    # Ceiling raised 8_500 → 12_000 (2026-08-18): the self-healing pass
+    # codified six live-reproduced worker failure modes as rules
+    # (origin/develop base, dep install, dirty-worktree adoption,
+    # force-with-lease on own branch, reviewer-owned visual checks,
+    # human-GO cards to till, done-verification evidence) — each one
+    # prevented a real chain stall, so they are load-bearing.
+    assert 1_500 < len(KANBAN_GUIDANCE) < 12_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
