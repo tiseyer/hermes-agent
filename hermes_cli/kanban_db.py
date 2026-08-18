@@ -8902,6 +8902,15 @@ def _dispatch_once_locked(
                                 int(time.time()),
                             ),
                         )
+                        # Sticky block event: without it recompute_ready
+                        # promotes the parked card back to ready@till —
+                        # an unspawnable limbo (live t_c55a415a).
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"kind": "needs_input",
+                             "reason": "review loop: zwei identische "
+                                       "Reviewer-Fehlversuche"},
+                        )
                         _append_event(
                             conn, row["id"], "review_loop_detected",
                             {"signature": review_loop.get("signature"),
