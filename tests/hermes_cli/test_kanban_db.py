@@ -5107,3 +5107,19 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_created_blocked_card_is_sticky_against_recompute(kanban_home):
+    """A card born blocked (human-GO parking) must survive recompute_ready
+    even after all parents complete — exit is an explicit unblock."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="code change", assignee="worker")
+        smoke = kb.create_task(
+            conn, title="Smoke: live check", assignee="till",
+            parents=[parent], initial_status="blocked",
+        )
+        _set_task_status(conn, parent, "done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, smoke).status == "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, smoke)]
+        assert "blocked" in kinds

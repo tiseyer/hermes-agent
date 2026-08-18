@@ -2780,6 +2780,21 @@ def create_task(
                         "initiative_id": hier_initiative,
                     },
                 )
+                if task_status == "blocked":
+                    # A card born blocked (human-GO parking, ops review)
+                    # is an explicit handoff: make the block STICKY so
+                    # recompute_ready cannot silently promote it to
+                    # ready once its parents finish (live-repro: the
+                    # reviewer's blocked@till smoke card got promoted to
+                    # ready@till — an unspawnable limbo state). Exit is
+                    # an explicit unblock, same as worker blocks.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "created blocked (explicit handoff)",
+                         "kind": "needs_input"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
