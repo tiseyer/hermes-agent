@@ -5481,7 +5481,14 @@ def block_task(
         # operator sees it instead of the card silently sitting in review.
         if kind == "review":
             task_tenant = cur_row["tenant"] if "tenant" in cur_row.keys() else None
-            reviewer = _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+            # Central repo→profile resolution: an explicit repo/profile
+            # declaration on the card (or its parent/initiative) beats the
+            # tenant default; without one this degrades to the tenant map.
+            _pair = resolve_task_repo_profiles(conn, task_id)
+            reviewer = (
+                _pair[1] if _pair
+                else _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+            )
             cur_assignee = (
                 cur_row["assignee"] if "assignee" in cur_row.keys() else None
             )
@@ -6080,8 +6087,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path, "
-            "initiative_id FROM tasks WHERE id = ?",
+            "SELECT id, title, body, status, tenant, workspace_kind, "
+            "workspace_path, initiative_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -6089,6 +6096,14 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        # Repo→profile resolution for role-profile children: an explicit
+        # repo/profile declaration on the root beats the tenant default
+        # (goal decompose-repo-routing); without one this is exactly the
+        # fbe14b734c tenant pair.
+        root_pair = resolve_repo_profiles(
+            (root_row["title"] or "") + "\n" + (root_row["body"] or ""),
+            tenant,
+        )
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -6111,22 +6126,36 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
-            # Tenant-correct role profiles: the decomposer LLM sometimes
-            # picks an existing but WRONG-tenant profile (hermes-coder
-            # for a voicera card — live t_05d6b16b crash-looped this
-            # way). If the child assignee is a <prefix>-<role> profile
-            # and the root's tenant has its own <tenant>-<role> profile,
-            # rewrite to the tenant one.
-            if assignee and tenant:
+            # Repo-correct role profiles. Two live failure modes, one
+            # mechanism:
+            #  - fbe14b734c: decomposer LLM picks an existing but
+            #    WRONG-tenant profile (hermes-coder on a voicera card,
+            #    live t_05d6b16b crash loop) → without a declaration the
+            #    resolver yields the tenant pair and we rewrite to it.
+            #  - decompose-repo-routing: the root explicitly declares a
+            #    different repo ("Repository: hermes-agent") → the
+            #    declared pair beats the tenant default, so children
+            #    route to hermes-coder/hermes-reviewer even on a
+            #    voicera-tenant board (2× live repro of the inverse).
+            # A child body may carry its own declaration, which wins
+            # over the root's.
+            if assignee:
+                _child_text = title + "\n" + (body if isinstance(body, str) else "")
+                _pair = resolve_repo_profiles(_child_text, None) or root_pair
                 _m = re.match(r"^([a-z0-9]+)-(coder|reviewer)$", assignee)
-                if _m and _m.group(1) != tenant:
-                    _tenant_profile = f"{tenant}-{_m.group(2)}"
-                    try:
-                        from hermes_cli.profiles import profile_exists
-                        if profile_exists(_tenant_profile):
-                            assignee = _tenant_profile
-                    except Exception:
-                        pass
+                if _m and _pair:
+                    _target = _pair[0] if _m.group(2) == "coder" else _pair[1]
+                    if _target != assignee:
+                        if _pair[2] == "declared":
+                            # Existence already verified by the resolver.
+                            assignee = _target
+                        else:
+                            try:
+                                from hermes_cli.profiles import profile_exists
+                                if profile_exists(_target):
+                                    assignee = _target
+                            except Exception:
+                                pass
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -8198,6 +8227,128 @@ _TENANT_REVIEWER_MAP = {
     "voicera": "voicera-reviewer",
 }
 
+# ---------------------------------------------------------------------------
+# Repo → role-profile resolution (goal decompose-repo-routing, Aug 2026)
+# ---------------------------------------------------------------------------
+# A card can explicitly declare the repository (or the role profiles) it
+# targets. That declaration BEATS the tenant default: a voicera-tenant card
+# that says "Repository: hermes-agent" must route to hermes-coder/
+# hermes-reviewer (2× live repro: children landed on voicera coders which
+# correctly blocked, hanging the chain). Resolution order everywhere:
+#   1. explicit declaration in the card text (Repository:/Repo:/Project:
+#      or Profile: lines — deterministic parsing, no LLM guessing),
+#   2. tenant default (voicera → voicera pair, as before),
+#   3. None — the caller keeps its legacy fallback.
+# The reverse direction (fbe14b734c: decomposer LLM picks a wrong-tenant
+# profile on a card WITHOUT a declaration → rewrite to tenant profile)
+# is preserved: without a declaration the resolver returns exactly the
+# tenant pair.
+
+# Known role-profile prefixes for tenant defaults (v1, extendable).
+_REPO_PROFILE_PREFIXES = ("hermes", "voicera", "goya")
+
+# Signature → profile prefix, matched (case-insensitively) against the VALUE
+# of an explicit declaration line. Ordered longest-first so "hermes-agent"
+# style signatures win over any shorter overlap.
+_REPO_SIGNATURE_MAP = (
+    ("hermes-agent-framework", "hermes"),
+    (".hermes/hermes-agent", "hermes"),
+    ("hermes-agent", "hermes"),
+    ("hermes_agent", "hermes"),
+    ("voicera-os", "voicera"),
+    ("voicera", "voicera"),
+    ("goya-v2", "goya"),
+    ("goya", "goya"),
+)
+
+# Declaration lines. Leading markdown litter ("- ", "> ", "* ") is allowed;
+# the keyword must start the line so prose mentions ("wir sollten das repo
+# aufräumen: ...") don't trigger.
+_REPO_DECL_RE = re.compile(
+    r"(?im)^[ \t>*-]*(?:repo(?:sitory)?|projekt|project)\s*:\s*(?P<val>.+)$"
+)
+_PROFILE_DECL_RE = re.compile(
+    r"(?im)^[ \t>*-]*profiles?\s*:\s*(?P<val>.+)$"
+)
+_ROLE_PROFILE_RE = re.compile(r"\b([a-z0-9]+)-(coder|reviewer)\b")
+
+
+def resolve_repo_profiles(
+    text: Optional[str], tenant: Optional[str],
+) -> Optional[tuple[str, str, str]]:
+    """Resolve the (coder, reviewer, source) profile pair for a card.
+
+    ``text`` is the card's title+body (any of it may be None/empty).
+    Returns ``(coder_profile, reviewer_profile, source)`` where source is
+    ``"declared"`` (explicit declaration found in the text — both profiles
+    verified to exist) or ``"tenant"`` (tenant-default pair, existence NOT
+    required to mirror the legacy ``_TENANT_REVIEWER_MAP`` behavior), or
+    ``None`` when neither applies (caller falls back as before).
+    """
+    if text:
+        prefix: Optional[str] = None
+        decl_vals = [m.group("val") for m in _REPO_DECL_RE.finditer(text)]
+        decl_vals += [m.group("val") for m in _PROFILE_DECL_RE.finditer(text)]
+        for val in decl_vals:
+            low = val.lower()
+            role_hit = _ROLE_PROFILE_RE.search(low)
+            if role_hit:
+                prefix = role_hit.group(1)
+                break
+            for sig, sig_prefix in _REPO_SIGNATURE_MAP:
+                if sig in low:
+                    prefix = sig_prefix
+                    break
+            if prefix:
+                break
+        if prefix:
+            pair = (f"{prefix}-coder", f"{prefix}-reviewer")
+            try:
+                from hermes_cli.profiles import profile_exists
+                if profile_exists(pair[0]) and profile_exists(pair[1]):
+                    return (pair[0], pair[1], "declared")
+            except Exception:
+                pass  # declared profiles unverifiable → fall through
+    if tenant and tenant in _REPO_PROFILE_PREFIXES:
+        return (f"{tenant}-coder", f"{tenant}-reviewer", "tenant")
+    return None
+
+
+def resolve_task_repo_profiles(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[tuple[str, str, str]]:
+    """Resolve role profiles for an existing card.
+
+    Declaration lookup order: the card's own title+body, then its
+    hierarchy parent (``parent_id``), then its initiative root — a
+    decomposed child usually doesn't repeat the root's repo declaration,
+    but must still route like the root. Falls back to the tenant default,
+    then ``None``. Read-only; deterministic.
+    """
+    row = conn.execute(
+        "SELECT title, body, tenant, parent_id, initiative_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    texts: list[str] = []
+    texts.append((row["title"] or "") + "\n" + (row["body"] or ""))
+    seen_rel = set()
+    for rel in (row["parent_id"], row["initiative_id"]):
+        if rel and rel not in seen_rel and rel != task_id:
+            seen_rel.add(rel)
+            prow = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ?", (rel,),
+            ).fetchone()
+            if prow:
+                texts.append((prow["title"] or "") + "\n" + (prow["body"] or ""))
+    for text in texts:
+        resolved = resolve_repo_profiles(text, None)
+        if resolved:
+            return resolved
+    return resolve_repo_profiles(None, row["tenant"])
+
 # Run outcomes that count as "the worker failed at the task" for loop
 # detection. Rate-limits and reclaims are infrastructure noise, not
 # evidence the approach is wrong.
@@ -8871,8 +9022,15 @@ def _dispatch_once_locked(
                 # "orchestrator-autonomy" §4).
                 loop_info = check_failure_loop(conn, row["id"]) or {}
                 _loop_task = get_task(conn, row["id"])
-                reviewer = _TENANT_REVIEWER_MAP.get(
-                    _loop_task.tenant if _loop_task else None, "reviewer",
+                # Same central repo→profile resolution as the review block
+                # path — a repo declaration on the card beats the tenant
+                # default here too (goal decompose-repo-routing §4).
+                _pair = resolve_task_repo_profiles(conn, row["id"])
+                reviewer = (
+                    _pair[1] if _pair
+                    else _TENANT_REVIEWER_MAP.get(
+                        _loop_task.tenant if _loop_task else None, "reviewer",
+                    )
                 )
                 with write_txn(conn):
                     cur = conn.execute(
