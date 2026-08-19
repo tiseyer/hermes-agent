@@ -80,6 +80,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "parent_id": t.parent_id,
+        "initiative_id": t.initiative_id,
     }
 
 
@@ -309,7 +311,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
-                          help="Parent task id (repeatable)")
+                          help="DEPENDENCY parent task id (repeatable): this "
+                               "task becomes ready only after all listed "
+                               "tasks are done (task_links / scheduling). "
+                               "For the human task HIERARCHY use "
+                               "--parent-task / --initiative instead.")
+    p_create.add_argument("--parent-task", default=None, dest="parent_task",
+                          metavar="ID",
+                          help="HIERARCHY parent card (Hauptaufgabe/step "
+                               "this card belongs under). Purely structural: "
+                               "groups the card into its initiative for the "
+                               "focus board, never affects scheduling. The "
+                               "initiative is derived from the parent "
+                               "automatically.")
+    p_create.add_argument("--initiative", default=None, dest="initiative",
+                          metavar="ID",
+                          help="Initiative/root card this card belongs to "
+                               "(explicit override; usually derived from "
+                               "--parent-task).")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -319,7 +338,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
-    p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument(
+        "--tenant", default=os.environ.get("HERMES_TENANT") or None,
+        help="Tenant namespace (default: $HERMES_TENANT). The tenant drives "
+             "reviewer routing (<tenant>-reviewer), so cards created without "
+             "it fall back to the generic 'reviewer' profile.",
+    )
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -870,12 +894,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect archived-task workspaces, worktree build "
+                   "artifacts, old events, and old logs",
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument("--log-max-total-mb", type=int, default=500,
+                      help="Cap total size of the worker log dir; oldest files "
+                           "beyond the cap are deleted (default: 500, -1 disables)")
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="Report what would be removed without deleting anything")
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
@@ -1368,6 +1398,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            parent_task_id=getattr(args, "parent_task", None),
+            initiative_id=getattr(args, "initiative", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2799,9 +2831,11 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
+    """Remove scratch workspaces of archived tasks, prune worktree build
+    artifacts of terminal tasks, prune old events, and delete old worker
+    logs. ``--dry-run`` reports without deleting."""
     import shutil
+    dry_run = bool(getattr(args, "dry_run", False))
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kb.connect_closing() as conn:
@@ -2822,20 +2856,60 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # Safety: never delete outside the scratch root.
             continue
         if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+            if dry_run:
+                print(f"[dry-run] would remove scratch workspace {path}")
+            else:
+                shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
+
+    # Worktree build artifacts (node_modules/.next/dist/__pycache__/.venv)
+    # of every done/archived worktree task — the ~2 GB-per-run transients
+    # that filled the disk. Worktrees + git state stay; catch-up sweep for
+    # tasks finished before the on-completion prune existed (or whose prune
+    # was deferred behind active children).
+    pruned_dirs = 0
+    pruned_bytes = 0
+    with kb.connect_closing() as conn:
+        wt_rows = conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+            "AND workspace_kind = 'worktree'"
+        ).fetchall()
+        for row in wt_rows:
+            removed = kb.cleanup_worktree_artifacts(
+                conn, row["id"], dry_run=dry_run,
+            )
+            for entry in removed:
+                pruned_dirs += 1
+                pruned_bytes += entry["bytes"]
+                if dry_run:
+                    print(f"[dry-run] would prune {entry['path']} "
+                          f"({entry['bytes'] / (1024 * 1024):.1f} MiB)")
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
-    with kb.connect_closing() as conn:
-        removed_events = kb.gc_events(
-            conn, older_than_seconds=event_days * 24 * 3600,
+    log_cap_mb = getattr(args, "log_max_total_mb", 500)
+    if dry_run:
+        removed_events = 0
+        removed_logs = 0
+        print("[dry-run] event/log GC skipped (age- and size-based, "
+              "runs only in real mode)")
+    else:
+        with kb.connect_closing() as conn:
+            removed_events = kb.gc_events(
+                conn, older_than_seconds=event_days * 24 * 3600,
+            )
+        removed_logs = kb.gc_worker_logs(
+            older_than_seconds=log_days * 24 * 3600,
+            max_total_bytes=(
+                None if log_cap_mb is None or log_cap_mb < 0
+                else log_cap_mb * 1024 * 1024
+            ),
         )
-    removed_logs = kb.gc_worker_logs(
-        older_than_seconds=log_days * 24 * 3600,
-    )
+    verb = "would be removed" if dry_run else "removed"
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{pruned_dirs} artifact dir(s) "
+          f"({pruned_bytes / (1024 * 1024):.1f} MiB), "
+          f"{removed_events} event row(s), {removed_logs} log file(s) {verb}")
     return 0
 
 

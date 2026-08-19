@@ -5978,13 +5978,21 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _bg = not _is_subagent and not os.environ.get("HERMES_KANBAN_TASK")
+        # Kanban workers: stamp the spawn time so the stop-guard pauses its
+        # nudge counter while a delegation is in flight. Updated on EVERY
+        # delegate_task call (not just first) so multi-step orchestrations
+        # (recon -> coder -> ...) always measure from the latest.
+        if not _is_subagent and os.environ.get("HERMES_KANBAN_TASK"):
+            import time as _time
+            self._delegation_spawned_at = _time.time()
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=_bg,
             parent_agent=self,
         )
 

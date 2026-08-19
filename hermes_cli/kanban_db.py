@@ -915,6 +915,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Task hierarchy (human structuring, orthogonal to task_links):
+    # ``parent_id`` = direct parent card, ``initiative_id`` = root
+    # initiative across arbitrarily deep chains. Both None for
+    # top-level / standalone cards.
+    parent_id: Optional[str] = None
+    initiative_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1004,14 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            parent_id=(
+                row["parent_id"] if "parent_id" in keys and row["parent_id"] else None
+            ),
+            initiative_id=(
+                row["initiative_id"]
+                if "initiative_id" in keys and row["initiative_id"]
+                else None
             ),
         )
 
@@ -1116,6 +1130,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_expires        INTEGER,
     tenant               TEXT,
     result               TEXT,
+    -- Optional merge-group tag: tasks sharing the same value are merged
+    -- as a unit by the merger card. NULL = independent task.
+    merge_group          TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
@@ -1176,7 +1193,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Task HIERARCHY (human structuring): the direct parent card of this
+    -- card. Orthogonal to ``task_links`` (machine scheduling/ordering) —
+    -- hierarchy is NEVER derived from dependency edges and vice versa.
+    -- NULL = this card is itself a top-level card (Hauptaufgabe).
+    parent_id            TEXT,
+    -- Root initiative of this card, stable across arbitrarily deep
+    -- parent chains (a grandchild carries the same initiative_id as its
+    -- parent). NULL = this card IS an initiative root / standalone card.
+    initiative_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1727,7 +1753,13 @@ def connect(
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # 100 -> 1000 (2026-08-19): with gateway threads + N workers
+                # + dashboard + bridge API all holding connections, a ~400KB
+                # checkpoint threshold made every writer checkpoint nearly
+                # every burst. Chronic idx_events_task corruption appeared
+                # under exactly that load pattern (storage layer suspected);
+                # fewer, larger checkpoints shrink the contention window.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -1761,7 +1793,13 @@ def connect(
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # 100 -> 1000 (2026-08-19): with gateway threads + N workers
+                # + dashboard + bridge API all holding connections, a ~400KB
+                # checkpoint threshold made every writer checkpoint nearly
+                # every burst. Chronic idx_events_task corruption appeared
+                # under exactly that load pattern (storage layer suspected);
+                # fewer, larger checkpoints shrink the contention window.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
                 # cell content; persisted in the DB header for new DBs.
@@ -1977,6 +2015,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # generic human blocker — same behaviour they had before the column.
         _add_column_if_missing(conn, "tasks", "block_kind", "block_kind TEXT")
 
+    if "merge_group" not in cols:
+        # Optional merge-group tag: tasks sharing the same value are merged
+        # as a unit by the merger card. NULL = independent task.
+        _add_column_if_missing(conn, "tasks", "merge_group", "merge_group TEXT")
+
     if "block_recurrences" not in cols:
         # Unblock-loop counter. Existing rows start at 0, so the loop breaker
         # only begins counting from the first re-block after this migration.
@@ -1985,6 +2028,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "parent_id" not in cols:
+        # Task hierarchy (human structuring): direct parent card. Orthogonal
+        # to task_links (scheduling). Existing rows get NULL = top-level.
+        _add_column_if_missing(conn, "tasks", "parent_id", "parent_id TEXT")
+
+    if "initiative_id" not in cols:
+        # Root initiative of the card (stable across nesting levels).
+        # NULL = the card is itself an initiative root / standalone card.
+        _add_column_if_missing(
+            conn, "tasks", "initiative_id", "initiative_id TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -2000,6 +2055,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_initiative_id ON tasks(initiative_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2404,10 +2465,13 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    merge_group: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    parent_task_id: Optional[str] = None,
+    initiative_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2431,6 +2495,14 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``parent_task_id`` / ``initiative_id`` place the card in the task
+    HIERARCHY (human structuring, e.g. a step under a Hauptaufgabe).
+    This is orthogonal to ``parents`` (task_links), which stays purely a
+    scheduling/ordering relation. When only ``parent_task_id`` is given
+    the initiative is derived from the parent (its ``initiative_id``, or
+    the parent itself when the parent is a root). Hierarchy never
+    affects readiness/dispatch — only how boards group and display.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2611,6 +2683,39 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # Resolve HIERARCHY placement (orthogonal to the dependency
+                # ``parents`` above; see docstring). Explicit initiative_id
+                # wins; otherwise derive it from the hierarchy parent.
+                hier_parent = (str(parent_task_id).strip() or None) if parent_task_id else None
+                hier_initiative = (str(initiative_id).strip() or None) if initiative_id else None
+                if hier_parent:
+                    prow = conn.execute(
+                        "SELECT id, initiative_id, tenant FROM tasks WHERE id = ?",
+                        (hier_parent,),
+                    ).fetchone()
+                    if prow is None:
+                        raise ValueError(f"unknown hierarchy parent task: {hier_parent}")
+                    if hier_initiative is None:
+                        hier_initiative = prow["initiative_id"] or prow["id"]
+                    if tenant is None:
+                        # Members inherit the family's tenant so tenant-filtered
+                        # boards (and the drill-down) keep the whole initiative
+                        # together instead of dropping untagged member cards.
+                        tenant = prow["tenant"]
+                if hier_initiative:
+                    irow = conn.execute(
+                        "SELECT id, tenant FROM tasks WHERE id = ?",
+                        (hier_initiative,),
+                    ).fetchone()
+                    if irow is None:
+                        raise ValueError(f"unknown initiative task: {hier_initiative}")
+                    if hier_parent is None:
+                        # Membership without an explicit parent card: hang the
+                        # card directly under the initiative root.
+                        hier_parent = hier_initiative
+                    if tenant is None:
+                        tenant = irow["tenant"]
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -2634,10 +2739,11 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, tenant, merge_group, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        parent_id, initiative_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2653,6 +2759,7 @@ def create_task(
                         branch_name,
                         project_id,
                         tenant,
+                        merge_group,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -2660,6 +2767,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        hier_parent,
+                        hier_initiative,
                     ),
                 )
                 for pid in parents:
@@ -2679,8 +2788,25 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "parent_task_id": hier_parent,
+                        "initiative_id": hier_initiative,
                     },
                 )
+                if task_status == "blocked":
+                    # A card born blocked (human-GO parking, ops review)
+                    # is an explicit handoff: make the block STICKY so
+                    # recompute_ready cannot silently promote it to
+                    # ready once its parents finish (live-repro: the
+                    # reviewer's blocked@till smoke card got promoted to
+                    # ready@till — an unspawnable limbo state). Exit is
+                    # an explicit unblock, same as worker blocks.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "created blocked (explicit handoff)",
+                         "kind": "needs_input"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3444,6 +3570,16 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
+            # Parent-less ``todo`` tasks are deliberate backlog — a card
+            # sitting in todo with NO dependency links was placed there by
+            # an operator (or a decompose flow that will promote its own
+            # children explicitly). Auto-promoting them here meant every
+            # recompute_ready() sweep (decompose, archive, dispatch tick)
+            # launched unrelated backlog cards board-wide (t_60b203d0 /
+            # goal "orchestrator-autonomy" §1). Only dependency-gated tasks
+            # — or blocked tasks recovering from a parent-wait — promote.
+            if not parents and cur_status == "todo":
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4087,6 +4223,164 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class DoneVerificationError(ValueError):
+    """Raised by ``complete_task`` when a review-gated completion fails
+    reality verification (remote commit / preview URL / test evidence).
+
+    The task is routed back to ``ready`` with the findings as a comment
+    before this is raised, so the board state already reflects the
+    rejection when the worker sees the error. ``.findings`` carries the
+    structured list. ValueError subclass for the same reason as
+    ``HallucinatedCardsError`` — existing tool-error handlers treat it
+    as a recoverable user error.
+    """
+
+    def __init__(self, findings: list[str], task_id: str):
+        self.findings = list(findings)
+        self.task_id = task_id
+        super().__init__(
+            "done-verification failed — task returned to 'ready': "
+            + "; ".join(findings)
+        )
+
+
+_DONE_VERIFY_TEST_EVIDENCE_RE = re.compile(
+    r"(?i)(pytest|unittest|vitest|jest|npm test|cargo test|go test"
+    r"|tests?\s+(pass(ed)?|green|bestanden|gr(ü|u)n)"
+    r"|\btests?:\s"           # a documented "Tests: ..." section
+    r"|\bpass(ed)?\b|\bbestanden\b"
+    r"|\b\d+\s+passed\b|\ballen?\s+tests?\b)"
+)
+_DONE_VERIFY_URL_RE = re.compile(r"https?://[^\s)>\"'\]]+")
+
+
+def _verify_done_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+) -> list[str]:
+    """Reality-check a review-gated completion. Returns findings ([] = ok).
+
+    Checks (goal "orchestrator-autonomy" §2 — Done-Verifikation):
+      1. The task branch exists on the remote (``git ls-remote``): a
+         reviewer-green card whose commits never reached origin is not
+         done.
+      2. If a preview URL is present (``metadata["preview_url"]`` or a
+         preview-ish URL in summary/result), it must answer < 400.
+      3. Test evidence is documented (``metadata["tests_run"]`` or
+         test-result prose in summary/result).
+
+    Only applies to worktree tasks completing out of the review flow
+    (``block_kind == 'review'``); everything else returns [] untouched.
+    Disable globally with ``HERMES_KANBAN_VERIFY_DONE=0``.
+    """
+    if os.environ.get("HERMES_KANBAN_VERIFY_DONE", "1").strip() in ("0", "false", "no"):
+        return []
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, block_kind, "
+        "goal_mode FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return []
+    # Review-flow completions AND goal_mode worktree completions are
+    # reality-checked. goal_mode coders used to slip past this gate by
+    # completing directly (their kind='review' block was rejected), which
+    # let a false "pushed" claim reach done (live t_05914cf9: summary
+    # claimed a remote commit, ls-remote showed nothing).
+    _goal_mode_worktree = bool(
+        ("goal_mode" in row.keys() and row["goal_mode"])
+        and row["workspace_kind"] == "worktree"
+    )
+    if not _goal_mode_worktree and (
+        row["block_kind"] != "review" or row["workspace_kind"] != "worktree"
+    ):
+        return []
+
+    findings: list[str] = []
+    branch = (row["branch_name"] or "").strip()
+
+    # 1. Remote commit present?
+    repo_root: Optional[Path] = None
+    if row["workspace_path"]:
+        ws = Path(row["workspace_path"]).expanduser()
+        if ws.exists():
+            common = _git_common_dir(ws)
+            if common is not None:
+                repo_root = common.parent
+    if branch and repo_root is not None:
+        try:
+            ls = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-remote", "origin",
+                 f"refs/heads/{branch}"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if ls.returncode != 0:
+                findings.append(
+                    f"git ls-remote failed for origin/{branch}: "
+                    + (ls.stderr or "").strip()[:200]
+                )
+            elif not (ls.stdout or "").strip():
+                findings.append(
+                    f"branch {branch!r} is NOT on the remote — the reviewed "
+                    "commits were never pushed"
+                )
+        except Exception as exc:
+            findings.append(f"remote check errored: {exc}")
+    elif branch and repo_root is None:
+        findings.append(
+            "cannot resolve the task worktree to verify the remote push "
+            f"(workspace_path={row['workspace_path']!r})"
+        )
+
+    # 2. Preview URL live?
+    preview_url = None
+    if isinstance(metadata, dict) and isinstance(metadata.get("preview_url"), str):
+        preview_url = metadata["preview_url"].strip()
+    if not preview_url:
+        scan = " ".join(filter(None, [summary, result]))
+        for m in _DONE_VERIFY_URL_RE.finditer(scan):
+            if "preview" in m.group(0).lower():
+                preview_url = m.group(0).rstrip(".,;:")
+                break
+    if preview_url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(preview_url, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if int(getattr(resp, "status", 200)) >= 400:
+                    findings.append(
+                        f"preview URL {preview_url} answered HTTP {resp.status}"
+                    )
+        except Exception as exc:
+            findings.append(
+                f"preview URL {preview_url} is not reachable: {exc}"
+            )
+
+    # 3. Test evidence documented?
+    tests_documented = False
+    if isinstance(metadata, dict):
+        tr = metadata.get("tests_run")
+        if isinstance(tr, (list, tuple)) and len(tr) > 0:
+            tests_documented = True
+        elif isinstance(tr, str) and tr.strip():
+            tests_documented = True
+    if not tests_documented:
+        scan = " ".join(filter(None, [summary, result]))
+        if _DONE_VERIFY_TEST_EVIDENCE_RE.search(scan):
+            tests_documented = True
+    if not tests_documented:
+        findings.append(
+            "no test evidence documented (metadata.tests_run empty and no "
+            "test-result mention in summary/result)"
+        )
+
+    return findings
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4157,6 +4451,52 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Done-Verifikation (goal "orchestrator-autonomy" §2): a reviewer-green
+    # worktree card is only 'done' when reality agrees — remote commit
+    # present, preview (if any) live, tests documented. On mismatch the
+    # card goes back to 'ready' with the concrete findings as a comment
+    # and the completion is rejected.
+    verify_findings = _verify_done_evidence(
+        conn, task_id, summary=summary, result=result, metadata=metadata,
+    )
+    if verify_findings:
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'ready',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                """,
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="gave_up", status="failed",
+                    summary="done-verification failed: "
+                    + "; ".join(verify_findings),
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Done-Verifikation fehlgeschlagen — Karte zurück auf "
+                        "'ready'. Befund:\n- " + "\n- ".join(verify_findings),
+                        now,
+                    ),
+                )
+                _append_event(
+                    conn, task_id, "done_verification_failed",
+                    {"findings": verify_findings}, run_id=run_id,
+                )
+        raise DoneVerificationError(verify_findings, task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -4602,6 +4942,14 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
         if kind != "scratch" or not path:
+            # Worktree workspaces stay (evidence), but their build artifacts
+            # (node_modules/.next/…, ~2 GB per run) must not — they are what
+            # filled the disk. Prune them now that the card is terminal.
+            if kind == "worktree" and path:
+                try:
+                    cleanup_worktree_artifacts(conn, task_id)
+                except Exception:
+                    pass  # best-effort — never block completion
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
@@ -4691,6 +5039,153 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
+
+
+# Build-artifact directory names pruned from finished task worktrees. These
+# are all reproducible from the checkout (npm ci / next build / pip install),
+# so removing them after a card reaches done/archived costs nothing but the
+# rebuild time of a hypothetical re-open — and each one can hold GBs.
+# The worktree itself, its branch, and all committed state stay untouched.
+WORKTREE_ARTIFACT_DIR_NAMES = frozenset({
+    "node_modules", ".next", "dist", "__pycache__", ".venv",
+})
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Best-effort recursive size of *path* in bytes (lstat, skips errors)."""
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _is_prunable_worktree(path: Path) -> bool:
+    """True iff *path* is a linked git worktree whose artifacts may be pruned.
+
+    Two independent guards, both required:
+
+    * the directory must live directly under a ``.worktrees/`` parent — the
+      layout every kanban worktree (and reviewer worktree) is materialized
+      into; and
+    * ``<path>/.git`` must be a *file* (gitdir pointer). In a root checkout
+      ``.git`` is a directory, so the root checkout can never match even if
+      someone pointed ``workspace_path`` at it.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if not resolved.is_dir():
+        return False
+    if resolved.parent.name != ".worktrees":
+        return False
+    return (resolved / ".git").is_file()
+
+
+def prune_worktree_artifacts(
+    workspace: Path, *, dry_run: bool = False,
+) -> list[dict]:
+    """Remove build-artifact dirs from one linked worktree.
+
+    Walks the tree top-down, deletes any directory whose name is in
+    :data:`WORKTREE_ARTIFACT_DIR_NAMES` (without descending into it), and
+    never enters ``.git``. Symlinked matches are skipped so a link into a
+    shared cache cannot pull foreign data into the deletion. Returns a list
+    of ``{"path": str, "bytes": int}`` entries (measured before deletion);
+    with ``dry_run=True`` nothing is deleted but the list is still built.
+    """
+    removed: list[dict] = []
+    if not _is_prunable_worktree(workspace):
+        return removed
+    import shutil
+    for cur, dirs, _files in os.walk(workspace.resolve()):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        hits = [d for d in dirs if d in WORKTREE_ARTIFACT_DIR_NAMES]
+        for name in hits:
+            dirs.remove(name)  # whole subtree goes; don't walk into it
+            target = Path(cur) / name
+            if target.is_symlink():
+                continue
+            size = _dir_size_bytes(target)
+            if not dry_run:
+                shutil.rmtree(target, ignore_errors=True)
+            removed.append({"path": str(target), "bytes": size})
+    return removed
+
+
+def cleanup_worktree_artifacts(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+) -> list[dict]:
+    """Prune build artifacts from a finished task's worktree(s).
+
+    Fires when a ``worktree`` task is ``done`` or ``archived``: removes
+    ``node_modules`` / ``.next`` / ``dist`` / ``__pycache__`` / ``.venv``
+    from the task worktree AND the reviewer worktree
+    ``<repo>/.worktrees/<task-id>-review`` if present. The worktrees
+    themselves, their branches, and all git state remain (evidence stays
+    inspectable); only reproducible build output goes. Deferred only while
+    a child task is actively ``running`` (it may be building inside the
+    parent's tree right now). Unlike the scratch-workspace defer (#33774),
+    todo/ready/blocked children do NOT hold the prune: reviewers routinely
+    park human smoke cards under a finished card for days, and artifacts
+    are reproducible (npm ci) — parking 2 GB behind them re-creates the
+    disk-full problem this exists to solve. Emits a
+    ``worktree_artifacts_pruned`` event with the removed paths + sizes so
+    every deletion is auditable on the card.
+    """
+    row = conn.execute(
+        "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        not row
+        or row["workspace_kind"] != "worktree"
+        or not row["workspace_path"]
+        or row["status"] not in ("done", "archived")
+    ):
+        return []
+    running_children = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? AND t.status = 'running' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if running_children:
+        _log.debug(
+            "Deferring worktree artifact prune for task %s: running children",
+            task_id,
+        )
+        return []
+    workspace = Path(row["workspace_path"]).expanduser()
+    candidates = [workspace]
+    if workspace.parent.name == ".worktrees":
+        candidates.append(workspace.parent / f"{task_id}-review")
+    removed: list[dict] = []
+    for cand in candidates:
+        removed.extend(prune_worktree_artifacts(cand, dry_run=dry_run))
+    if removed:
+        total = sum(r["bytes"] for r in removed)
+        _log.info(
+            "Worktree artifact prune%s for task %s: %d dir(s), %.1f MiB — %s",
+            " (dry-run)" if dry_run else "", task_id, len(removed),
+            total / (1024 * 1024),
+            ", ".join(r["path"] for r in removed),
+        )
+        if not dry_run:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "worktree_artifacts_pruned",
+                        {"dirs": removed, "total_bytes": total},
+                    )
+            except Exception:
+                pass  # audit trail is best-effort; the prune already happened
+    return removed
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4916,7 +5411,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, tenant FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, tenant, assignee "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -4985,11 +5481,109 @@ def block_task(
         # operator sees it instead of the card silently sitting in review.
         if kind == "review":
             task_tenant = cur_row["tenant"] if "tenant" in cur_row.keys() else None
-            _reviewer_map = {
-                "goya": "goya-reviewer",
-                "voicera": "voicera-reviewer",
-            }
-            reviewer = _reviewer_map.get(task_tenant, "reviewer")
+            reviewer = _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+            cur_assignee = (
+                cur_row["assignee"] if "assignee" in cur_row.keys() else None
+            )
+            if cur_assignee == reviewer:
+                # The REVIEWER itself blocked with kind='review': that is
+                # a rejection ("changes requested"), not a review request.
+                # Without this branch the card stayed review@reviewer and
+                # the dispatcher respawned the reviewer forever (the
+                # themeColor rejection loop). Route the card back to the
+                # original implementer — latest run profile that isn't
+                # the reviewer — as a fresh ready card.
+                impl_row = conn.execute(
+                    "SELECT profile FROM task_runs "
+                    "WHERE task_id = ? AND profile IS NOT NULL "
+                    "AND profile != ? ORDER BY id DESC LIMIT 1",
+                    (task_id, reviewer),
+                ).fetchone()
+                implementer = impl_row["profile"] if impl_row else None
+                if implementer:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'ready',
+                               assignee      = ?,
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = NULL
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """ + (
+                            "" if expected_run_id is None
+                            else " AND current_run_id = ?"
+                        ),
+                        (implementer, task_id) if expected_run_id is None
+                        else (implementer, task_id, int(expected_run_id)),
+                    )
+                    if cur.rowcount != 1:
+                        return False
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        error=f"review rejected → {implementer}: {reason}",
+                    )
+                    if run_id is None:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id, outcome="blocked",
+                            summary=f"review rejected → {implementer}",
+                        )
+                    _append_event(
+                        conn, task_id, "review_rejected",
+                        {"reason": reason, "reviewer": reviewer,
+                         "implementer": implementer, "tenant": task_tenant},
+                        run_id=run_id,
+                    )
+                    conn.execute(
+                        "INSERT INTO task_comments "
+                        "(task_id, author, body, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            task_id, reviewer,
+                            f"REVIEW REJECTED — zurück an {implementer}: "
+                            f"{reason}",
+                            int(time.time()),
+                        ),
+                    )
+                    return True
+                # No implementer derivable — park at the human instead of
+                # spinning the reviewer again.
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + (
+                        "" if expected_run_id is None
+                        else " AND current_run_id = ?"
+                    ),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    error=f"review rejected, no implementer found: {reason}",
+                )
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"reason": f"review rejected, no implementer "
+                               f"derivable: {reason}",
+                     "kind": "needs_input", "reviewer": reviewer},
+                    run_id=run_id,
+                )
+                return True
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5370,9 +5964,26 @@ def specify_triage_task(
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
-    # with no open parents flips straight to 'ready' here instead of
+    # with open-but-done parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
     recompute_ready(conn)
+    # Specifying IS the explicit promotion intent — recompute_ready no
+    # longer promotes parent-less todo cards board-wide, so a specified
+    # task without dependency links is promoted here, scoped to exactly
+    # this task id.
+    with write_txn(conn):
+        has_parents = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if has_parents is None:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                _append_event(conn, task_id, "promoted", None)
     return True
 
 
@@ -5469,8 +6080,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "initiative_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -5484,6 +6095,12 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # Hierarchy: every decomposed child hangs directly under the root
+        # card and inherits the root's initiative (or the root itself when
+        # the root is a top-level Hauptaufgabe). This is what keeps
+        # auto-decomposed machine steps grouped under ONE focus card
+        # instead of flooding the board as peer cards.
+        child_initiative = root_row["initiative_id"] or root_row["id"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5494,6 +6111,22 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            # Tenant-correct role profiles: the decomposer LLM sometimes
+            # picks an existing but WRONG-tenant profile (hermes-coder
+            # for a voicera card — live t_05d6b16b crash-looped this
+            # way). If the child assignee is a <prefix>-<role> profile
+            # and the root's tenant has its own <tenant>-<role> profile,
+            # rewrite to the tenant one.
+            if assignee and tenant:
+                _m = re.match(r"^([a-z0-9]+)-(coder|reviewer)$", assignee)
+                if _m and _m.group(1) != tenant:
+                    _tenant_profile = f"{tenant}-{_m.group(2)}"
+                    try:
+                        from hermes_cli.profiles import profile_exists
+                        if profile_exists(_tenant_profile):
+                            assignee = _tenant_profile
+                    except Exception:
+                        pass
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -5509,8 +6142,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " parent_id, initiative_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5521,6 +6155,8 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    task_id,
+                    child_initiative,
                 ),
             )
             _append_event(
@@ -5589,13 +6225,29 @@ def decompose_triage_task(
             },
         )
 
-    # Outside the write_txn: promote parent-free children to 'ready'
-    # so the dispatcher picks them up on its next tick. Same pattern
-    # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
-    # for manual-review-first workflows.
+    # Outside the write_txn: promote THIS decomposition's parent-free
+    # children to 'ready' so the dispatcher picks them up on its next
+    # tick. Explicitly scoped to the just-created child ids —
+    # recompute_ready() no longer sweeps parent-less todo cards
+    # board-wide (that launched unrelated backlog cards; see the guard
+    # in recompute_ready). When auto_promote is False children stay in
+    # 'todo' until the user manually promotes them — useful for
+    # manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        parent_free = [
+            child_ids[i] for i, c in enumerate(children)
+            if not (c.get("parents") or [])
+        ]
+        if parent_free:
+            with write_txn(conn):
+                for cid in parent_free:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'ready' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (cid,),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(conn, cid, "promoted", None)
     return child_ids
 
 
@@ -5622,6 +6274,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # Archive is the second terminal transition where worktree build
+    # artifacts may still be lying around (e.g. task went straight from
+    # blocked → archived and never passed through complete_task).
+    try:
+        cleanup_worktree_artifacts(conn, task_id)
+    except Exception:
+        pass  # best-effort — never block archiving
     return True
 
 
@@ -5665,12 +6324,43 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
+        # Children gated on the deleted task lose that gate. Remember them
+        # BEFORE dropping the links: recompute_ready no longer promotes
+        # parent-less todo cards board-wide, so the promotion below must be
+        # scoped to exactly these former children.
+        former_children = [
+            r["child_id"] for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,),
+            ).fetchall()
+        ]
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
+    # Scoped promotion for the deleted task's former children whose LAST
+    # open gate was the deleted parent (i.e. no remaining unfinished
+    # parents). Mirrors the done/archived promotion semantics.
+    if former_children:
+        with write_txn(conn):
+            for cid in former_children:
+                open_parent = conn.execute(
+                    "SELECT 1 FROM tasks t "
+                    "JOIN task_links l ON l.parent_id = t.id "
+                    "WHERE l.child_id = ? "
+                    "AND t.status NOT IN ('done', 'archived') LIMIT 1",
+                    (cid,),
+                ).fetchone()
+                if open_parent is None:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'ready' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (cid,),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(conn, cid, "promoted", None)
     return True
 
 
@@ -5797,7 +6487,18 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    New branches are rooted on the freshest reachable remote base (upstream
+    tracking ref, else the remote's default branch, else local ``HEAD`` when
+    offline/no-remote) via the shared ``hermes_cli.worktree_base`` resolver —
+    the same contract ``cli.py``'s ``hermes -w`` bootstrap uses. Without
+    this, a dispatcher running from a standalone clone whose local ``HEAD``
+    lags ``origin/main`` would silently root every new task branch on that
+    stale base (see task t_c3e3ed9c). An EXISTING branch is always attached
+    as-is — never rebased or re-based here — so branch-attach semantics for
+    resumed/decompose-child tasks are unaffected by this change.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -5805,12 +6506,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+    base_ref = "HEAD"
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        from hermes_cli.worktree_base import resolve_worktree_base
+        base_ref, _label = resolve_worktree_base(str(repo_root))
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -5819,6 +6523,22 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         timeout=60,
         check=False,
     )
+    if result.returncode != 0 and base_ref != "HEAD":
+        # Branching from the resolved remote ref failed for any reason (e.g.
+        # a partial fetch left the ref unusable) — retry from local HEAD so
+        # worktree creation never hard-fails purely on a sync hiccup. Mirrors
+        # cli.py's _setup_worktree retry-on-remote-base-failure behavior.
+        fallback_cmd = [
+            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
+            str(target), "HEAD",
+        ]
+        result = subprocess.run(
+            fallback_cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
@@ -5895,6 +6615,165 @@ def _resolve_worktree_workspace(
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _maybe_repair_stale_worktree(workspace: Path) -> Optional[dict]:
+    """Detect + auto-repair a worktree whose branch sits on a stale base.
+
+    Called by the dispatcher before (re)spawning a coder into an EXISTING
+    worktree. When the branch does not contain the current remote base
+    (upstream/default-branch tip), the orchestrator repairs it instead of
+    letting the coder run into conflicts (goal "orchestrator-autonomy" §3
+    / Canary 2):
+
+      * no unique commits on the branch → hard-reset the branch onto the
+        fresh base (nothing of value is lost; uncommitted dirt in a
+        dispatcher-managed worktree between runs is not preserved work).
+      * unique commits present → attempt ``git rebase`` onto the base;
+        on conflict, abort the rebase and report (the coder handles it).
+
+    Returns a repair-report dict when something was detected/attempted,
+    else None (worktree already current). Never raises — repair is
+    best-effort and the spawn proceeds regardless.
+    """
+    try:
+        from hermes_cli.worktree_base import resolve_worktree_base
+        base_ref, base_label = resolve_worktree_base(str(workspace))
+        if base_ref == "HEAD":
+            return None  # offline / no remote — nothing to compare against
+        def _git(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", str(workspace), *args],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        base_tip = _git("rev-parse", "--verify", "--quiet", base_ref)
+        if base_tip.returncode != 0:
+            return None
+        base_sha = base_tip.stdout.strip()
+        contains = _git("merge-base", "--is-ancestor", base_sha, "HEAD")
+        if contains.returncode == 0:
+            return None  # branch already contains the current base
+        unique = _git("rev-list", "--count", f"{base_ref}..HEAD")
+        unique_count = int((unique.stdout or "0").strip() or 0)
+        if unique_count == 0:
+            reset = _git("reset", "--hard", base_sha)
+            return {
+                "action": "reset",
+                "base": base_label,
+                "base_sha": base_sha[:12],
+                "ok": reset.returncode == 0,
+                "detail": (reset.stderr or reset.stdout or "").strip()[:200],
+            }
+        rebase = _git("rebase", base_sha, timeout=120)
+        if rebase.returncode != 0:
+            _git("rebase", "--abort")
+            return {
+                "action": "rebase_conflict",
+                "base": base_label,
+                "base_sha": base_sha[:12],
+                "ok": False,
+                "detail": (rebase.stderr or rebase.stdout or "").strip()[:300],
+            }
+        return {
+            "action": "rebase",
+            "base": base_label,
+            "base_sha": base_sha[:12],
+            "ok": True,
+            "detail": f"{unique_count} eigene Commits auf frische Basis rebased",
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("stale-worktree repair failed for %s: %s", workspace, exc)
+        return None
+
+
+def _resolve_review_worktree_workspace(
+    task: Task, *, board: Optional[str] = None
+) -> tuple[Path, str]:
+    """Materialize a SEPARATE reviewer worktree for a review-claimed task.
+
+    Reviewers must never share the coder's worktree (they could corrupt
+    in-progress state, and they'd review the local tree instead of what
+    was actually pushed). This resolves the repo root from the coder's
+    worktree (or the board default_workdir), fetches the task branch from
+    ``origin``, and materializes ``<repo>/.worktrees/<task-id>-review``
+    checked out at ``origin/<branch>`` (detached). Falls back to the
+    local branch tip when the branch was never pushed — the reviewer is
+    expected to flag the missing push as a finding.
+
+    The task row's ``workspace_path`` is deliberately NOT the target:
+    callers must not persist this path onto the task, so a review
+    rejection sends the coder back to their own original worktree.
+    """
+    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+
+    # Resolve the main repo root. The coder's workspace_path is a linked
+    # worktree — its git-common-dir points into the main checkout.
+    repo_root: Optional[Path] = None
+    if task.workspace_path:
+        coder_ws = Path(task.workspace_path).expanduser()
+        if coder_ws.exists():
+            common = _git_common_dir(coder_ws)
+            if common is not None:
+                # <repo>/.git → repo root is its parent
+                repo_root = common.parent
+    if repo_root is None:
+        board_slug = board if board else get_current_board()
+        board_default = (
+            read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+        if not board_default:
+            raise ValueError(
+                f"review task {task.id}: cannot resolve a repo root for the "
+                f"reviewer worktree (no coder workspace, and board "
+                f"{board_slug!r} has no default_workdir)"
+            )
+        repo_root = _git_toplevel(Path(board_default).expanduser())
+        if repo_root is None:
+            raise ValueError(
+                f"review task {task.id}: board default_workdir "
+                f"{board_default!r} is not inside a git repo"
+            )
+
+    target = repo_root / ".worktrees" / f"{task.id}-review"
+
+    # Fetch the branch so origin/<branch> reflects what the coder pushed.
+    # Best-effort: offline review of the local tip is better than a
+    # hard-failed dispatch.
+    subprocess.run(
+        ["git", "-C", str(repo_root), "fetch", "origin", branch_name],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    remote_ref = f"origin/{branch_name}"
+    has_remote = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+         remote_ref],
+        capture_output=True, text=True, timeout=30, check=False,
+    ).returncode == 0
+    review_ref = remote_ref if has_remote else branch_name
+
+    if target.exists() and _is_linked_worktree_checkout(target):
+        # Reuse the existing reviewer worktree but sync it to the ref
+        # under review — a re-review after a coder fix must see the new
+        # push, not the previous round's checkout.
+        subprocess.run(
+            ["git", "-C", str(target), "checkout", "--detach", review_ref],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return target, branch_name
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "add", "--detach",
+         str(target), review_ref],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"reviewer worktree add failed for {target} at {review_ref}: "
+            f"{stderr}"
+        )
+    return target, branch_name
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -7304,6 +8183,96 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+# Cards whose title/body demands smoke-test / deploy / live actions must
+# never start unattended from the default-assignee fallback — they wait
+# for an explicit human GO (goal "orchestrator-autonomy" / Canary 4).
+_GO_GATE_RE = re.compile(
+    r"(?i)\b(smoke[- ]?tests?|smoke\b|deploy(ment|s|en)?\b|go[- ]?live"
+    r"|live[- ]?(gang|schalt\w*|aktivierung)|production|prod[- ]?release)"
+)
+
+# Tenant → reviewer profile routing. Used by the review block path and
+# the loop-detection diagnosis routing so both always agree.
+_TENANT_REVIEWER_MAP = {
+    "goya": "goya-reviewer",
+    "voicera": "voicera-reviewer",
+}
+
+# Run outcomes that count as "the worker failed at the task" for loop
+# detection. Rate-limits and reclaims are infrastructure noise, not
+# evidence the approach is wrong.
+_LOOP_FAILURE_OUTCOMES = ("crashed", "timed_out", "gave_up", "spawn_failed", "failed")
+
+
+def _normalize_failure_signature(text: Optional[str]) -> Optional[str]:
+    """Collapse a failure error/summary to a comparable signature.
+
+    First non-empty line, lowercased, whitespace collapsed, volatile
+    tokens (hex ids, pids, timestamps) stripped so 'same file / same
+    test / same error' compares equal across two runs.
+    """
+    if not text:
+        return None
+    line = ""
+    for candidate in str(text).strip().splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    if not line:
+        return None
+    line = line.lower()
+    line = re.sub(r"0x[0-9a-f]+", "<hex>", line)
+    line = re.sub(r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2})?\b", "<ts>", line)
+    line = re.sub(r"\bpid[= ]?\d+\b", "<pid>", line)
+    line = re.sub(r"\s+", " ", line)
+    return line[:300] or None
+
+
+def check_failure_loop(
+    conn: sqlite3.Connection, task_id: str,
+    *,
+    outcomes: Optional[tuple[str, ...]] = None,
+    profile: Optional[str] = None,
+) -> Optional[dict]:
+    """Detect a worker failing twice in a row at the SAME thing.
+
+    Returns ``{"signature": ..., "runs": [run_id, run_id]}`` when the two
+    most recent ended runs both failed (outcome in
+    :data:`_LOOP_FAILURE_OUTCOMES`, or the explicit ``outcomes`` override)
+    with the same normalized failure signature — the trigger for the
+    orchestrator to STOP the third attempt and switch to diagnosis (goal
+    "orchestrator-autonomy" §4). Returns ``None`` otherwise.
+
+    ``profile`` requires the two most recent ended runs (of ANY profile)
+    to BOTH belong to that profile — used by the review-loop brake so a
+    reviewer is only judged by its own consecutive runs. A run by a
+    different profile in between (e.g. the implementer re-ran after a
+    rejection) resets the window: that is fresh progress, not a loop.
+    """
+    _outcomes = outcomes if outcomes is not None else _LOOP_FAILURE_OUTCOMES
+    runs = conn.execute(
+        "SELECT id, profile, outcome, error, summary FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if profile is not None and any(r["profile"] != profile for r in runs):
+        return None
+    if len(runs) < 2:
+        return None
+    sigs = []
+    for r in runs:
+        if r["outcome"] not in _outcomes:
+            return None
+        sig = _normalize_failure_signature(r["error"] or r["summary"])
+        if sig is None:
+            return None
+        sigs.append(sig)
+    if sigs[0] != sigs[1]:
+        return None
+    return {"signature": sigs[0], "runs": [runs[0]["id"], runs[1]["id"]]}
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -7401,6 +8370,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
+
+    # 2b. Failure loop: the worker failed twice in a row at the SAME
+    #     thing. A third identical attempt is wasted budget — the
+    #     dispatcher routes the task to the reviewer for a diagnosis
+    #     check instead (see the loop_detected handling in
+    #     ``_dispatch_once_locked``).
+    if check_failure_loop(conn, task_id) is not None:
+        return "loop_detected"
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
@@ -7649,7 +8626,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, body, tenant FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7708,6 +8685,62 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): Smoke-, Deploy-
+        # und Live-Karten dürfen NIE ungefragt vom default-Fallback starten.
+        # Ohne expliziten menschlichen Assignee (oder mit 'default') werden
+        # sie an 'till' geparkt — kein Hermes-Profil, also nicht spawnbar —
+        # bis ein Mensch GO gibt (Assignee auf ein echtes Profil setzt).
+        # Explizit von Hand einem Profil zugewiesene Karten passieren das
+        # Gate unverändert.
+        if (not row_assignee or row_assignee == "default") and _GO_GATE_RE.search(
+            f"{row['title'] or ''}\n{row['body'] or ''}"
+        ):
+            result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                with write_txn(conn):
+                    # Park as blocked@till, not ready@till: the board
+                    # invariant says every waiting-on-a-human card is
+                    # ``blocked`` — a GO-gated card sitting in ``ready``
+                    # reads as "stuck" on every board scan. The sticky
+                    # ``blocked`` event keeps recompute_ready from
+                    # ping-ponging it back; the human GO is an explicit
+                    # unblock + assignee change.
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = 'till', "
+                        "status = 'blocked', block_kind = 'needs_input' "
+                        "WHERE id = ? AND status = 'ready' "
+                        "AND (assignee IS NULL OR assignee = '' "
+                        "     OR assignee = 'default')",
+                        (row["id"],),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"kind": "needs_input",
+                             "reason": "go_gate: smoke/deploy/live card "
+                                       "requires explicit human GO"},
+                        )
+                        _append_event(
+                            conn, row["id"], "go_gate_held",
+                            {"assignee": "till", "status": "blocked",
+                             "reason": "smoke/deploy/live card requires "
+                                       "explicit human GO"},
+                        )
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "GO-Gate: Diese Karte verlangt Smoke/Deploy/"
+                                "Live-Aktionen und wird nicht automatisch "
+                                "gestartet. Assignee auf 'till' gesetzt — "
+                                "für GO einem echten Profil zuweisen.",
+                                int(time.time()),
+                            ),
+                        )
+            continue
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -7766,14 +8799,44 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+            # Self-heal generic machine assignees before giving up: a
+            # planner naming a role ('reviewer', 'coder') instead of the
+            # tenant profile ('voicera-reviewer') left the card in ready
+            # forever — skipped_nonspawnable every tick with no diagnosis
+            # (live-repro: t_0f5f947a ready@reviewer). If the tenant-
+            # prefixed profile exists, remap and fall through to spawn.
+            _task_tenant = row["tenant"] if "tenant" in row.keys() else None
+            _remapped = (
+                f"{_task_tenant}-{row_assignee}" if _task_tenant else None
+            )
+            if (
+                _remapped
+                and profile_exists(_remapped)
+                and not dry_run
+            ):
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = ? "
+                        "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                        (_remapped, row["id"], row_assignee),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "assignee_remapped",
+                            {"from": row_assignee, "to": _remapped,
+                             "reason": "profile does not exist; tenant-"
+                                       "prefixed profile does"},
+                        )
+                        row_assignee = _remapped
+            if not profile_exists(row_assignee):
+                # Bucket separately from skipped_unassigned: the operator
+                # cannot fix this by assigning a profile (the assignee IS
+                # the intended owner — a terminal lane, e.g. 'till').
+                # Health telemetry uses this distinction to suppress
+                # spurious "stuck" warnings on multi-lane setups where
+                # the ready queue is steadily full of human-pulled work.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7798,6 +8861,59 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if guard_reason == "loop_detected" and not dry_run:
+                # Two consecutive failures at the same thing — do NOT
+                # burn a third identical attempt. Route the card to the
+                # reviewer as a DIAGNOSIS check: the reviewer verifies
+                # whether the failure diagnosis is correct (not the next
+                # fix). Only after a confirmed diagnosis should a newly
+                # phrased coder task continue the work (goal
+                # "orchestrator-autonomy" §4).
+                loop_info = check_failure_loop(conn, row["id"]) or {}
+                _loop_task = get_task(conn, row["id"])
+                reviewer = _TENANT_REVIEWER_MAP.get(
+                    _loop_task.tenant if _loop_task else None, "reviewer",
+                )
+                with write_txn(conn):
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status     = 'review',
+                               assignee   = ?,
+                               block_kind = 'review'
+                         WHERE id = ? AND status = 'ready'
+                           AND claim_lock IS NULL
+                        """,
+                        (reviewer, row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "Loop erkannt: zwei aufeinanderfolgende "
+                                "Fehlversuche an derselben Stelle — "
+                                f"Signatur: {loop_info.get('signature')!r}. "
+                                "Dritter identischer Versuch gestoppt. "
+                                "DIAGNOSE-AUFTRAG an den Reviewer: Prüfe, ob "
+                                "die Fehlerdiagnose der letzten beiden Runs "
+                                "stimmt — NICHT den nächsten Fix bauen. "
+                                "Ergebnis als Kommentar dokumentieren; danach "
+                                "wird ein neu formulierter Coder-Auftrag "
+                                "erstellt.",
+                                int(time.time()),
+                            ),
+                        )
+                        _append_event(
+                            conn, row["id"], "loop_detected",
+                            {"signature": loop_info.get("signature"),
+                             "runs": loop_info.get("runs"),
+                             "routed_to": reviewer},
+                        )
+                continue
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
@@ -7840,6 +8956,34 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Blocker-Auto-Resolution (goal §3 / Canary 2): a worktree
+            # whose branch sits on a stale base is repaired here —
+            # reset/rebase onto the fresh remote base — instead of
+            # letting the coder run into avoidable conflicts or
+            # escalating a purely technical blocker to a human.
+            repair = _maybe_repair_stale_worktree(Path(workspace))
+            if repair is not None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, claimed.id, "worktree_repaired", repair,
+                    )
+                    if repair.get("action") == "rebase_conflict":
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                claimed.id,
+                                "orchestrator",
+                                "Worktree-Basis ist veraltet und der "
+                                "Auto-Rebase schlug fehl (Konflikt). Bitte "
+                                "im Worktree auf die aktuelle Remote-Basis "
+                                f"({repair.get('base')}) rebasen, bevor du "
+                                "weiterarbeitest. Detail: "
+                                + str(repair.get("detail") or ""),
+                                int(time.time()),
+                            ),
+                        )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -7901,6 +9045,69 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        # Loop brake for review runs: a reviewer that failed twice in a
+        # row at the same thing must not get a third identical attempt
+        # (themeColor card burned 5 runs this way). Unlike the ready
+        # path we cannot route "to the reviewer for diagnosis" — this IS
+        # the reviewer — so park the card at the human with the loop
+        # signature. blocked@till is a terminal state per the board
+        # invariant; review-with-no-progress is not.
+        # Scope: only the reviewer's OWN ended runs (profile filter) and
+        # only real run outcomes — spawn_failed stays with the existing
+        # consecutive_failures circuit breaker (gave_up → auto_block).
+        review_loop = check_failure_loop(
+            conn, row["id"],
+            profile=row["assignee"],
+            outcomes=("crashed", "timed_out", "gave_up", "failed", "blocked"),
+        )
+        if review_loop is not None:
+            result.respawn_guarded.append((row["id"], "review_loop_detected"))
+            if not dry_run:
+                with write_txn(conn):
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status     = 'blocked',
+                               assignee   = 'till',
+                               block_kind = 'needs_input'
+                         WHERE id = ? AND status = 'review'
+                           AND claim_lock IS NULL
+                        """,
+                        (row["id"],),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "Review-Loop erkannt: zwei aufeinanderfolgende "
+                                "Reviewer-Fehlversuche mit identischer Signatur "
+                                f"— {review_loop.get('signature')!r}. Dritter "
+                                "identischer Review-Run gestoppt; Karte "
+                                "eskaliert an till (needs_input). Bitte "
+                                "Reviewer-Logs der letzten beiden Runs prüfen.",
+                                int(time.time()),
+                            ),
+                        )
+                        # Sticky block event: without it recompute_ready
+                        # promotes the parked card back to ready@till —
+                        # an unspawnable limbo (live t_c55a415a).
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"kind": "needs_input",
+                             "reason": "review loop: zwei identische "
+                                       "Reviewer-Fehlversuche"},
+                        )
+                        _append_event(
+                            conn, row["id"], "review_loop_detected",
+                            {"signature": review_loop.get("signature"),
+                             "runs": review_loop.get("runs"),
+                             "routed_to": "till"},
+                        )
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -7915,9 +9122,15 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
-            resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                # Reviewer isolation: NEVER reuse the coder's worktree.
+                # Materialize a separate  <repo>/.worktrees/<id>-review
+                # checkout at origin/<coder-branch> so the reviewer sees
+                # exactly what was pushed and cannot corrupt the coder's
+                # in-progress tree (goal "orchestrator-autonomy" §5).
+                workspace, _rv_branch = _resolve_review_worktree_workspace(
+                    claimed, board=board
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -7928,17 +9141,30 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Do NOT persist the reviewer worktree onto the task row —
+            # workspace_path must keep pointing at the coder's worktree so
+            # a review rejection sends the coder back to their own tree.
+            # The reviewer subprocess still lands in the right place: the
+            # spawn passes `workspace` as cwd / HERMES_KANBAN_WORKSPACE /
+            # TERMINAL_CWD explicitly. In-memory only:
+            claimed.workspace_path = str(workspace)
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "review_worktree",
+                    {"path": str(workspace),
+                     "branch": (claimed.branch_name or "").strip() or None},
+                )
+        else:
+            # Persist the resolved workspace path so the worker can cd there.
+            set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # NOTE (2026-07-28): sdlc-review skill was a planned but never-built
+        # phantom.  Reviewers run from their SOUL + Brain Prüf-Katalog
+        # which covers the full review logic.  This line previously
+        # force-loaded the missing skill, causing every reviewer to crash
+        # at startup.  Reverted to empty — reviewers self-sufficient.
+        claimed.skills = []
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -9050,25 +10276,49 @@ def gc_events(
 
 def gc_worker_logs(
     *, older_than_seconds: int = 30 * 24 * 3600,
+    max_total_bytes: Optional[int] = None,
     board: Optional[str] = None,
 ) -> int:
     """Delete worker log files older than ``older_than_seconds``. Returns
     the number of files removed. Kept separate from ``gc_events`` because
     log files live on disk, not in SQLite. Scoped to ``board`` (defaults
     to the active board) — per-board isolation means deleting logs from
-    board A cannot touch board B's logs."""
+    board A cannot touch board B's logs.
+
+    ``max_total_bytes`` additionally caps the total size of the log dir:
+    after the age pass, remaining files are deleted oldest-first (mtime)
+    until the directory fits under the cap. Age alone cannot bound disk
+    use when many workers run in a short window — the cap can."""
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
     removed = 0
+    survivors: list[tuple[float, int, Path]] = []  # (mtime, size, path)
     for p in log_dir.iterdir():
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff:
+            if not p.is_file():
+                continue
+            st = p.stat()
+            if st.st_mtime < cutoff:
                 p.unlink()
                 removed += 1
+            else:
+                survivors.append((st.st_mtime, st.st_size, p))
         except OSError:
             continue
+    if max_total_bytes is not None and max_total_bytes >= 0:
+        total = sum(size for _mtime, size, _p in survivors)
+        survivors.sort()  # oldest first
+        for _mtime, size, p in survivors:
+            if total <= max_total_bytes:
+                break
+            try:
+                p.unlink()
+                removed += 1
+                total -= size
+            except OSError:
+                continue
     return removed
 
 
@@ -9304,3 +10554,135 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Initiative / focus-mode aggregation
+# ---------------------------------------------------------------------------
+
+# Statuses that count as "waiting" in an initiative rollup — the child
+# exists but no worker is on it yet.
+_ROLLUP_WAITING_STATUSES = {"triage", "todo", "scheduled", "ready"}
+
+
+def go_gated_task_ids(conn: sqlite3.Connection) -> set[str]:
+    """Ids of tasks that were parked by the GO gate and are still parked.
+
+    The GO gate has no dedicated column — its durable representation is
+    the ``go_gate_held`` event plus ``assignee='till'`` (see
+    ``_dispatch_once_locked``). A card stops counting as GO-gated as
+    soon as it completes or a human re-assigns it.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT e.task_id FROM task_events e "
+        "JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'go_gate_held' AND t.assignee = 'till' "
+        "AND t.status NOT IN ('done', 'archived')"
+    ).fetchall()
+    return {r["task_id"] for r in rows}
+
+
+def initiative_members(conn: sqlite3.Connection, initiative_id: str) -> list[Task]:
+    """All member cards of an initiative (excluding the root itself).
+
+    Membership is defined EXCLUSIVELY by ``tasks.initiative_id`` — never
+    by ``task_links``. Dependency edges between members therefore cannot
+    change what belongs to an initiative.
+    """
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE initiative_id = ? AND id != ? "
+        "ORDER BY created_at ASC, id ASC",
+        (initiative_id, initiative_id),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def initiative_rollups(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+) -> dict[str, dict]:
+    """Aggregate member state per initiative root id.
+
+    Returns ``{root_id: rollup}`` where rollup is::
+
+        {
+            "total": int, "done": int, "running": int, "waiting": int,
+            "review": int, "blocked": int, "needs_go": int, "failed": int,
+            "active": [{"id","title","assignee"}, ...],   # running members
+            "go_titles": [str, ...],                        # GO-parked members
+            "agg_status": "running|blocked|review|done" | None,
+        }
+
+    ``agg_status`` is the initiative's aggregated board status; ``None``
+    means "no signal from members" (caller falls back to the root's own
+    status, e.g. a freshly decomposed initiative that has not started).
+
+    Precedence: a member needing human GO (or hard-blocked) beats
+    running — the focus board is a decision instrument, so the human
+    signal must win. Then running > review > done.
+
+    DECISION: this reads ONLY ``tasks`` (hierarchy columns + status) and
+    the ``go_gate_held`` events. ``task_links`` (depends_on/ordering) is
+    deliberately never consulted — dependencies must not influence the
+    focus view.
+    """
+    where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
+    params: list = []
+    if tenant:
+        # Filter over the ROOT card's tenant: the initiative belongs to its
+        # root, and legacy member rows may predate tenant inheritance.
+        where += (
+            " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
+        )
+        params.append(tenant)
+    rows = conn.execute(
+        f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
+        "ORDER BY created_at ASC, id ASC",
+        params,
+    ).fetchall()
+    go_ids = go_gated_task_ids(conn)
+
+    rollups: dict[str, dict] = {}
+    for r in rows:
+        root = r["initiative_id"]
+        if r["id"] == root:
+            continue
+        agg = rollups.setdefault(root, {
+            "total": 0, "done": 0, "running": 0, "waiting": 0,
+            "review": 0, "blocked": 0, "needs_go": 0, "failed": 0,
+            "active": [], "go_titles": [],
+        })
+        status = r["status"]
+        agg["total"] += 1
+        needs_go = r["id"] in go_ids
+        if needs_go:
+            agg["needs_go"] += 1
+            agg["go_titles"].append(r["title"])
+        if status == "done":
+            agg["done"] += 1
+        elif status == "running":
+            agg["running"] += 1
+            agg["active"].append(
+                {"id": r["id"], "title": r["title"], "assignee": r["assignee"]}
+            )
+        elif status == "review":
+            agg["review"] += 1
+        elif status == "blocked":
+            agg["blocked"] += 1
+        elif status in _ROLLUP_WAITING_STATUSES:
+            if not needs_go:
+                agg["waiting"] += 1
+
+    for agg in rollups.values():
+        if agg["needs_go"] > 0 or agg["blocked"] > 0:
+            agg["agg_status"] = "blocked"
+        elif agg["running"] > 0:
+            agg["agg_status"] = "running"
+        elif agg["review"] > 0:
+            agg["agg_status"] = "review"
+        elif agg["total"] > 0 and agg["done"] == agg["total"]:
+            agg["agg_status"] = "done"
+        else:
+            agg["agg_status"] = None
+    return rollups

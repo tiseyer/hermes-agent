@@ -386,8 +386,34 @@ def get_board(
     current_step_key: Optional[str] = Query(
         None, description="Restrict to tasks at this workflow step key",
     ),
+    view: str = Query(
+        "all",
+        description=(
+            "Board view: 'all' (every card, legacy default), 'focus' "
+            "(only top-level Hauptaufgaben/initiative roots, with an "
+            "aggregated rollup per initiative), or 'drilldown' (only the "
+            "member cards of one initiative; requires ?initiative=)."
+        ),
+    ),
+    initiative: Optional[str] = Query(
+        None, description="Initiative root task id (required for view=drilldown)",
+    ),
 ):
     """Return the full board grouped by status column.
+
+    ``view=focus`` hides every card that belongs to an initiative
+    (``initiative_id`` set) and instead decorates each initiative root
+    with ``task.initiative`` — the rollup produced by
+    :func:`kanban_db.initiative_rollups` (progress, running/waiting/GO
+    counts, aggregated status). Roots are bucketed into the column of
+    their aggregated status (e.g. a member awaiting human GO puts the
+    root into ``blocked``). Membership and aggregation are computed
+    purely from the hierarchy columns — ``task_links`` dependencies
+    never influence this view.
+
+    ``view=drilldown&initiative=<id>`` returns ONLY that initiative's
+    member cards in their real status columns, plus ``initiative_root``
+    (root card + rollup) for the drill-down header.
 
     ``_conn()`` auto-initializes ``kanban.db`` on first call so a fresh
     install doesn't surface a "failed to load" error on the plugin tab.
@@ -396,6 +422,10 @@ def get_board(
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
     """
+    if view not in ("all", "focus", "drilldown"):
+        raise HTTPException(status_code=400, detail="view must be all|focus|drilldown")
+    if view == "drilldown" and not initiative:
+        raise HTTPException(status_code=400, detail="view=drilldown requires ?initiative=<task id>")
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -406,6 +436,27 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
+
+        # Initiative rollups (hierarchy columns only — never task_links).
+        # Computed for every view: focus uses them for filtering/bucketing,
+        # all/drilldown attach them so cards can render progress badges.
+        rollups = kanban_db.initiative_rollups(conn, tenant=tenant)
+        initiative_root_payload: Optional[dict[str, Any]] = None
+        if view == "focus":
+            # Hauptaufgaben only: cards that belong to no initiative.
+            tasks = [t for t in tasks if not t.initiative_id]
+        elif view == "drilldown":
+            root_task = kanban_db.get_task(conn, initiative)
+            if root_task is None:
+                raise HTTPException(status_code=404, detail=f"initiative {initiative} not found")
+            tasks = [
+                t for t in tasks
+                if t.initiative_id == initiative and t.id != initiative
+            ]
+            initiative_root_payload = {
+                "task": _task_dict(root_task),
+                "rollup": rollups.get(initiative),
+            }
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -475,7 +526,17 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            rollup = rollups.get(t.id)
+            if rollup:
+                d["initiative"] = rollup
+            col = t.status
+            if view == "focus" and rollup and rollup.get("agg_status"):
+                # Focus view buckets an initiative root by its AGGREGATED
+                # status (e.g. member needs GO → root shows in blocked),
+                # not by the root's own dispatcher status.
+                col = rollup["agg_status"]
+            if col not in columns:
+                col = "todo"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -505,6 +566,8 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            "view": view,
+            "initiative_root": initiative_root_payload,
         }
     finally:
         conn.close()
@@ -568,6 +631,51 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+
+        # "Ablauf" (flow) section for the drawer: the member steps of this
+        # card's initiative — the card's own initiative when it is a root,
+        # otherwise the initiative it belongs to. Membership comes from the
+        # hierarchy columns only; ``task_links`` is consulted purely to
+        # DISPLAY a concrete wait reason ("wartet auf X") per step.
+        flow: Optional[dict[str, Any]] = None
+        flow_root_id = task.initiative_id or task.id
+        members = kanban_db.initiative_members(conn, flow_root_id)
+        if members:
+            root_task = task if flow_root_id == task.id else kanban_db.get_task(conn, flow_root_id)
+            go_ids = kanban_db.go_gated_task_ids(conn)
+            member_ids = [m.id for m in members]
+            ph = ",".join("?" for _ in member_ids)
+            dep_rows = conn.execute(
+                f"SELECT l.child_id AS cid, t.id AS pid, t.title AS ptitle, t.status AS pstatus "
+                f"FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                f"WHERE l.child_id IN ({ph})",
+                member_ids,
+            ).fetchall()
+            waits: dict[str, list[str]] = {}
+            for r in dep_rows:
+                if r["pstatus"] != "done" and r["pid"] != flow_root_id:
+                    waits.setdefault(r["cid"], []).append(r["ptitle"])
+            steps = []
+            done_n = 0
+            for m in members:
+                if m.status == "done":
+                    done_n += 1
+                steps.append({
+                    "id": m.id,
+                    "title": m.title,
+                    "status": m.status,
+                    "assignee": m.assignee,
+                    "needs_go": m.id in go_ids,
+                    "waiting_on": waits.get(m.id) or [],
+                })
+            flow = {
+                "root": {
+                    "id": flow_root_id,
+                    "title": root_task.title if root_task else flow_root_id,
+                },
+                "progress": {"done": done_n, "total": len(members)},
+                "steps": steps,
+            }
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -575,6 +683,7 @@ def get_task(
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": child_results,
+            "flow": flow,
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -608,6 +717,10 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    # Hierarchy placement (orthogonal to ``parents`` above, which stays a
+    # pure scheduling/dependency relation).
+    parent_task_id: Optional[str] = None
+    initiative_id: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -632,6 +745,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            parent_task_id=payload.parent_task_id,
+            initiative_id=payload.initiative_id,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}

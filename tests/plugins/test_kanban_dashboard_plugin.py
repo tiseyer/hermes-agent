@@ -2484,3 +2484,152 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+# ---------------------------------------------------------------------------
+# Fokusmodus: view=focus / view=drilldown / flow im Task-Detail
+# ---------------------------------------------------------------------------
+
+
+def _mk_focus_fixture(conn):
+    """Initiative (root + 3 Children: done/running/GO-geparkt) + Solokarte."""
+    import time as _time
+
+    root = kb.create_task(conn, title="Preview-Initiative", tenant="voicera", triage=True)
+    kids = kb.decompose_triage_task(
+        conn, root, root_assignee="orchestrator",
+        children=[
+            {"title": "Recon"},
+            {"title": "Webhook", "parents": [0]},
+            {"title": "Live-GO", "parents": [1]},
+        ],
+        author="auto-decomposer",
+    )
+    solo = kb.create_task(conn, title="Solokarte", tenant="voicera")
+    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (kids[0],))
+    conn.execute(
+        "UPDATE tasks SET status='running', assignee='voicera-coder' WHERE id=?",
+        (kids[1],),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', assignee='till' WHERE id=?", (kids[2],)
+    )
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) "
+        "VALUES (?, 'go_gate_held', '{}', ?)",
+        (kids[2], int(_time.time())),
+    )
+    conn.commit()
+    return root, kids, solo
+
+
+def test_board_focus_hides_children_and_aggregates(client, kanban_home):
+    conn = kb.connect()
+    root, kids, solo = _mk_focus_fixture(conn)
+
+    r = client.get("/api/plugins/kanban/board?view=focus")
+    assert r.status_code == 200
+    data = r.json()
+    cards = {t["id"]: (c["name"], t) for c in data["columns"] for t in c["tasks"]}
+
+    # Children sind im Fokus UNSICHTBAR; Root + Solokarte sichtbar.
+    assert all(k not in cards for k in kids)
+    assert root in cards and solo in cards
+
+    # GO-Bedarf eines Childs setzt die Hauptaufgabe auf Blocked (Spalte + Rollup).
+    col, card = cards[root]
+    assert col == "blocked"
+    rollup = card["initiative"]
+    assert rollup["total"] == 3 and rollup["done"] == 1
+    assert rollup["running"] == 1 and rollup["needs_go"] == 1
+    assert rollup["agg_status"] == "blocked"
+    assert rollup["active"][0]["title"] == "Webhook"
+
+    # depends_on-Kanten zu/zwischen Karten ändern die Fokusansicht nicht.
+    outsider = kb.create_task(conn, title="Fremd")
+    kb.link_tasks(conn, outsider, kids[1])
+    r2 = client.get("/api/plugins/kanban/board?view=focus")
+    cards2 = {t["id"]: c["name"] for c in r2.json()["columns"] for t in c["tasks"]}
+    assert cards2[root] == "blocked"
+    assert all(k not in cards2 for k in kids)
+    conn.close()
+
+
+def test_board_drilldown_shows_only_members(client, kanban_home):
+    conn = kb.connect()
+    root, kids, solo = _mk_focus_fixture(conn)
+    conn.close()
+
+    r = client.get(f"/api/plugins/kanban/board?view=drilldown&initiative={root}")
+    assert r.status_code == 200
+    data = r.json()
+    cards = {t["id"]: c["name"] for c in data["columns"] for t in c["tasks"]}
+
+    # AUSSCHLIESSLICH die Children dieser Initiative, in echten Statusspalten.
+    assert set(cards) == set(kids)
+    assert solo not in cards and root not in cards
+    assert cards[kids[0]] == "done"
+    assert cards[kids[1]] == "running"
+
+    # Header-Payload für die Breadcrumb-/Parent-Anzeige.
+    hdr = data["initiative_root"]
+    assert hdr["task"]["id"] == root
+    assert hdr["rollup"]["agg_status"] == "blocked"
+
+
+def test_board_drilldown_requires_initiative(client):
+    assert client.get("/api/plugins/kanban/board?view=drilldown").status_code == 400
+    assert client.get("/api/plugins/kanban/board?view=nope").status_code == 400
+    r = client.get("/api/plugins/kanban/board?view=drilldown&initiative=t_missing")
+    assert r.status_code == 404
+
+
+def test_task_detail_flow_section(client, kanban_home):
+    conn = kb.connect()
+    root, kids, _ = _mk_focus_fixture(conn)
+    conn.close()
+
+    # Flow am Root …
+    r = client.get(f"/api/plugins/kanban/tasks/{root}")
+    assert r.status_code == 200
+    flow = r.json()["flow"]
+    assert flow["root"]["id"] == root
+    assert flow["progress"] == {"done": 1, "total": 3}
+    by_title = {s["title"]: s for s in flow["steps"]}
+    assert by_title["Live-GO"]["needs_go"] is True
+    assert by_title["Webhook"]["status"] == "running"
+    # Wartegrund aus depends_on wird als Text angezeigt (reine Anzeige).
+    assert by_title["Live-GO"]["waiting_on"] == ["Webhook"]
+
+    # … und identisch erreichbar von einem Child aus (Initiative des Childs).
+    r2 = client.get(f"/api/plugins/kanban/tasks/{kids[0]}")
+    assert r2.json()["flow"]["root"]["id"] == root
+
+    # Karten ohne Initiative haben keinen Ablauf-Abschnitt.
+    conn = kb.connect()
+    solo = kb.create_task(conn, title="Einzelkarte")
+    conn.close()
+    r3 = client.get(f"/api/plugins/kanban/tasks/{solo}")
+    assert r3.json()["flow"] is None
+
+
+def test_create_task_with_hierarchy_via_api(client, kanban_home):
+    conn = kb.connect()
+    root = kb.create_task(conn, title="Root", tenant="voicera")
+    conn.close()
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Mitglied", "parent_task_id": root},
+    )
+    assert r.status_code == 200
+    task = r.json()["task"]
+    assert task["parent_id"] == root
+    assert task["initiative_id"] == root
+    assert task["tenant"] == "voicera"  # geerbt
+
+    r400 = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "kaputt", "parent_task_id": "t_missing"},
+    )
+    assert r400.status_code == 400

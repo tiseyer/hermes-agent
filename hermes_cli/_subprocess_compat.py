@@ -232,3 +232,21 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+def noninteractive_git_env(base=None) -> dict:
+    """Environment for *internal* git invocations that must never prompt.
+
+    Returns a copy of ``base`` (default ``os.environ``) with
+    ``GIT_TERMINAL_PROMPT=0`` (git fails fast instead of prompting for
+    credentials) and ``GCM_INTERACTIVE=Never`` (Git Credential Manager
+    never pops a dialog). ``GIT_ASKPASS`` / ``SSH_ASKPASS`` are left
+    alone so a *working* non-interactive helper still succeeds. Pair
+    with ``stdin=subprocess.DEVNULL``. Ported from the newer branch for
+    ``hermes_cli.worktree_base``.
+    """
+    import os
+    env = dict(base if base is not None else os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    return env

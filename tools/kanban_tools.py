@@ -80,16 +80,31 @@ def _check_kanban_mode() -> bool:
 
 
 def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
+    """Board-mutating routing tools (kanban_unblock) are intentionally
     hidden from task workers.
 
     Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
+    lifecycle tools (complete/block/heartbeat), not unblock board
+    state. Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_board_read_mode() -> bool:
+    """Read-only board discovery (kanban_list).
+
+    Available to any profile that explicitly opts into the kanban
+    toolset — including dispatcher-spawned orchestrator workers
+    (``HERMES_KANBAN_TASK`` set). Orchestrators are themselves
+    dispatched as tasks but still need to enumerate running cards
+    (e.g. the pre-coder file-conflict check); hiding kanban_list from
+    them forced capability self-blocks. Focused workers (coder,
+    reviewer profiles) don't opt into the kanban toolset, so they
+    still never see this tool.
+    """
     return _profile_has_kanban_toolset()
 
 
@@ -179,7 +194,11 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+# 'review' is deliberately allowed: the review handoff is not an escape
+# hatch from the goal loop — it routes to the reviewer whose approval
+# goes through the done-verification gate. Rejecting it forced coders
+# into direct kanban_complete, bypassing review entirely (live t_05914cf9).
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "review"})
 
 
 def _goal_judge_available() -> bool:
@@ -442,9 +461,15 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
-    guard = _require_orchestrator_tool("kanban_list")
-    if guard:
-        return guard
+    # Read-only listing is allowed for task-scoped orchestrator workers
+    # whose profile opts into the kanban toolset; only block workers
+    # that never had board discovery in their surface.
+    if os.environ.get("HERMES_KANBAN_TASK") and not _profile_has_kanban_toolset():
+        return tool_error(
+            "kanban_list is available only to profiles with the kanban "
+            "toolset; dispatcher-spawned workers must use kanban_show for "
+            "their assigned task."
+        )
     assignee = args.get("assignee")
     status = args.get("status")
     tenant = args.get("tenant")
@@ -636,6 +661,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.DoneVerificationError as verify_err:
+                # The orchestrator's reality check rejected the completion.
+                # The card is ALREADY back in 'ready' with the findings as
+                # a comment — the worker must not retry kanban_complete
+                # blindly; the findings need to be fixed first (push the
+                # branch, bring the preview up, document the tests).
+                return tool_error(
+                    "kanban_complete rejected by done-verification: "
+                    + "; ".join(verify_err.findings)
+                    + ". The card was returned to 'ready' with these findings "
+                    "as a comment. Fix the findings (push the branch / bring "
+                    "the preview up / document test results), then complete "
+                    "again on the next run."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -1075,6 +1114,7 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    merge_group = args.get("merge_group")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1093,6 +1133,27 @@ def _handle_create(args: dict, **kw) -> str:
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
+    workspace_fallback_note = None
+    if workspace_kind == "worktree" and workspace_path is None:
+        # A worktree card without a path is doomed: the dispatcher fails
+        # it deterministically at spawn time ("workspace_kind=worktree
+        # but no workspace_path"). Board-level default_workdir (resolved
+        # in create_task) can still fill the path; when the board has no
+        # default either, degrade to scratch at create time so the card
+        # stays runnable instead of spawn-failing twice and giving up.
+        try:
+            from hermes_cli.kanban_db import get_current_board, read_board_metadata
+            _board_slug = args.get("board") or get_current_board()
+            if not read_board_metadata(_board_slug).get("default_workdir"):
+                workspace_kind = "scratch"
+                workspace_fallback_note = (
+                    "workspace_kind=worktree had no workspace_path and the "
+                    "board has no default_workdir; created as scratch. Pass "
+                    "workspace_path (e.g. the project repo root) to get a "
+                    "real worktree."
+                )
+        except Exception:
+            pass
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -1157,16 +1218,20 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                merge_group=merge_group,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
-            return _ok(
+            _ok_kwargs = dict(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
             )
+            if workspace_fallback_note:
+                _ok_kwargs["workspace_note"] = workspace_fallback_note
+            return _ok(**_ok_kwargs)
         finally:
             conn.close()
     except ValueError as e:
@@ -1795,6 +1860,17 @@ KANBAN_CREATE_SCHEMA = {
                     "task id), instead of a random branch."
                 ),
             },
+            "merge_group": {
+                "type": "string",
+                "description": (
+                    "Optional group tag. When multiple tasks share the same "
+                    "merge_group value, the merger treats them as a unit: "
+                    "all member branches are merged into a single commit "
+                    "on develop. The merger card for the group stays in "
+                    "todo until all member cards reach done (enforced via "
+                    "parent/child links)."
+                ),
+            },
             "triage": {
                 "type": "boolean",
                 "description": (
@@ -1928,7 +2004,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LIST_SCHEMA,
     handler=_handle_list,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=_check_kanban_board_read_mode,
     emoji="📋",
 )
 

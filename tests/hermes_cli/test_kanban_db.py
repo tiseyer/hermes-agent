@@ -3924,7 +3924,7 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == []  # no forced skills; reviewers self-sufficient
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
@@ -3990,6 +3990,154 @@ def test_has_spawnable_review_false_on_empty(kanban_home):
     """has_spawnable_review returns False when no review tasks exist."""
     with kb.connect() as conn:
         assert kb.has_spawnable_review(conn) is False
+
+
+def test_reviewer_review_block_routes_back_to_implementer(kanban_home):
+    """A reviewer blocking kind='review' is a REJECTION → card returns to
+    the original implementer as ready, instead of respawning the reviewer
+    forever (themeColor rejection loop)."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="fix footer", assignee="voicera-coder",
+            tenant="voicera",
+        )
+        now = int(__import__("time").time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "started_at, ended_at) VALUES (?, 'voicera-coder', 'ended', "
+            "'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', "
+            "assignee = 'voicera-reviewer' WHERE id = ?", (t,),
+        )
+        assert kb.block_task(
+            conn, t, reason="ROT: footer not visible", kind="review",
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "voicera-coder"
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "review_rejected" in kinds
+
+
+def test_coder_review_block_still_routes_to_reviewer(kanban_home):
+    """The normal handoff is untouched: a coder blocking kind='review'
+    sends the card to the tenant reviewer in status review."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="build footer", assignee="voicera-coder",
+            tenant="voicera",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?", (t,),
+        )
+        assert kb.block_task(
+            conn, t, reason="Review requested", kind="review",
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "voicera-reviewer"
+
+
+def test_review_loop_brake_escalates_to_till(kanban_home, all_assignees_spawnable):
+    """Two identical failed reviewer runs park the card at till, no 3rd run.
+
+    Regression for the themeColor card that burned 5 review runs: the
+    review dispatch column had no loop brake. The brake only counts the
+    reviewer's OWN runs (profile filter) with real run outcomes.
+    """
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (2, 1):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, ?, 'ended', "
+                "'gave_up', ?, ?, ?)",
+                (t, "reviewer", "reviewer stalled at step X", now - i * 60,
+                 now - i * 60 + 30),
+            )
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert spawns == [], "review loop must not spawn a third identical run"
+    assert ("review_loop_detected" in [r[1] for r in res.respawn_guarded])
+    assert task.status == "blocked"
+    assert task.assignee == "till"
+    assert "review_loop_detected" in events
+
+
+def test_review_loop_brake_ignores_coder_failures(
+    kanban_home, all_assignees_spawnable,
+):
+    """Coder failures that routed the card to review must not trip the
+    review brake — the reviewer deserves its first diagnosis run."""
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="diagnose me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (2, 1):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, ?, 'ended', "
+                "'crashed', ?, ?, ?)",
+                (t, "voicera-coder", "exit 128: develop already used", now - i * 60,
+                 now - i * 60 + 30),
+            )
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+    assert spawns == [t], "reviewer must get its first run despite coder loop"
+    assert task.status == "running"
+
+
+def test_review_loop_brake_resets_on_interleaved_implementer_run(
+    kanban_home, all_assignees_spawnable,
+):
+    """An implementer run AFTER two identical reviewer failures resets the
+    loop window — the card earned a fresh review, not an escalation.
+    (Live-repro: coder fixed + pushed, brake still fired on stale runs.)"""
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="re-review me", assignee="reviewer")
+        _set_task_status(conn, t, "review")
+        now = int(__import__("time").time())
+        for i in (3, 2):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "error, started_at, ended_at) VALUES (?, 'reviewer', "
+                "'ended', 'gave_up', 'reviewer stalled at step X', ?, ?)",
+                (t, now - i * 60, now - i * 60 + 30),
+            )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "error, started_at, ended_at) VALUES (?, 'voicera-coder', "
+            "'ended', 'blocked', 'review requested → reviewer', ?, ?)",
+            (t, now - 60, now - 30),
+        )
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+    assert spawns == [t], "fresh implementer run must reset the review loop"
+    assert task.status == "running"
 
 
 def test_has_spawnable_review_false_when_only_terminal_lanes(
@@ -4706,13 +4854,14 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
-def test_connect_sets_wal_autocheckpoint_100(tmp_path):
-    """connect() sets wal_autocheckpoint to 100."""
+def test_connect_sets_wal_autocheckpoint(tmp_path):
+    """connect() sets wal_autocheckpoint to 1000 (raised from 100 on
+    2026-08-19 to shrink checkpoint contention under multi-worker load)."""
     from hermes_cli.kanban_db import connect
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
     val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
-    assert val == 100
+    assert val == 1000
     conn.close()
 
 
@@ -4959,3 +5108,293 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_created_blocked_card_is_sticky_against_recompute(kanban_home):
+    """A card born blocked (human-GO parking) must survive recompute_ready
+    even after all parents complete — exit is an explicit unblock."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="code change", assignee="worker")
+        smoke = kb.create_task(
+            conn, title="Smoke: live check", assignee="till",
+            parents=[parent], initial_status="blocked",
+        )
+        _set_task_status(conn, parent, "done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, smoke).status == "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, smoke)]
+        assert "blocked" in kinds
+
+
+def test_dispatch_remaps_generic_assignee_to_tenant_profile(
+    kanban_home, monkeypatch,
+):
+    """A ready card assigned to a role name ('reviewer') with a tenant whose
+    prefixed profile exists ('voicera-reviewer') is remapped and spawned
+    instead of hanging in ready forever (live-repro t_0f5f947a)."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "profile_exists",
+        lambda name: name in ("voicera-reviewer",),
+    )
+    spawns = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawns.append((task.id, task.assignee))
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="Review something", assignee="reviewer",
+            tenant="voicera",
+        )
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert spawns and spawns[0][1] == "voicera-reviewer"
+    assert task.assignee == "voicera-reviewer"
+    assert "assignee_remapped" in events
+
+
+def test_dispatch_nonexistent_assignee_without_tenant_stays_skipped(
+    kanban_home, monkeypatch,
+):
+    """No tenant → no remap target; card stays skipped_nonspawnable."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="human lane", assignee="till")
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 42)
+    assert t in res.skipped_nonspawnable
+
+
+# ---------------------------------------------------------------------------
+# Worktree build-artifact prune (disk-hygiene goal, Aug 2026)
+# ---------------------------------------------------------------------------
+
+def _make_linked_worktree(repo: Path, name: str) -> Path:
+    """Create ``<repo>/.worktrees/<name>`` as a real linked worktree."""
+    target = repo / ".worktrees" / name
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", f"wt/{name}",
+         str(target)],
+        check=True, capture_output=True, text=True,
+    )
+    return target
+
+
+def _seed_artifacts(wt: Path) -> Path:
+    """Drop a fake node_modules + .next into a worktree; return node_modules."""
+    nm = wt / "node_modules"
+    (nm / "leftpad").mkdir(parents=True)
+    (nm / "leftpad" / "index.js").write_text("x" * 4096, encoding="utf-8")
+    nxt = wt / ".next"
+    nxt.mkdir()
+    (nxt / "build.js").write_text("y" * 2048, encoding="utf-8")
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    (src / "app.py").write_text("print('keep me')\n", encoding="utf-8")
+    return nm
+
+
+def test_prune_worktree_artifacts_removes_only_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = _make_linked_worktree(repo, "t_prune1")
+    _seed_artifacts(wt)
+
+    removed = kb.prune_worktree_artifacts(wt)
+
+    removed_names = {Path(r["path"]).name for r in removed}
+    assert removed_names == {"node_modules", ".next"}
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+    assert (wt / "src" / "app.py").exists(), "source files must survive"
+    assert (wt / ".git").is_file(), "worktree gitdir pointer must survive"
+    status = subprocess.run(
+        ["git", "-C", str(wt), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    )
+    # node_modules/.next were untracked; removing them leaves a clean tree
+    # apart from the surviving untracked src/ dir.
+    assert "node_modules" not in status.stdout
+    assert all(r["bytes"] > 0 for r in removed)
+
+
+def test_prune_worktree_artifacts_dry_run_deletes_nothing(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = _make_linked_worktree(repo, "t_prune2")
+    _seed_artifacts(wt)
+
+    removed = kb.prune_worktree_artifacts(wt, dry_run=True)
+
+    assert {Path(r["path"]).name for r in removed} == {"node_modules", ".next"}
+    assert (wt / "node_modules").exists()
+    assert (wt / ".next").exists()
+
+
+def test_prune_worktree_artifacts_refuses_root_checkout(kanban_home, tmp_path):
+    """The repo root checkout is never pruned — even if nested under a
+    directory literally named .worktrees (its .git is a dir, not a file)."""
+    outer = tmp_path / ".worktrees"
+    repo = outer / "rootrepo"
+    _init_git_repo(repo)
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "x.js").write_text("z", encoding="utf-8")
+
+    removed = kb.prune_worktree_artifacts(repo)
+
+    assert removed == []
+    assert (repo / "node_modules").exists()
+
+
+def test_prune_worktree_artifacts_refuses_non_worktree_layout(kanban_home, tmp_path):
+    plain = tmp_path / "somedir"
+    plain.mkdir()
+    (plain / "node_modules").mkdir()
+    removed = kb.prune_worktree_artifacts(plain)
+    assert removed == []
+    assert (plain / "node_modules").exists()
+
+
+def test_complete_task_prunes_worktree_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="build feature", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+    wt = _make_linked_worktree(repo, tid)
+    review_wt = _make_linked_worktree(repo, f"{tid}-review")
+    _seed_artifacts(wt)
+    _seed_artifacts(review_wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, tid, wt)
+        kb.complete_task(conn, tid, result="done")
+
+    assert wt.exists(), "worktree itself must survive completion"
+    assert review_wt.exists(), "review worktree itself must survive"
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+    assert not (review_wt / "node_modules").exists(), (
+        "reviewer worktree artifacts must be pruned too"
+    )
+    with kb.connect() as conn:
+        events = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "worktree_artifacts_pruned"
+        ]
+    assert events, "prune must leave an audit event on the card"
+
+
+def test_archive_task_prunes_worktree_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale card", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+    wt = _make_linked_worktree(repo, tid)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, tid, wt)
+        kb.archive_task(conn, tid)
+
+    assert wt.exists()
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+
+
+def test_cleanup_worktree_artifacts_deferred_while_child_running(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent wt", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id = ?", (child,)
+        )
+        conn.commit()
+    wt = _make_linked_worktree(repo, parent)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, parent, wt)
+        kb.complete_task(conn, parent, result="handoff")
+
+    assert (wt / "node_modules").exists(), (
+        "artifact prune must defer while a child is actively running"
+    )
+
+
+def test_cleanup_worktree_artifacts_not_deferred_by_parked_child(kanban_home, tmp_path):
+    """A todo/blocked child (e.g. a human smoke card the reviewer parked
+    under the finished card) must NOT hold the artifact prune — parking
+    ~2 GB of reproducible build output behind a card that may sit for days
+    re-creates the disk-full problem (live-repro t_44002d1a/t_ae1b2f31)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent wt", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.create_task(conn, title="smoke card for human")
+        kb.link_tasks(conn, parent, child)
+    wt = _make_linked_worktree(repo, parent)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, parent, wt)
+        kb.complete_task(conn, parent, result="done")
+
+    assert not (wt / "node_modules").exists(), (
+        "a parked (non-running) child must not defer the artifact prune"
+    )
+
+
+def test_gc_worker_logs_size_cap_deletes_oldest_first(kanban_home):
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    # Three fresh 1-KiB logs with staggered mtimes: cap at 2 KiB must drop
+    # exactly the oldest one.
+    for i, name in enumerate(["t_old.log", "t_mid.log", "t_new.log"]):
+        p = log_dir / name
+        p.write_bytes(b"a" * 1024)
+        os.utime(p, (now - (3 - i) * 3600, now - (3 - i) * 3600))
+
+    removed = kb.gc_worker_logs(
+        older_than_seconds=30 * 24 * 3600, max_total_bytes=2 * 1024,
+    )
+
+    assert removed == 1
+    assert not (log_dir / "t_old.log").exists()
+    assert (log_dir / "t_mid.log").exists()
+    assert (log_dir / "t_new.log").exists()
+
+
+def test_gc_worker_logs_age_and_cap_combined(kanban_home):
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    stale = log_dir / "t_stale.log"
+    stale.write_bytes(b"s" * 512)
+    os.utime(stale, (now - 40 * 24 * 3600, now - 40 * 24 * 3600))
+    fresh = log_dir / "t_fresh.log"
+    fresh.write_bytes(b"f" * 512)
+
+    removed = kb.gc_worker_logs(
+        older_than_seconds=30 * 24 * 3600, max_total_bytes=500 * 1024 * 1024,
+    )
+
+    assert removed == 1
+    assert not stale.exists(), "backdated log must be rotated away"
+    assert fresh.exists(), "fresh log must survive"

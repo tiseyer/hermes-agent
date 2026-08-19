@@ -2329,6 +2329,40 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     return env_type in ("singularity", "modal", "daytona")
 
 
+def _is_kanban_own_branch_force_push(command: str) -> bool:
+    """True for a kanban worker's --force-with-lease push of its own branch.
+
+    Conditions (all must hold):
+      * ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), and
+      * the command is a single ``git push`` using ``--force-with-lease``
+        (never bare ``--force``/``-f``), and
+      * the task id appears in the command (task branches are named after
+        the task, e.g. ``wt/t_2323adbe``), and
+      * no shared integration branch (main/master/develop/release*) is
+        mentioned anywhere in the command — this keeps
+        ``... wt/t_x:develop`` refspecs gated.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return False
+    if "--force-with-lease" not in command:
+        return False
+    # Only a plain git push — no chaining that could smuggle a second cmd.
+    if re.search(r"[;&|`$(]", command):
+        return False
+    if not re.match(r"^\s*git\s+push\b", command):
+        return False
+    # Bare --force / -f anywhere disables the exemption (e.g. a command
+    # carrying both flags).
+    if re.search(r"(^|\s)--force(\s|$)|(^|\s)-f(\s|$)", command):
+        return False
+    if task_id not in command:
+        return False
+    if re.search(r"\b(main|master|develop|release[\w/-]*)\b", command):
+        return False
+    return True
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
                             has_host_access: bool = False) -> dict:
@@ -2375,6 +2409,19 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
+
+    # Kanban-worker exemption: a dispatcher-spawned worker force-pushing
+    # ITS OWN task branch with --force-with-lease after a rebase is
+    # routine workspace hygiene, not history rewrite of shared state —
+    # nobody else builds on wt/<task-id>, and --force-with-lease refuses
+    # to clobber a moved remote. Headless workers have no human to
+    # approve the generic force-push gate, so without this exemption the
+    # coder is structurally unable to complete a rebase (live-repro:
+    # t_2323adbe block-looped on the approval gate). Shared integration
+    # branches stay gated: any mention of main/master/develop/release
+    # in the push disables the exemption.
+    if _is_kanban_own_branch_force_push(command):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
