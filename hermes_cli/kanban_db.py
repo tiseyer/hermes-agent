@@ -4312,15 +4312,18 @@ def _verify_done_evidence(
             if common is not None:
                 repo_root = common.parent
     if branch and repo_root is not None:
+        # Fork-push rule: verify against the remote workers actually push to
+        # ("fork" when present, else "origin") — see _push_remote().
+        remote = _push_remote(repo_root)
         try:
             ls = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-remote", "origin",
+                ["git", "-C", str(repo_root), "ls-remote", remote,
                  f"refs/heads/{branch}"],
                 capture_output=True, text=True, timeout=60, check=False,
             )
             if ls.returncode != 0:
                 findings.append(
-                    f"git ls-remote failed for origin/{branch}: "
+                    f"git ls-remote failed for {remote}/{branch}: "
                     + (ls.stderr or "").strip()[:200]
                 )
             elif not (ls.stdout or "").strip():
@@ -6432,6 +6435,29 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     except Exception:
         return False
     return result.returncode == 0
+
+
+def _push_remote(repo_root: Path) -> str:
+    """Resolve the remote workers push to (fork-push rule).
+
+    Rule (GitHub-403 finding, 2026-08-19): when the repo has a remote named
+    ``fork`` (personal fork, e.g. tiseyer/hermes-agent for this framework
+    repo), that is the ONLY writable remote — origin/upstream (NousResearch)
+    is strictly read-only for all workers. Without a ``fork`` remote the
+    conventional ``origin`` stays the push target (tenant repos like
+    voicera-os). Fetching is untouched by this rule.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "remote"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return "origin"
+    if result.returncode != 0:
+        return "origin"
+    remotes = {r.strip() for r in (result.stdout or "").splitlines() if r.strip()}
+    return "fork" if "fork" in remotes else "origin"
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
