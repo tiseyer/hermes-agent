@@ -228,3 +228,31 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_decompose_rewrites_wrong_tenant_role_profiles(kanban_home, monkeypatch):
+    """A voicera root whose child is assigned hermes-coder gets the
+    tenant-correct voicera-coder (live-repro t_05d6b16b crash loop)."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        profiles_mod, "profile_exists",
+        lambda name: name in ("voicera-coder", "voicera-reviewer",
+                              "hermes-coder", "orchestrator"),
+    )
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn, title="root", triage=True, tenant="voicera",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="orchestrator",
+            children=[
+                {"title": "code it", "assignee": "hermes-coder", "parents": []},
+                {"title": "review it", "assignee": "hermes-reviewer",
+                 "parents": [0]},
+            ],
+        )
+        assert child_ids
+        assert kb.get_task(conn, child_ids[0]).assignee == "voicera-coder"
+        assert kb.get_task(conn, child_ids[1]).assignee == "voicera-reviewer"

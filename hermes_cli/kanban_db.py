@@ -5956,6 +5956,22 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            # Tenant-correct role profiles: the decomposer LLM sometimes
+            # picks an existing but WRONG-tenant profile (hermes-coder
+            # for a voicera card — live t_05d6b16b crash-looped this
+            # way). If the child assignee is a <prefix>-<role> profile
+            # and the root's tenant has its own <tenant>-<role> profile,
+            # rewrite to the tenant one.
+            if assignee and tenant:
+                _m = re.match(r"^([a-z0-9]+)-(coder|reviewer)$", assignee)
+                if _m and _m.group(1) != tenant:
+                    _tenant_profile = f"{tenant}-{_m.group(2)}"
+                    try:
+                        from hermes_cli.profiles import profile_exists
+                        if profile_exists(_tenant_profile):
+                            assignee = _tenant_profile
+                    except Exception:
+                        pass
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
