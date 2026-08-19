@@ -4854,13 +4854,14 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
-def test_connect_sets_wal_autocheckpoint_100(tmp_path):
-    """connect() sets wal_autocheckpoint to 100."""
+def test_connect_sets_wal_autocheckpoint(tmp_path):
+    """connect() sets wal_autocheckpoint to 1000 (raised from 100 on
+    2026-08-19 to shrink checkpoint contention under multi-worker load)."""
     from hermes_cli.kanban_db import connect
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
     val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
-    assert val == 100
+    assert val == 1000
     conn.close()
 
 

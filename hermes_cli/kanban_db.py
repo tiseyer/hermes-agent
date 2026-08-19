@@ -1753,7 +1753,13 @@ def connect(
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # 100 -> 1000 (2026-08-19): with gateway threads + N workers
+                # + dashboard + bridge API all holding connections, a ~400KB
+                # checkpoint threshold made every writer checkpoint nearly
+                # every burst. Chronic idx_events_task corruption appeared
+                # under exactly that load pattern (storage layer suspected);
+                # fewer, larger checkpoints shrink the contention window.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -1787,7 +1793,13 @@ def connect(
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # 100 -> 1000 (2026-08-19): with gateway threads + N workers
+                # + dashboard + bridge API all holding connections, a ~400KB
+                # checkpoint threshold made every writer checkpoint nearly
+                # every burst. Chronic idx_events_task corruption appeared
+                # under exactly that load pattern (storage layer suspected);
+                # fewer, larger checkpoints shrink the contention window.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
                 # cell content; persisted in the DB header for new DBs.
