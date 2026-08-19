@@ -286,3 +286,65 @@ def test_loop_brake_without_declaration_uses_tenant(
         task = kb.get_task(conn, tid)
         assert task.assignee == "voicera-reviewer"
         assert all(a == "voicera-reviewer" for _, a in spawned)
+
+
+# ---------------------------------------------------------------------------
+# Negative case (Review-Nachlieferung 19.08.): UNKNOWN explicit declaration
+# → tenant-default fallback + log warning, never a crash, never silent
+# ---------------------------------------------------------------------------
+
+def test_resolver_unknown_declaration_falls_back_to_tenant_with_warning(
+    kanban_home, role_profiles_exist, caplog,
+):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
+        resolved = kb.resolve_repo_profiles(
+            "Titel\nRepository: unbekanntes-repo\nmehr text", "voicera",
+        )
+    assert resolved == ("voicera-coder", "voicera-reviewer", "tenant"), (
+        "unknown explicit declaration must fall back to the tenant default"
+    )
+    assert any(
+        "Unbekannte Repo-Deklaration" in r.message and "unbekanntes-repo" in r.message
+        for r in caplog.records
+    ), "the unknown declaration must be surfaced as a log warning"
+
+
+def test_resolver_unknown_declaration_without_tenant_returns_none(
+    kanban_home, role_profiles_exist, caplog,
+):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
+        resolved = kb.resolve_repo_profiles(
+            "Repository: unbekanntes-repo", None,
+        )
+    assert resolved is None, (
+        "no known declaration and no tenant → None (caller legacy fallback)"
+    )
+    assert any(
+        "Unbekannte Repo-Deklaration" in r.message for r in caplog.records
+    )
+
+
+def test_decompose_unknown_declaration_keeps_tenant_default(
+    kanban_home, role_profiles_exist,
+):
+    """End-to-end pin: a root that declares an unknown repo must route its
+    children exactly like an undeclared card — tenant pair, no crash."""
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn, title="Kaputte Deklaration",
+            body="Repository: unbekanntes-repo\nBitte umsetzen.",
+            tenant="voicera", triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="orchestrator",
+            children=[
+                {"title": "code it", "assignee": "voicera-coder", "parents": []},
+                {"title": "review it", "assignee": "voicera-reviewer",
+                 "parents": [0]},
+            ],
+        )
+        assert child_ids
+        assert kb.get_task(conn, child_ids[0]).assignee == "voicera-coder"
+        assert kb.get_task(conn, child_ids[1]).assignee == "voicera-reviewer"

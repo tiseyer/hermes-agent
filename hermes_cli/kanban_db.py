@@ -8284,6 +8284,12 @@ def resolve_repo_profiles(
     verified to exist) or ``"tenant"`` (tenant-default pair, existence NOT
     required to mirror the legacy ``_TENANT_REVIEWER_MAP`` behavior), or
     ``None`` when neither applies (caller falls back as before).
+
+    An explicit declaration that names an UNKNOWN repo signature (or whose
+    profiles don't exist) never crashes and is never silently swallowed:
+    it falls back to the tenant default (then the caller fallback) and
+    emits a structured log warning so the misrouted declaration is
+    visible to the operator.
     """
     if text:
         prefix: Optional[str] = None
@@ -8307,8 +8313,20 @@ def resolve_repo_profiles(
                 from hermes_cli.profiles import profile_exists
                 if profile_exists(pair[0]) and profile_exists(pair[1]):
                     return (pair[0], pair[1], "declared")
+                _log.warning(
+                    "Repo-Deklaration %r aufgelöst zu %s/%s, aber die "
+                    "Profile existieren nicht — falle auf Tenant-Default "
+                    "(%r) zurück", decl_vals[0].strip(), pair[0], pair[1],
+                    tenant,
+                )
             except Exception:
                 pass  # declared profiles unverifiable → fall through
+        elif decl_vals:
+            _log.warning(
+                "Unbekannte Repo-Deklaration %r (keine Signatur in der "
+                "Map) — falle auf Tenant-Default (%r) zurück",
+                decl_vals[0].strip(), tenant,
+            )
     if tenant and tenant in _REPO_PROFILE_PREFIXES:
         return (f"{tenant}-coder", f"{tenant}-reviewer", "tenant")
     return None
