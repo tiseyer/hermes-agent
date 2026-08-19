@@ -5168,3 +5168,204 @@ def test_dispatch_nonexistent_assignee_without_tenant_stays_skipped(
         t = kb.create_task(conn, title="human lane", assignee="till")
         res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 42)
     assert t in res.skipped_nonspawnable
+
+
+# ---------------------------------------------------------------------------
+# Worktree build-artifact prune (disk-hygiene goal, Aug 2026)
+# ---------------------------------------------------------------------------
+
+def _make_linked_worktree(repo: Path, name: str) -> Path:
+    """Create ``<repo>/.worktrees/<name>`` as a real linked worktree."""
+    target = repo / ".worktrees" / name
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", f"wt/{name}",
+         str(target)],
+        check=True, capture_output=True, text=True,
+    )
+    return target
+
+
+def _seed_artifacts(wt: Path) -> Path:
+    """Drop a fake node_modules + .next into a worktree; return node_modules."""
+    nm = wt / "node_modules"
+    (nm / "leftpad").mkdir(parents=True)
+    (nm / "leftpad" / "index.js").write_text("x" * 4096, encoding="utf-8")
+    nxt = wt / ".next"
+    nxt.mkdir()
+    (nxt / "build.js").write_text("y" * 2048, encoding="utf-8")
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    (src / "app.py").write_text("print('keep me')\n", encoding="utf-8")
+    return nm
+
+
+def test_prune_worktree_artifacts_removes_only_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = _make_linked_worktree(repo, "t_prune1")
+    _seed_artifacts(wt)
+
+    removed = kb.prune_worktree_artifacts(wt)
+
+    removed_names = {Path(r["path"]).name for r in removed}
+    assert removed_names == {"node_modules", ".next"}
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+    assert (wt / "src" / "app.py").exists(), "source files must survive"
+    assert (wt / ".git").is_file(), "worktree gitdir pointer must survive"
+    status = subprocess.run(
+        ["git", "-C", str(wt), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    )
+    # node_modules/.next were untracked; removing them leaves a clean tree
+    # apart from the surviving untracked src/ dir.
+    assert "node_modules" not in status.stdout
+    assert all(r["bytes"] > 0 for r in removed)
+
+
+def test_prune_worktree_artifacts_dry_run_deletes_nothing(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = _make_linked_worktree(repo, "t_prune2")
+    _seed_artifacts(wt)
+
+    removed = kb.prune_worktree_artifacts(wt, dry_run=True)
+
+    assert {Path(r["path"]).name for r in removed} == {"node_modules", ".next"}
+    assert (wt / "node_modules").exists()
+    assert (wt / ".next").exists()
+
+
+def test_prune_worktree_artifacts_refuses_root_checkout(kanban_home, tmp_path):
+    """The repo root checkout is never pruned — even if nested under a
+    directory literally named .worktrees (its .git is a dir, not a file)."""
+    outer = tmp_path / ".worktrees"
+    repo = outer / "rootrepo"
+    _init_git_repo(repo)
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "x.js").write_text("z", encoding="utf-8")
+
+    removed = kb.prune_worktree_artifacts(repo)
+
+    assert removed == []
+    assert (repo / "node_modules").exists()
+
+
+def test_prune_worktree_artifacts_refuses_non_worktree_layout(kanban_home, tmp_path):
+    plain = tmp_path / "somedir"
+    plain.mkdir()
+    (plain / "node_modules").mkdir()
+    removed = kb.prune_worktree_artifacts(plain)
+    assert removed == []
+    assert (plain / "node_modules").exists()
+
+
+def test_complete_task_prunes_worktree_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="build feature", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+    wt = _make_linked_worktree(repo, tid)
+    review_wt = _make_linked_worktree(repo, f"{tid}-review")
+    _seed_artifacts(wt)
+    _seed_artifacts(review_wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, tid, wt)
+        kb.complete_task(conn, tid, result="done")
+
+    assert wt.exists(), "worktree itself must survive completion"
+    assert review_wt.exists(), "review worktree itself must survive"
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+    assert not (review_wt / "node_modules").exists(), (
+        "reviewer worktree artifacts must be pruned too"
+    )
+    with kb.connect() as conn:
+        events = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "worktree_artifacts_pruned"
+        ]
+    assert events, "prune must leave an audit event on the card"
+
+
+def test_archive_task_prunes_worktree_artifacts(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale card", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+    wt = _make_linked_worktree(repo, tid)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, tid, wt)
+        kb.archive_task(conn, tid)
+
+    assert wt.exists()
+    assert not (wt / "node_modules").exists()
+    assert not (wt / ".next").exists()
+
+
+def test_cleanup_worktree_artifacts_deferred_while_child_active(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent wt", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+    wt = _make_linked_worktree(repo, parent)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, parent, wt)
+        kb.complete_task(conn, parent, result="handoff")
+
+    assert (wt / "node_modules").exists(), (
+        "artifact prune must defer while a child is still active"
+    )
+
+
+def test_gc_worker_logs_size_cap_deletes_oldest_first(kanban_home):
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    # Three fresh 1-KiB logs with staggered mtimes: cap at 2 KiB must drop
+    # exactly the oldest one.
+    for i, name in enumerate(["t_old.log", "t_mid.log", "t_new.log"]):
+        p = log_dir / name
+        p.write_bytes(b"a" * 1024)
+        os.utime(p, (now - (3 - i) * 3600, now - (3 - i) * 3600))
+
+    removed = kb.gc_worker_logs(
+        older_than_seconds=30 * 24 * 3600, max_total_bytes=2 * 1024,
+    )
+
+    assert removed == 1
+    assert not (log_dir / "t_old.log").exists()
+    assert (log_dir / "t_mid.log").exists()
+    assert (log_dir / "t_new.log").exists()
+
+
+def test_gc_worker_logs_age_and_cap_combined(kanban_home):
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    stale = log_dir / "t_stale.log"
+    stale.write_bytes(b"s" * 512)
+    os.utime(stale, (now - 40 * 24 * 3600, now - 40 * 24 * 3600))
+    fresh = log_dir / "t_fresh.log"
+    fresh.write_bytes(b"f" * 512)
+
+    removed = kb.gc_worker_logs(
+        older_than_seconds=30 * 24 * 3600, max_total_bytes=500 * 1024 * 1024,
+    )
+
+    assert removed == 1
+    assert not stale.exists(), "backdated log must be rotated away"
+    assert fresh.exists(), "fresh log must survive"

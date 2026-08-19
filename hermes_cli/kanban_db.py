@@ -4942,6 +4942,14 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
         if kind != "scratch" or not path:
+            # Worktree workspaces stay (evidence), but their build artifacts
+            # (node_modules/.next/…, ~2 GB per run) must not — they are what
+            # filled the disk. Prune them now that the card is terminal.
+            if kind == "worktree" and path:
+                try:
+                    cleanup_worktree_artifacts(conn, task_id)
+                except Exception:
+                    pass  # best-effort — never block completion
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
@@ -5031,6 +5039,149 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
+
+
+# Build-artifact directory names pruned from finished task worktrees. These
+# are all reproducible from the checkout (npm ci / next build / pip install),
+# so removing them after a card reaches done/archived costs nothing but the
+# rebuild time of a hypothetical re-open — and each one can hold GBs.
+# The worktree itself, its branch, and all committed state stay untouched.
+WORKTREE_ARTIFACT_DIR_NAMES = frozenset({
+    "node_modules", ".next", "dist", "__pycache__", ".venv",
+})
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Best-effort recursive size of *path* in bytes (lstat, skips errors)."""
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _is_prunable_worktree(path: Path) -> bool:
+    """True iff *path* is a linked git worktree whose artifacts may be pruned.
+
+    Two independent guards, both required:
+
+    * the directory must live directly under a ``.worktrees/`` parent — the
+      layout every kanban worktree (and reviewer worktree) is materialized
+      into; and
+    * ``<path>/.git`` must be a *file* (gitdir pointer). In a root checkout
+      ``.git`` is a directory, so the root checkout can never match even if
+      someone pointed ``workspace_path`` at it.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if not resolved.is_dir():
+        return False
+    if resolved.parent.name != ".worktrees":
+        return False
+    return (resolved / ".git").is_file()
+
+
+def prune_worktree_artifacts(
+    workspace: Path, *, dry_run: bool = False,
+) -> list[dict]:
+    """Remove build-artifact dirs from one linked worktree.
+
+    Walks the tree top-down, deletes any directory whose name is in
+    :data:`WORKTREE_ARTIFACT_DIR_NAMES` (without descending into it), and
+    never enters ``.git``. Symlinked matches are skipped so a link into a
+    shared cache cannot pull foreign data into the deletion. Returns a list
+    of ``{"path": str, "bytes": int}`` entries (measured before deletion);
+    with ``dry_run=True`` nothing is deleted but the list is still built.
+    """
+    removed: list[dict] = []
+    if not _is_prunable_worktree(workspace):
+        return removed
+    import shutil
+    for cur, dirs, _files in os.walk(workspace.resolve()):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        hits = [d for d in dirs if d in WORKTREE_ARTIFACT_DIR_NAMES]
+        for name in hits:
+            dirs.remove(name)  # whole subtree goes; don't walk into it
+            target = Path(cur) / name
+            if target.is_symlink():
+                continue
+            size = _dir_size_bytes(target)
+            if not dry_run:
+                shutil.rmtree(target, ignore_errors=True)
+            removed.append({"path": str(target), "bytes": size})
+    return removed
+
+
+def cleanup_worktree_artifacts(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+) -> list[dict]:
+    """Prune build artifacts from a finished task's worktree(s).
+
+    Fires when a ``worktree`` task is ``done`` or ``archived``: removes
+    ``node_modules`` / ``.next`` / ``dist`` / ``__pycache__`` / ``.venv``
+    from the task worktree AND the reviewer worktree
+    ``<repo>/.worktrees/<task-id>-review`` if present. The worktrees
+    themselves, their branches, and all git state remain (evidence stays
+    inspectable); only reproducible build output goes. Deferred while the
+    task still has non-terminal children (mirrors the scratch-workspace
+    defer, #33774). Emits a ``worktree_artifacts_pruned`` event with the
+    removed paths + sizes so every deletion is auditable on the card.
+    """
+    row = conn.execute(
+        "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        not row
+        or row["workspace_kind"] != "worktree"
+        or not row["workspace_path"]
+        or row["status"] not in ("done", "archived")
+    ):
+        return []
+    active_children = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? AND t.status NOT IN "
+        "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if active_children:
+        _log.debug(
+            "Deferring worktree artifact prune for task %s: active children",
+            task_id,
+        )
+        return []
+    workspace = Path(row["workspace_path"]).expanduser()
+    candidates = [workspace]
+    if workspace.parent.name == ".worktrees":
+        candidates.append(workspace.parent / f"{task_id}-review")
+    removed: list[dict] = []
+    for cand in candidates:
+        removed.extend(prune_worktree_artifacts(cand, dry_run=dry_run))
+    if removed:
+        total = sum(r["bytes"] for r in removed)
+        _log.info(
+            "Worktree artifact prune%s for task %s: %d dir(s), %.1f MiB — %s",
+            " (dry-run)" if dry_run else "", task_id, len(removed),
+            total / (1024 * 1024),
+            ", ".join(r["path"] for r in removed),
+        )
+        if not dry_run:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "worktree_artifacts_pruned",
+                        {"dirs": removed, "total_bytes": total},
+                    )
+            except Exception:
+                pass  # audit trail is best-effort; the prune already happened
+    return removed
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6119,6 +6270,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # Archive is the second terminal transition where worktree build
+    # artifacts may still be lying around (e.g. task went straight from
+    # blocked → archived and never passed through complete_task).
+    try:
+        cleanup_worktree_artifacts(conn, task_id)
+    except Exception:
+        pass  # best-effort — never block archiving
     return True
 
 
@@ -10114,25 +10272,49 @@ def gc_events(
 
 def gc_worker_logs(
     *, older_than_seconds: int = 30 * 24 * 3600,
+    max_total_bytes: Optional[int] = None,
     board: Optional[str] = None,
 ) -> int:
     """Delete worker log files older than ``older_than_seconds``. Returns
     the number of files removed. Kept separate from ``gc_events`` because
     log files live on disk, not in SQLite. Scoped to ``board`` (defaults
     to the active board) — per-board isolation means deleting logs from
-    board A cannot touch board B's logs."""
+    board A cannot touch board B's logs.
+
+    ``max_total_bytes`` additionally caps the total size of the log dir:
+    after the age pass, remaining files are deleted oldest-first (mtime)
+    until the directory fits under the cap. Age alone cannot bound disk
+    use when many workers run in a short window — the cap can."""
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
     removed = 0
+    survivors: list[tuple[float, int, Path]] = []  # (mtime, size, path)
     for p in log_dir.iterdir():
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff:
+            if not p.is_file():
+                continue
+            st = p.stat()
+            if st.st_mtime < cutoff:
                 p.unlink()
                 removed += 1
+            else:
+                survivors.append((st.st_mtime, st.st_size, p))
         except OSError:
             continue
+    if max_total_bytes is not None and max_total_bytes >= 0:
+        total = sum(size for _mtime, size, _p in survivors)
+        survivors.sort()  # oldest first
+        for _mtime, size, p in survivors:
+            if total <= max_total_bytes:
+                break
+            try:
+                p.unlink()
+                removed += 1
+                total -= size
+            except OSError:
+                continue
     return removed
 
 
