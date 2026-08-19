@@ -5310,7 +5310,7 @@ def test_archive_task_prunes_worktree_artifacts(kanban_home, tmp_path):
     assert not (wt / ".next").exists()
 
 
-def test_cleanup_worktree_artifacts_deferred_while_child_active(kanban_home, tmp_path):
+def test_cleanup_worktree_artifacts_deferred_while_child_running(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     with kb.connect() as conn:
@@ -5320,6 +5320,10 @@ def test_cleanup_worktree_artifacts_deferred_while_child_active(kanban_home, tmp
         )
         child = kb.create_task(conn, title="child")
         kb.link_tasks(conn, parent, child)
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id = ?", (child,)
+        )
+        conn.commit()
     wt = _make_linked_worktree(repo, parent)
     _seed_artifacts(wt)
     with kb.connect() as conn:
@@ -5327,7 +5331,32 @@ def test_cleanup_worktree_artifacts_deferred_while_child_active(kanban_home, tmp
         kb.complete_task(conn, parent, result="handoff")
 
     assert (wt / "node_modules").exists(), (
-        "artifact prune must defer while a child is still active"
+        "artifact prune must defer while a child is actively running"
+    )
+
+
+def test_cleanup_worktree_artifacts_not_deferred_by_parked_child(kanban_home, tmp_path):
+    """A todo/blocked child (e.g. a human smoke card the reviewer parked
+    under the finished card) must NOT hold the artifact prune — parking
+    ~2 GB of reproducible build output behind a card that may sit for days
+    re-creates the disk-full problem (live-repro t_44002d1a/t_ae1b2f31)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent wt", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.create_task(conn, title="smoke card for human")
+        kb.link_tasks(conn, parent, child)
+    wt = _make_linked_worktree(repo, parent)
+    _seed_artifacts(wt)
+    with kb.connect() as conn:
+        kb.set_workspace_path(conn, parent, wt)
+        kb.complete_task(conn, parent, result="done")
+
+    assert not (wt / "node_modules").exists(), (
+        "a parked (non-running) child must not defer the artifact prune"
     )
 
 

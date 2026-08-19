@@ -5128,10 +5128,15 @@ def cleanup_worktree_artifacts(
     from the task worktree AND the reviewer worktree
     ``<repo>/.worktrees/<task-id>-review`` if present. The worktrees
     themselves, their branches, and all git state remain (evidence stays
-    inspectable); only reproducible build output goes. Deferred while the
-    task still has non-terminal children (mirrors the scratch-workspace
-    defer, #33774). Emits a ``worktree_artifacts_pruned`` event with the
-    removed paths + sizes so every deletion is auditable on the card.
+    inspectable); only reproducible build output goes. Deferred only while
+    a child task is actively ``running`` (it may be building inside the
+    parent's tree right now). Unlike the scratch-workspace defer (#33774),
+    todo/ready/blocked children do NOT hold the prune: reviewers routinely
+    park human smoke cards under a finished card for days, and artifacts
+    are reproducible (npm ci) — parking 2 GB behind them re-creates the
+    disk-full problem this exists to solve. Emits a
+    ``worktree_artifacts_pruned`` event with the removed paths + sizes so
+    every deletion is auditable on the card.
     """
     row = conn.execute(
         "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
@@ -5144,16 +5149,15 @@ def cleanup_worktree_artifacts(
         or row["status"] not in ("done", "archived")
     ):
         return []
-    active_children = conn.execute(
+    running_children = conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks t ON t.id = l.child_id "
-        "WHERE l.parent_id = ? AND t.status NOT IN "
-        "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+        "WHERE l.parent_id = ? AND t.status = 'running' LIMIT 1",
         (task_id,),
     ).fetchone()
-    if active_children:
+    if running_children:
         _log.debug(
-            "Deferring worktree artifact prune for task %s: active children",
+            "Deferring worktree artifact prune for task %s: running children",
             task_id,
         )
         return []
