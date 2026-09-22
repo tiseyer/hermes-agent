@@ -214,8 +214,8 @@ _SPECS = [
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
-             help="Initial card status. Use 'blocked' for cards "
-                  "that require immediate human ops (R3 gate) "
+             help="Initial card status. Use 'backlog' to park a card until a human moves it to todo, "
+                  "or 'blocked' for cards that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
