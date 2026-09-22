@@ -87,11 +87,12 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["backlog", "triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
+    backlog: "Backlog",
     triage: "Triage",
     todo: "Todo",
     ready: "Ready",
@@ -102,6 +103,7 @@
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
+    backlog: "Human-controlled parking — move to todo when ready",
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
     ready: "Dependencies satisfied; assign a profile to dispatch",
@@ -170,6 +172,7 @@
   }
 
   const COLUMN_DOT = {
+    backlog: "hermes-kanban-dot-backlog",
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
     ready: "hermes-kanban-dot-ready",

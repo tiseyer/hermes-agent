@@ -21,6 +21,32 @@ def _names(selection, disabled=None):
     }
 
 
+def test_kanban_create_schema_allows_human_parked_backlog(tmp_path, monkeypatch):
+    """The model-facing creation path must be able to create a parked card."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    create = next(
+        row["function"]
+        for row in get_tool_definitions(
+            ["kanban"], quiet_mode=True, skip_tool_search_assembly=True,
+        )
+        if row["function"]["name"] == "kanban_create"
+    )
+    assert "backlog" in create["parameters"]["properties"]["initial_status"]["enum"]
+
+    result = json.loads(registry.dispatch("kanban_create", {
+        "title": "human parked", "assignee": "default", "initial_status": "backlog",
+    }))
+    assert result.get("ok"), result
+    assert result["status"] == "backlog"
+
+
 @pytest.mark.parametrize("surface", ["cli", "http", "rpc"])
 def test_saved_opt_in_roundtrip_reaches_schema_and_board(surface, tmp_path, monkeypatch):
     """Exercise the real config writer, availability gate, skills gate and handler."""
