@@ -61,3 +61,70 @@ def test_existing_cards_are_work_and_not_family_members(kanban_home):
         task = kb.get_task(conn, task_id)
     assert task.child_role == "work"
     assert task.family_root_id is None
+
+
+@pytest.mark.parametrize("concurrency_limit", [
+    {"max_in_progress": 2},
+    {"max_spawn": 2},
+])
+def test_dispatch_concurrency_ignores_mirrored_family_root(
+    concurrency_limit,
+    kanban_home, all_assignees_spawnable,
+):
+    """A mirrored root is board state, not an in-flight worker slot."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "work", "assignee": "worker", "parents": []}],
+        )
+        assert child_ids is not None
+        work_child = child_ids[0]
+
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn, **concurrency_limit)
+        assert [task_id for task_id, _, _ in first.spawned] == [work_child]
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert root.status == "running"
+
+        independent = kb.create_task(conn, title="independent", assignee="other")
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn, **concurrency_limit)
+
+    assert [task_id for task_id, _, _ in second.spawned] == [independent]
+
+
+def test_dispatch_per_profile_limit_ignores_mirrored_family_root(
+    kanban_home, all_assignees_spawnable,
+):
+    """A root sharing an assignee with its child does not consume a profile slot."""
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="worker",
+            children=[{"title": "work", "assignee": "worker", "parents": []}],
+        )
+        assert child_ids is not None
+        work_child = child_ids[0]
+
+        first = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: None,
+            max_in_progress_per_profile=2,
+        )
+        assert [task_id for task_id, _, _ in first.spawned] == [work_child]
+
+        independent = kb.create_task(conn, title="independent", assignee="worker")
+        second = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: None,
+            max_in_progress_per_profile=2,
+        )
+
+    assert [task_id for task_id, _, _ in second.spawned] == [independent]

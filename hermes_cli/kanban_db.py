@@ -2099,10 +2099,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_initiative_id ON tasks(initiative_id)"
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_family_root "
-        "ON tasks(family_root_id, family_order, child_role, status)"
-    )
+    # Some migration-isolation callers intentionally provide only the
+    # additive-column subset of the historical schema. The family index needs
+    # the core ``status`` column, so defer it until the complete task shape is
+    # available; normal board initialization always has that column.
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "status" in task_columns:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_family_root "
+            "ON tasks(family_root_id, family_order, child_role, status)"
+        )
     _install_family_state_triggers(conn)
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -9119,17 +9125,20 @@ def _dispatch_once_locked(
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # than a per-tick spawn budget. Family roots mirror a work child's state,
+    # but never own a worker themselves, so exclude them from every worker
+    # concurrency calculation. See the docstring above for the full rationale;
+    # the short version is that a 60-second tick interval with a per-tick
+    # budget of N would grow concurrency by N every tick on a busy board,
+    # since "running" tasks aren't reclaimed by completion alone — they sit in
+    # status='running' until the worker calls kanban_complete/kanban_block (or
+    # the dispatcher TTL-reclaims them).
     running_count = 0
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+                "AND (family_root_id IS NULL OR id != family_root_id)"
             ).fetchone()[0]
         )
 
@@ -9144,7 +9153,8 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+            "AND (family_root_id IS NULL OR id != family_root_id)"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -9170,6 +9180,7 @@ def _dispatch_once_locked(
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
+            "AND (family_root_id IS NULL OR id != family_root_id) "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
