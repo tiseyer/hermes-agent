@@ -540,3 +540,32 @@ def test_review_handoff_unknown_declaration_blocks_needs_input(
     assert task.status == "blocked"
     assert task.block_kind == "needs_input"
     assert task.assignee == "voicera-coder"
+
+
+def test_loop_brake_unknown_declaration_blocks_needs_input(
+    kanban_home, role_profiles_exist, monkeypatch,
+):
+    """The loop brake must not let an invalid declaration abort a tick."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Kaputte Deklaration in Fehlerschleife",
+            body="Repository: unbekanntes-repo\nBitte umsetzen.",
+            assignee="voicera-coder",
+            tenant="voicera",
+        )
+        _fail_run(conn, task_id, "AssertionError in tests/test_x.py:42")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        _fail_run(conn, task_id, "AssertionError in tests/test_x.py:42")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 1)
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.assignee == "voicera-coder"
+    assert task_id in result.auto_blocked

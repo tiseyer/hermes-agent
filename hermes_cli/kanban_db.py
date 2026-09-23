@@ -9521,7 +9521,23 @@ def _dispatch_once_locked(
                 # Same central repo→profile resolution as the review block
                 # path — a repo declaration on the card beats the tenant
                 # default here too (goal decompose-repo-routing §4).
-                _pair = resolve_task_repo_profiles(conn, row["id"])
+                try:
+                    _pair = resolve_task_repo_profiles(conn, row["id"])
+                except RepositoryProfileError as exc:
+                    # The loop brake is a routing boundary too.  An explicit
+                    # but invalid declaration must stop only this card for
+                    # operator input, never abort the whole dispatcher tick.
+                    block_task(
+                        conn,
+                        row["id"],
+                        reason=(
+                            "repository routing configuration required: "
+                            f"{exc}"
+                        ),
+                        kind="needs_input",
+                    )
+                    result.auto_blocked.append(row["id"])
+                    continue
                 reviewer = (
                     _pair[1] if _pair
                     else _TENANT_REVIEWER_MAP.get(
