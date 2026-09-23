@@ -344,6 +344,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "reviewer routing (<tenant>-reviewer), so cards created without "
              "it fall back to the generic 'reviewer' profile.",
     )
+    p_create.add_argument(
+        "--repository", default=None,
+        help="Repository profile or signature (e.g. hermes or hermes-agent). "
+             "Stored structurally and inherited by decomposed children.",
+    )
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -1390,6 +1395,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
+            repository=getattr(args, "repository", None),
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),

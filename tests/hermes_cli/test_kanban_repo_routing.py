@@ -194,29 +194,69 @@ def test_resolver_unknown_everything_returns_none(kanban_home, role_profiles_exi
     assert kb.resolve_repo_profiles(None, "unknown-tenant") is None
 
 
+def test_task_without_repository_or_legacy_declaration_fails_closed(
+    kanban_home, role_profiles_exist,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Undeclared task")
+        assert kb.resolve_task_repository_profile(conn, task_id) is None
+
+
 # ---------------------------------------------------------------------------
 # Condition 1: decompose honors the root's repo declaration
 # ---------------------------------------------------------------------------
 
-def test_decompose_honors_repo_declaration(kanban_home, role_profiles_exist):
+def test_redecompose_inherits_structured_repository_to_children(
+    kanban_home, role_profiles_exist,
+):
+    """The durable repository field survives LLM bodies that omit it."""
     with kb.connect() as conn:
         root = kb.create_task(
-            conn, title="Framework-Bug fixen", body=HERMES_DECL_BODY,
-            tenant="voicera", triage=True,
+            conn,
+            title="Framework-Bug fixen",
+            body="Die Re-Decomposition darf keine Repo-Zeile verlieren.",
+            repository="hermes",
+            tenant="voicera",
+            triage=True,
         )
         child_ids = kb.decompose_triage_task(
             conn, root, root_assignee="orchestrator",
             children=[
                 # The decomposer LLM guessed the tenant pair — the root's
-                # explicit declaration must override it.
+                # structured declaration must override it.
                 {"title": "code it", "assignee": "voicera-coder", "parents": []},
                 {"title": "review it", "assignee": "voicera-reviewer",
                  "parents": [0]},
             ],
         )
         assert child_ids
+        for child_id in child_ids:
+            child = kb.get_task(conn, child_id)
+            assert child.repository == "hermes"
+            profile = kb.resolve_task_repository_profile(conn, child_id)
+            assert profile is not None
+            assert profile.name == "hermes"
+            assert profile.base_ref == "fork/main"
         assert kb.get_task(conn, child_ids[0]).assignee == "hermes-coder"
         assert kb.get_task(conn, child_ids[1]).assignee == "hermes-reviewer"
+
+
+def test_structured_repository_beats_conflicting_legacy_body(
+    kanban_home, role_profiles_exist,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Framework-Fix",
+            body="Repository: voicera",
+            repository="hermes",
+            tenant="voicera",
+        )
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+
+    assert profile is not None
+    assert profile.name == "hermes"
+    assert profile.base_ref == "fork/main"
 
 
 # ---------------------------------------------------------------------------

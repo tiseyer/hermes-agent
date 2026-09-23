@@ -1007,6 +1007,29 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_persists_structured_repository(worker_env):
+    """The worker API stores repository routing independently of the body."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "framework child",
+        "assignee": "peer",
+        "repository": "hermes-agent",
+    })
+    task_id = json.loads(out)["task_id"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.repository == "hermes"
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+        assert profile is not None
+        assert profile.base_ref == "fork/main"
+    finally:
+        conn.close()
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen

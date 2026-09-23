@@ -1398,6 +1398,21 @@ def test_cli_create_max_runtime_bad_format_exits_nonzero(kanban_home):
     assert "max-runtime" in out.lower() or "malformed" in out.lower()
 
 
+def test_cli_create_persists_structured_repository(kanban_home):
+    out = run_slash("create 'framework task' --repository hermes-agent --json")
+    task_id = json.loads(out)["id"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.repository == "hermes"
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+        assert profile is not None
+        assert profile.base_ref == "fork/main"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Runs as first-class (vulcan-artivus RFC feedback)
 # ---------------------------------------------------------------------------
