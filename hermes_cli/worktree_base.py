@@ -29,10 +29,18 @@ def resolve_worktree_base(
     repo_root: str,
     fetch_timeout: float = 5,
     freshness_window: float = 300,
+    *,
+    base_ref: Optional[str] = None,
 ) -> tuple:
     """Resolve the freshest base ref to branch a new worktree from.
 
-    Strategy (each step falls back to the next on failure):
+    When ``base_ref`` is supplied by a repository profile, it is the sole
+    allowed base. A missing, malformed, or unreachable configured ref raises
+    instead of silently selecting ``origin`` or local ``HEAD``. The caller can
+    therefore block the card for input rather than creating an unmergeable
+    branch against a different repository's upstream.
+
+    Without a configured ``base_ref``, the legacy CLI strategy falls back:
       1. If the current branch tracks an upstream, refresh and use that
          upstream ref — so a deliberate feature-branch checkout tracks its
          own remote, not the default branch.
@@ -86,7 +94,7 @@ def resolve_worktree_base(
         except Exception:
             return None
 
-    def _refresh(remote: str, branch: str, ref: str) -> tuple:
+    def _refresh(remote: str, branch: str, ref: str, *, required: bool = False) -> tuple:
         """Return (ref, label) after a cheap best-effort refresh of *ref*.
 
         Never raises, never fetches twice, never blocks longer than
@@ -107,7 +115,26 @@ def resolve_worktree_base(
         if _ref_exists(ref):
             _log.debug("worktree base: %s — using cached %s", reason, ref)
             return ref, f"{ref} (cached — {reason})"
+        if required:
+            raise RuntimeError(
+                f"configured worktree base {ref!r} is unavailable: {reason}"
+            )
         return "HEAD", f"HEAD (local — {reason}, no cached {ref})"
+
+    if base_ref is not None:
+        configured_ref = base_ref.strip()
+        if not configured_ref or "/" not in configured_ref:
+            raise ValueError(
+                "repository profile base_ref must be a remote/branch ref, "
+                f"got {base_ref!r}"
+            )
+        remote, branch = configured_ref.split("/", 1)
+        if not remote or not branch:
+            raise ValueError(
+                "repository profile base_ref must be a remote/branch ref, "
+                f"got {base_ref!r}"
+            )
+        return _refresh(remote, branch, configured_ref, required=True)
 
     # 0. Explicit override — an operator/board that knows the integration
     #    branch pins it here (e.g. HERMES_WORKTREE_BASE_REF=origin/develop).

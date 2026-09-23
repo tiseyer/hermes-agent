@@ -6541,7 +6541,13 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    base_ref: Optional[str] = None,
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
     New branches are rooted on the freshest reachable remote base (upstream
@@ -6561,15 +6567,17 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
-    base_ref = "HEAD"
+    resolved_base_ref = "HEAD"
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         from hermes_cli.worktree_base import resolve_worktree_base
-        base_ref, _label = resolve_worktree_base(str(repo_root))
+        resolved_base_ref, _label = resolve_worktree_base(
+            str(repo_root), base_ref=base_ref,
+        )
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), base_ref,
+            str(target), resolved_base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -6578,7 +6586,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         timeout=60,
         check=False,
     )
-    if result.returncode != 0 and base_ref != "HEAD":
+    if result.returncode != 0 and base_ref is None and resolved_base_ref != "HEAD":
         # Branching from the resolved remote ref failed for any reason (e.g.
         # a partial fetch left the ref unusable) — retry from local HEAD so
         # worktree creation never hard-fails purely on a sync hiccup. Mirrors
@@ -6602,7 +6610,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    repository_profile: Optional[RepositoryProfile] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -6641,7 +6652,10 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name,
+            base_ref=repository_profile.base_ref if repository_profile else None,
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6659,7 +6673,10 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name,
+            base_ref=repository_profile.base_ref if repository_profile else None,
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6668,11 +6685,16 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(
+        repo_root, requested, branch_name,
+        base_ref=repository_profile.base_ref if repository_profile else None,
+    )
     return requested, branch_name
 
 
-def _maybe_repair_stale_worktree(workspace: Path) -> Optional[dict]:
+def _maybe_repair_stale_worktree(
+    workspace: Path, *, base_ref: Optional[str] = None,
+) -> Optional[dict]:
     """Detect + auto-repair a worktree whose branch sits on a stale base.
 
     Called by the dispatcher before (re)spawning a coder into an EXISTING
@@ -6693,22 +6715,24 @@ def _maybe_repair_stale_worktree(workspace: Path) -> Optional[dict]:
     """
     try:
         from hermes_cli.worktree_base import resolve_worktree_base
-        base_ref, base_label = resolve_worktree_base(str(workspace))
-        if base_ref == "HEAD":
+        resolved_base_ref, base_label = resolve_worktree_base(
+            str(workspace), base_ref=base_ref,
+        )
+        if resolved_base_ref == "HEAD":
             return None  # offline / no remote — nothing to compare against
         def _git(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
             return subprocess.run(
                 ["git", "-C", str(workspace), *args],
                 capture_output=True, text=True, timeout=timeout, check=False,
             )
-        base_tip = _git("rev-parse", "--verify", "--quiet", base_ref)
+        base_tip = _git("rev-parse", "--verify", "--quiet", resolved_base_ref)
         if base_tip.returncode != 0:
             return None
         base_sha = base_tip.stdout.strip()
         contains = _git("merge-base", "--is-ancestor", base_sha, "HEAD")
         if contains.returncode == 0:
             return None  # branch already contains the current base
-        unique = _git("rev-list", "--count", f"{base_ref}..HEAD")
+        unique = _git("rev-list", "--count", f"{resolved_base_ref}..HEAD")
         unique_count = int((unique.stdout or "0").strip() or 0)
         if unique_count == 0:
             reset = _git("reset", "--hard", base_sha)
@@ -8270,8 +8294,50 @@ _TENANT_REVIEWER_MAP = {
 # is preserved: without a declaration the resolver returns exactly the
 # tenant pair.
 
+@dataclass(frozen=True)
+class RepositoryProfile:
+    """Repository-specific routing and git integration contract for a card."""
+
+    name: str
+    coder: str
+    reviewer: str
+    base_ref: str
+    merge_target: str
+
+
+class RepositoryProfileError(ValueError):
+    """A declared repository card cannot be safely integrated as configured."""
+
+
+# Repository profiles are the single source for both role routing and git
+# integration.  A task declaration is intentionally resolved to one of these
+# profiles rather than inferring base/target branches from its local clone.
+_REPOSITORY_PROFILES = {
+    "hermes": RepositoryProfile(
+        name="hermes",
+        coder="hermes-coder",
+        reviewer="hermes-reviewer",
+        base_ref="fork/main",
+        merge_target="main",
+    ),
+    "goya": RepositoryProfile(
+        name="goya",
+        coder="goya-coder",
+        reviewer="goya-reviewer",
+        base_ref="origin/develop",
+        merge_target="develop",
+    ),
+    "voicera": RepositoryProfile(
+        name="voicera",
+        coder="voicera-coder",
+        reviewer="voicera-reviewer",
+        base_ref="origin/develop",
+        merge_target="develop",
+    ),
+}
+
 # Known role-profile prefixes for tenant defaults (v1, extendable).
-_REPO_PROFILE_PREFIXES = ("hermes", "voicera", "goya")
+_REPO_PROFILE_PREFIXES = tuple(_REPOSITORY_PROFILES)
 
 # Signature → profile prefix, matched (case-insensitively) against the VALUE
 # of an explicit declaration line. Ordered longest-first so "hermes-agent"
@@ -8297,6 +8363,82 @@ _PROFILE_DECL_RE = re.compile(
     r"(?im)^[ \t>*-]*profiles?\s*:\s*(?P<val>.+)$"
 )
 _ROLE_PROFILE_RE = re.compile(r"\b([a-z0-9]+)-(coder|reviewer)\b")
+
+
+def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Optional[str]:
+    """Resolve a profile prefix from deterministic card declarations."""
+    if text:
+        decl_vals = [m.group("val") for m in _REPO_DECL_RE.finditer(text)]
+        decl_vals += [m.group("val") for m in _PROFILE_DECL_RE.finditer(text)]
+        for val in decl_vals:
+            low = val.lower()
+            role_hit = _ROLE_PROFILE_RE.search(low)
+            if role_hit and role_hit.group(1) in _REPOSITORY_PROFILES:
+                return role_hit.group(1)
+            for sig, sig_prefix in _REPO_SIGNATURE_MAP:
+                if sig in low:
+                    return sig_prefix
+    return tenant if tenant in _REPOSITORY_PROFILES else None
+
+
+def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfile:
+    for field_name in ("base_ref", "merge_target"):
+        value = getattr(profile, field_name).strip()
+        if not value:
+            raise RepositoryProfileError(
+                f"repository profile {profile.name!r} is missing required {field_name}"
+            )
+    if "/" not in profile.base_ref:
+        raise RepositoryProfileError(
+            f"repository profile {profile.name!r} has invalid base_ref "
+            f"{profile.base_ref!r}; expected remote/branch"
+        )
+    return profile
+
+
+def resolve_repository_profile(
+    text: Optional[str], tenant: Optional[str],
+) -> Optional[RepositoryProfile]:
+    """Return the configured repository profile for a card, if identifiable.
+
+    The returned profile is validated fail-closed: a known repository whose
+    base ref or merge target is omitted must be blocked by the caller instead
+    of falling back to the local clone's ``origin`` or ``HEAD``.
+    """
+    prefix = _repository_profile_prefix(text, tenant)
+    if prefix is None:
+        return None
+    profile = _REPOSITORY_PROFILES.get(prefix)
+    if profile is None:
+        return None
+    return _validated_repository_profile(profile)
+
+
+def resolve_task_repository_profile(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[RepositoryProfile]:
+    """Resolve a card's repo profile, inheriting its parent/root declaration."""
+    row = conn.execute(
+        "SELECT title, body, tenant, parent_id, initiative_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    texts = [(row["title"] or "") + "\n" + (row["body"] or "")]
+    seen_rel = set()
+    for rel in (row["parent_id"], row["initiative_id"]):
+        if rel and rel not in seen_rel and rel != task_id:
+            seen_rel.add(rel)
+            parent = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ?", (rel,),
+            ).fetchone()
+            if parent:
+                texts.append((parent["title"] or "") + "\n" + (parent["body"] or ""))
+    for text in texts:
+        profile = resolve_repository_profile(text, None)
+        if profile is not None:
+            return profile
+    return resolve_repository_profile(None, row["tenant"])
 
 
 def resolve_repo_profiles(
@@ -9142,10 +9284,26 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
+            repository_profile = resolve_task_repository_profile(conn, claimed.id)
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board, repository_profile=repository_profile,
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except RepositoryProfileError as exc:
+            # A declared repository is an integration contract, not a hint.
+            # Do not spend retries (or silently fall back to origin/HEAD) when
+            # its required base/merge fields are absent: an operator must fix
+            # the profile before this card can safely create a branch.
+            block_task(
+                conn,
+                claimed.id,
+                reason=f"repository profile configuration required: {exc}",
+                kind="needs_input",
+            )
+            result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -9163,7 +9321,10 @@ def _dispatch_once_locked(
             # reset/rebase onto the fresh remote base — instead of
             # letting the coder run into avoidable conflicts or
             # escalating a purely technical blocker to a human.
-            repair = _maybe_repair_stale_worktree(Path(workspace))
+            repair = _maybe_repair_stale_worktree(
+                Path(workspace),
+                base_ref=repository_profile.base_ref if repository_profile else None,
+            )
             if repair is not None:
                 with write_txn(conn):
                     _append_event(
@@ -9966,6 +10127,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    # A repository profile is the authoritative integration contract for a
+    # task. Surface it to every worker (especially the merger) rather than
+    # expecting role-specific SOUL files to guess a project-wide branch.
+    # Keep an invalid profile visible to an already-running worker so it can
+    # block the card for input instead of losing access to kanban_show.
+    try:
+        repository_profile = resolve_task_repository_profile(conn, task_id)
+    except RepositoryProfileError as exc:
+        lines.append(f"Repository profile: INVALID ({exc})")
+    else:
+        if repository_profile is not None:
+            lines.append(
+                "Repository profile: "
+                f"{repository_profile.name} "
+                f"(base ref: {repository_profile.base_ref}; "
+                f"merge target: {repository_profile.merge_target})"
+            )
     lines.append("")
 
     if task.body and task.body.strip():

@@ -65,6 +65,114 @@ def test_resolver_repo_line_without_profiles(kanban_home, role_profiles_exist):
     assert resolved == ("hermes-coder", "hermes-reviewer", "declared")
 
 
+def test_repository_profile_supplies_hermes_merge_target_and_base_ref(
+    kanban_home, role_profiles_exist,
+):
+    """A declared framework card must use the fork's main ref end to end."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Framework-Fix",
+            body="Repository: hermes-agent",
+            tenant="voicera",
+        )
+
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+
+    assert profile is not None
+    assert profile.name == "hermes"
+    assert profile.base_ref == "fork/main"
+    assert profile.merge_target == "main"
+
+
+def test_worker_context_surfaces_repository_merge_target_for_merger(
+    kanban_home, role_profiles_exist,
+):
+    """The merger receives the target from the card profile, not a default."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Framework-Fix",
+            body="Repository: hermes-agent",
+            assignee="merger",
+            tenant="voicera",
+        )
+
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "Repository profile: hermes (base ref: fork/main; merge target: main)" in context
+    assert "merge target: develop" not in context
+
+
+def test_repository_profile_missing_required_field_fails_closed(
+    kanban_home, role_profiles_exist, monkeypatch,
+):
+    profile = kb._REPOSITORY_PROFILES["hermes"]
+    monkeypatch.setitem(
+        kb._REPOSITORY_PROFILES,
+        "hermes",
+        kb.RepositoryProfile(
+            name=profile.name,
+            coder=profile.coder,
+            reviewer=profile.reviewer,
+            base_ref="",
+            merge_target=profile.merge_target,
+        ),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Framework-Fix",
+            body="Repository: hermes-agent",
+            tenant="voicera",
+        )
+
+        with pytest.raises(kb.RepositoryProfileError, match="base_ref"):
+            kb.resolve_task_repository_profile(conn, task_id)
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "Repository profile: INVALID" in context
+    assert "missing required base_ref" in context
+
+
+def test_dispatch_blocks_for_missing_repository_profile_field(
+    kanban_home, role_profiles_exist, monkeypatch, tmp_path,
+):
+    """A malformed declared profile is needs_input, never a retry/default."""
+    profile = kb._REPOSITORY_PROFILES["hermes"]
+    monkeypatch.setitem(
+        kb._REPOSITORY_PROFILES,
+        "hermes",
+        kb.RepositoryProfile(
+            name=profile.name,
+            coder=profile.coder,
+            reviewer=profile.reviewer,
+            base_ref=profile.base_ref,
+            merge_target="",
+        ),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Framework-Fix",
+            body="Repository: hermes-agent",
+            assignee="hermes-coder",
+            tenant="voicera",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "not-needed"),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 1)
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.consecutive_failures == 0
+    assert task_id in result.auto_blocked
+
+
 def test_resolver_no_declaration_falls_to_tenant(kanban_home, role_profiles_exist):
     resolved = kb.resolve_repo_profiles(
         "Fix den Footer im Login-Screen", "voicera",
