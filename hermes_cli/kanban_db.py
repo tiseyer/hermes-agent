@@ -8747,31 +8747,36 @@ def resolve_task_repo_profiles(
 ) -> Optional[tuple[str, str, str]]:
     """Resolve role profiles for an existing card.
 
-    Declaration lookup order: the card's own title+body, then its
-    hierarchy parent (``parent_id``), then its initiative root — a
-    decomposed child usually doesn't repeat the root's repo declaration,
-    but must still route like the root. Falls back to the tenant default,
-    then ``None``. Read-only; deterministic.
+    Declaration lookup order: the structural ``repository`` field on the
+    card, then its hierarchy parent (``parent_id``), then its initiative
+    root. Only after those durable values do legacy title/body declarations
+    participate. A decomposed child commonly loses the body declaration but
+    must still route like its root. Falls back to the tenant default, then
+    ``None``. Read-only; deterministic.
     """
     row = conn.execute(
-        "SELECT title, body, tenant, parent_id, initiative_id "
+        "SELECT title, body, tenant, repository, parent_id, initiative_id "
         "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return None
-    texts: list[str] = []
-    texts.append((row["title"] or "") + "\n" + (row["body"] or ""))
+    rows = [row]
     seen_rel = set()
     for rel in (row["parent_id"], row["initiative_id"]):
         if rel and rel not in seen_rel and rel != task_id:
             seen_rel.add(rel)
             prow = conn.execute(
-                "SELECT title, body FROM tasks WHERE id = ?", (rel,),
+                "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
             ).fetchone()
             if prow:
-                texts.append((prow["title"] or "") + "\n" + (prow["body"] or ""))
-    for text in texts:
+                rows.append(prow)
+    for candidate in rows:
+        profile = _repository_profile_from_name(candidate["repository"])
+        if profile is not None:
+            return (profile.coder, profile.reviewer, "structured")
+    for candidate in rows:
+        text = (candidate["title"] or "") + "\n" + (candidate["body"] or "")
         resolved = resolve_repo_profiles(text, None)
         if resolved:
             return resolved
