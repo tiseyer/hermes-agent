@@ -34,6 +34,7 @@ from hermes_cli.profiles import get_active_profile_name
 # ---------------------------------------------------------------------------
 
 _STATUS_ICONS = {
+    "backlog":  "▣",
     "todo":     "◻",
     "ready":    "▶",
     "running":  "●",
@@ -2558,7 +2559,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "backlog", "todo", "scheduled", "ready", "running", "blocked", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

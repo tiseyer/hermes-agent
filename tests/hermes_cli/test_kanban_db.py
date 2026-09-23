@@ -1653,6 +1653,29 @@ def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t2).status == "ready"
 
 
+def test_backlog_is_visible_but_never_promoted_or_dispatched(
+    kanban_home, all_assignees_spawnable,
+):
+    """A parked card needs an explicit manual move to ``ready`` before spawn."""
+    spawned = []
+    with kb.connect() as conn:
+        parked = kb.create_task(conn, title="parked", assignee="alice")
+        control = kb.create_task(conn, title="control", assignee="bob")
+        conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (parked,))
+
+        assert kb.recompute_ready(conn) == 0
+        result = kb.dispatch_once(
+            conn, dry_run=True, spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+        parked_after = kb.get_task(conn, parked)
+        assert parked_after is not None
+        assert parked_after.status == "backlog"
+    assert parked not in {entry[0] for entry in result.spawned}
+    assert control in {entry[0] for entry in result.spawned}
+    assert spawned == []  # dry-run preserves the independent control task.
+
+
 def test_dispatch_skips_unassigned(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="floater")
