@@ -1866,8 +1866,8 @@ KANBAN_CREATE_SCHEMA = {
                     "Optional group tag. When multiple tasks share the same "
                     "merge_group value, the merger treats them as a unit: "
                     "all member branches are merged into a single commit "
-                    "on develop. The merger card for the group stays in "
-                    "todo until all member cards reach done (enforced via "
+                    "on the repository profile's configured merge target. The "
+                    "merger card for the group stays in todo until all member "
                     "parent/child links)."
                 ),
             },
