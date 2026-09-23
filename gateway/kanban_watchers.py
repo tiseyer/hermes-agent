@@ -24,6 +24,10 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Startup grace before the embedded dispatcher's first tick (module-level so
+# tests can shrink it instead of waiting out the real adapter-wiring delay).
+_DISPATCHER_INITIAL_DELAY_S = 5.0
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -932,7 +936,7 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
-        await asyncio.sleep(5)
+        await asyncio.sleep(_DISPATCHER_INITIAL_DELAY_S)
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
@@ -1208,10 +1212,49 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        # Out-of-loop liveness backstop (Loop-Freeze-Härtung Paket 1): this
+        # loop survives exceptions, but a *hung* dispatch tick (e.g. an
+        # SQLite lock wait inside asyncio.to_thread) freezes it silently —
+        # systemd only sees "PID alive". Same heartbeat file, kill switch
+        # (HERMES_DISPATCHER_WATCHDOG=0) and stall budget as
+        # kanban_db.run_daemon(): after max_strikes probes without tick
+        # progress the watchdog hard-exits 75. The embedded loop runs inside
+        # the gateway process (= the unit's MainPID), so os._exit(75) IS the
+        # service exit status and RestartForceExitStatus=75 restarts us.
+        # The _kanban_watchdog_* instance attributes are test seams.
+        from hermes_cli import dispatcher_watchdog as _watchdog
+
+        tick_count = 0
+        tick_ok = False
+        watchdog_handle = None
+        if _watchdog.watchdog_enabled():
+            _probe = getattr(self, "_kanban_watchdog_probe_interval", None)
+            _strikes = getattr(self, "_kanban_watchdog_max_strikes", None)
+            watchdog_handle = _watchdog.start_stall_watchdog(
+                lambda: tick_count,
+                probe_interval=(
+                    float(_probe)
+                    if _probe is not None
+                    else max(interval, _watchdog.DEFAULT_PROBE_INTERVAL_S)
+                ),
+                max_strikes=(
+                    int(_strikes)
+                    if _strikes is not None
+                    else _watchdog.DEFAULT_MAX_STRIKES
+                ),
+                on_stall=getattr(self, "_kanban_watchdog_on_stall", None),
+            )
+        else:
+            logger.info(
+                "kanban dispatcher: stall watchdog disabled via %s",
+                _watchdog.WATCHDOG_ENV_VAR,
+            )
+
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            tick_ok = False
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1267,13 +1310,26 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                tick_ok = True
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                if watchdog_handle is not None:
+                    watchdog_handle.stop()
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
                 self._kanban_dispatcher_lock_handle = None
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+
+            # Progress marker AFTER the tick (same contract as run_daemon):
+            # a hung dispatch freezes the counter and trips the watchdog;
+            # a failing-but-returning tick still counts as progress.
+            tick_count += 1
+            _watchdog.write_heartbeat(
+                tick_count=tick_count,
+                last_tick_ok=tick_ok,
+                extra={"source": "gateway_dispatcher"},
+            )
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
@@ -1282,5 +1338,7 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
+        if watchdog_handle is not None:
+            watchdog_handle.stop()
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None
