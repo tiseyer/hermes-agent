@@ -1130,6 +1130,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
+    repository = args.get("repository")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -1202,6 +1203,7 @@ def _handle_create(args: dict, **kw) -> str:
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
+                repository=repository,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
@@ -1827,6 +1829,14 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Optional namespace for multi-project isolation. "
                     "Defaults to HERMES_TENANT env if set."
+                ),
+            },
+            "repository": {
+                "type": "string",
+                "description": (
+                    "Repository profile or signature (for example 'hermes' or "
+                    "'hermes-agent'). Stored structurally and inherited by "
+                    "decomposed children."
                 ),
             },
             "priority": {

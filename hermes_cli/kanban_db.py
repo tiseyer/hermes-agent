@@ -855,6 +855,8 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    # Canonical repository-profile name. NULL keeps legacy body/tenant routing.
+    repository: Optional[str] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -960,6 +962,7 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            repository=row["repository"] if "repository" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -1152,6 +1155,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
+    -- Canonical repository-profile name; survives body rewrites and decomposition.
+    repository           TEXT,
     result               TEXT,
     -- Optional merge-group tag: tasks sharing the same value are merged
     -- as a unit by the merger card. NULL = independent task.
@@ -2014,6 +2019,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "repository" not in cols:
+        _add_column_if_missing(conn, "tasks", "repository", "repository TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2557,6 +2565,7 @@ def create_task(
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
+    repository: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
     triage: bool = False,
@@ -2624,6 +2633,12 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if repository is not None:
+        repository = str(repository).strip().lower()
+        if repository not in _REPOSITORY_PROFILES:
+            repository = _repository_profile_prefix(f"Repository: {repository}", None)
+        if repository is None:
+            raise ValueError("repository must name a configured repository profile")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2863,12 +2878,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, merge_group, idempotency_key,
+                        branch_name, project_id, tenant, repository, merge_group, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         parent_id, initiative_id, family_root_id, family_order,
                         child_role
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2884,6 +2899,7 @@ def create_task(
                         branch_name,
                         project_id,
                         tenant,
+                        repository,
                         merge_group,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -6254,7 +6270,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, title, body, status, tenant, workspace_kind, "
+            "SELECT id, title, body, status, tenant, repository, workspace_kind, "
             "workspace_path, initiative_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6274,9 +6290,15 @@ def decompose_triage_task(
         # repo/profile declaration on the root beats the tenant default
         # (goal decompose-repo-routing); without one this is exactly the
         # fbe14b734c tenant pair.
-        root_pair = resolve_repo_profiles(
-            (root_row["title"] or "") + "\n" + (root_row["body"] or ""),
-            tenant,
+        root_repository = root_row["repository"]
+        root_profile = _repository_profile_from_name(root_repository)
+        root_pair = (
+            (root_profile.coder, root_profile.reviewer, "declared")
+            if root_profile is not None
+            else resolve_repo_profiles(
+                (root_row["title"] or "") + "\n" + (root_row["body"] or ""),
+                tenant,
+            )
         )
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -6345,9 +6367,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by, "
+                " workspace_path, tenant, repository, created_at, created_by, "
                 " parent_id, initiative_id, family_root_id, family_order, child_role) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'work')",
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'work')",
                 (
                     new_id,
                     title,
@@ -6356,6 +6378,7 @@ def decompose_triage_task(
                     child_ws_kind,
                     child_ws_path,
                     tenant,
+                    root_repository,
                     now,
                     (author or "decomposer"),
                     task_id,
@@ -8598,6 +8621,16 @@ def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfi
     return profile
 
 
+def _repository_profile_from_name(name: Optional[str]) -> Optional[RepositoryProfile]:
+    """Resolve a stored canonical repository name without tenant fallback."""
+    if not name:
+        return None
+    profile = _REPOSITORY_PROFILES.get(name)
+    if profile is None:
+        return None
+    return _validated_repository_profile(profile)
+
+
 def resolve_repository_profile(
     text: Optional[str], tenant: Optional[str],
 ) -> Optional[RepositoryProfile]:
@@ -8621,20 +8654,27 @@ def resolve_task_repository_profile(
 ) -> Optional[RepositoryProfile]:
     """Resolve a card's repo profile, inheriting its parent/root declaration."""
     row = conn.execute(
-        "SELECT title, body, tenant, parent_id, initiative_id FROM tasks WHERE id = ?",
+        "SELECT title, body, tenant, repository, parent_id, initiative_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return None
+    profile = _repository_profile_from_name(row["repository"])
+    if profile is not None:
+        return profile
     texts = [(row["title"] or "") + "\n" + (row["body"] or "")]
     seen_rel = set()
     for rel in (row["parent_id"], row["initiative_id"]):
         if rel and rel not in seen_rel and rel != task_id:
             seen_rel.add(rel)
             parent = conn.execute(
-                "SELECT title, body FROM tasks WHERE id = ?", (rel,),
+                "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
             ).fetchone()
             if parent:
+                profile = _repository_profile_from_name(parent["repository"])
+                if profile is not None:
+                    return profile
                 texts.append((parent["title"] or "") + "\n" + (parent["body"] or ""))
     for text in texts:
         profile = resolve_repository_profile(text, None)
