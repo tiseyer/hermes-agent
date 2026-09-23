@@ -10160,7 +10160,11 @@ def run_daemon(
             # the counter and trips the stall watchdog.
             tick_count += 1
             consecutive_failures = 0 if tick_ok else consecutive_failures + 1
-            _watchdog.write_heartbeat(tick_count=tick_count, last_tick_ok=tick_ok)
+            _watchdog.write_heartbeat(
+                tick_count=tick_count,
+                last_tick_ok=tick_ok,
+                extra={"source": "kanban_daemon"},
+            )
             stop_event.wait(
                 timeout=_watchdog.backoff_wait_seconds(
                     interval, consecutive_failures
