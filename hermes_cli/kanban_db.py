@@ -6766,18 +6766,24 @@ def _maybe_repair_stale_worktree(
 
 
 def _resolve_review_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    repository_profile: Optional[RepositoryProfile] = None,
 ) -> tuple[Path, str]:
     """Materialize a SEPARATE reviewer worktree for a review-claimed task.
 
     Reviewers must never share the coder's worktree (they could corrupt
     in-progress state, and they'd review the local tree instead of what
     was actually pushed). This resolves the repo root from the coder's
-    worktree (or the board default_workdir), fetches the task branch from
-    ``origin``, and materializes ``<repo>/.worktrees/<task-id>-review``
-    checked out at ``origin/<branch>`` (detached). Falls back to the
-    local branch tip when the branch was never pushed — the reviewer is
-    expected to flag the missing push as a finding.
+    worktree (or the board default_workdir), fetches the task branch from the
+    repository profile's base-ref remote, and materializes
+    ``<repo>/.worktrees/<task-id>-review`` checked out at
+    ``<remote>/<branch>`` (detached). A configured repository profile requires
+    that remote ref to exist: falling back to a local branch would let the
+    reviewer inspect unpushed work rather than the coder's remote read-back.
+    Legacy tasks without a profile retain the old best-effort origin/local
+    fallback behavior.
 
     The task row's ``workspace_path`` is deliberately NOT the target:
     callers must not persist this path onto the task, so a review
@@ -6815,19 +6821,37 @@ def _resolve_review_worktree_workspace(
 
     target = repo_root / ".worktrees" / f"{task.id}-review"
 
-    # Fetch the branch so origin/<branch> reflects what the coder pushed.
-    # Best-effort: offline review of the local tip is better than a
-    # hard-failed dispatch.
-    subprocess.run(
-        ["git", "-C", str(repo_root), "fetch", "origin", branch_name],
+    remote = "origin"
+    profile_requires_remote_ref = repository_profile is not None
+    if repository_profile is not None:
+        remote, separator, _branch = repository_profile.base_ref.partition("/")
+        if not separator or not remote:
+            raise RepositoryProfileError(
+                f"repository profile {repository_profile.name!r} has invalid "
+                f"base_ref {repository_profile.base_ref!r}; expected remote/branch"
+            )
+
+    # Fetch the branch from the repository profile's remote so the review
+    # checkout proves what the coder pushed.  A profile-controlled task must
+    # never silently degrade to a local ref, because that bypasses remote
+    # verification and may select a branch from a foreign upstream.
+    fetched = subprocess.run(
+        ["git", "-C", str(repo_root), "fetch", remote, branch_name],
         capture_output=True, text=True, timeout=60, check=False,
     )
-    remote_ref = f"origin/{branch_name}"
+    remote_ref = f"{remote}/{branch_name}"
     has_remote = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
          remote_ref],
         capture_output=True, text=True, timeout=30, check=False,
     ).returncode == 0
+    if profile_requires_remote_ref and not has_remote:
+        detail = (fetched.stderr or fetched.stdout or "").strip()
+        raise RuntimeError(
+            f"review task {task.id}: required remote branch {remote_ref!r} "
+            f"is unavailable; coder must push to {remote!r} before review"
+            + (f": {detail}" if detail else "")
+        )
     review_ref = remote_ref if has_remote else branch_name
 
     if target.exists() and _is_linked_worktree_checkout(target):
@@ -9485,17 +9509,28 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
+            repository_profile = resolve_task_repository_profile(conn, claimed.id)
             if claimed.workspace_kind == "worktree":
                 # Reviewer isolation: NEVER reuse the coder's worktree.
                 # Materialize a separate  <repo>/.worktrees/<id>-review
-                # checkout at origin/<coder-branch> so the reviewer sees
-                # exactly what was pushed and cannot corrupt the coder's
-                # in-progress tree (goal "orchestrator-autonomy" §5).
+                # checkout at the repository-profile remote/<coder-branch>
+                # so the reviewer sees exactly what was pushed and cannot
+                # corrupt the coder's in-progress tree (goal
+                # "orchestrator-autonomy" §5).
                 workspace, _rv_branch = _resolve_review_worktree_workspace(
-                    claimed, board=board
+                    claimed, board=board, repository_profile=repository_profile,
                 )
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except RepositoryProfileError as exc:
+            block_task(
+                conn,
+                claimed.id,
+                reason=f"repository profile configuration required: {exc}",
+                kind="needs_input",
+            )
+            result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",

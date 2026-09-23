@@ -334,6 +334,81 @@ def test_review_dispatch_uses_separate_reviewer_worktree(
         assert kb.get_task(conn, tid).workspace_path == str(coder_wt)
 
 
+@pytest.mark.parametrize(
+    ("repository", "remote", "branch", "expected_file", "unexpected_file"),
+    [
+        (
+            "hermes-agent", "fork", "feature/fork-review",
+            "fork-feature.txt", "local-decoy.txt",
+        ),
+        (
+            "goya", "origin", "feature/origin-review",
+            "origin-feature.txt", "local-decoy.txt",
+        ),
+    ],
+)
+def test_review_dispatch_reads_feature_branch_from_repository_profile_remote(
+    kanban_home, tmp_path, all_assignees_spawnable,
+    repository, remote, branch, expected_file, unexpected_file,
+):
+    """Review checkout must read the feature ref from the profile's remote.
+
+    The local branch is a deliberately different decoy.  Before the fix, the
+    hermes case fetched only origin, missed the fork-only branch, and reviewed
+    that local decoy instead.  The goya control continues reading origin.
+    """
+    origin = tmp_path / "origin.git"
+    fork = tmp_path / "fork.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run(["git", "init"], seed)
+    _run(["git", "config", "user.email", "t@t.com"], seed)
+    _run(["git", "config", "user.name", "T"], seed)
+    _run(["git", "checkout", "-b", "main"], seed)
+    _commit(seed, "README.md", "base")
+    _run(["git", "init", "--bare", str(origin)], tmp_path)
+    _run(["git", "init", "--bare", str(fork)], tmp_path)
+    _run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], origin)
+    _run(["git", "remote", "add", "origin", str(origin)], seed)
+    _run(["git", "remote", "add", "fork", str(fork)], seed)
+    _run(["git", "push", "origin", "main"], seed)
+    _run(["git", "push", "fork", "main"], seed)
+
+    feature_file = "fork-feature.txt" if remote == "fork" else "origin-feature.txt"
+    _run(["git", "checkout", "-b", branch], seed)
+    _commit(seed, feature_file, f"{remote} feature")
+    _run(["git", "push", remote, branch], seed)
+    _run(["git", "checkout", "main"], seed)
+
+    repo = tmp_path / "repo"
+    _run(["git", "clone", str(origin), str(repo)], tmp_path)
+    _run(["git", "remote", "add", "fork", str(fork)], repo)
+    _run(["git", "config", "user.email", "t@t.com"], repo)
+    _run(["git", "config", "user.name", "T"], repo)
+    _run(["git", "checkout", "-b", branch], repo)
+    _commit(repo, "local-decoy.txt", "local decoy")
+
+    coder_wt = repo.parent / "coder-wt"
+    # The root checkout owns the decoy branch, so materialize the coder
+    # workspace detached at that same local commit.
+    _run(["git", "worktree", "add", "--detach", str(coder_wt), branch], repo)
+    tid = None
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title=f"Repository: {repository}", assignee="alice",
+            workspace_kind="worktree", workspace_path=str(coder_wt),
+            branch_name=branch,
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        assert kb.block_task(conn, tid, reason="review it", kind="review")
+        spawned = {}
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, **kw: spawned.setdefault(task.id, workspace))
+
+    review_ws = Path(spawned[tid])
+    assert (review_ws / expected_file).exists()
+    assert not (review_ws / unexpected_file).exists()
+
+
 def test_done_verification_covers_goal_mode_direct_complete(
     kanban_home, repo_with_remote,
 ):
