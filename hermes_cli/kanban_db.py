@@ -5592,6 +5592,15 @@ def block_task(
         )
     routed_to = "blocked"
     recurrences = 0
+    # Resolve the review target before opening the transition transaction. An
+    # explicit legacy declaration that cannot be resolved is unsafe to route;
+    # convert the requested handoff into a human-visible needs_input block.
+    if kind == "review":
+        try:
+            resolve_task_repo_profiles(conn, task_id)
+        except RepositoryProfileError as exc:
+            kind = "needs_input"
+            reason = f"repository routing configuration required: {exc}"
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences, tenant, assignee "
@@ -6235,6 +6244,38 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+
+    # Reject malformed explicit declarations before opening the atomic child
+    # insert transaction. A triage root is not dispatchable yet, so it must be
+    # parked here rather than letting tenant fallback create misrouted children.
+    root_for_routing = conn.execute(
+        "SELECT title, body, tenant, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if root_for_routing is not None and root_for_routing["status"] == "triage":
+        try:
+            resolve_repo_profiles(
+                (root_for_routing["title"] or "") + "\n" + (root_for_routing["body"] or ""),
+                root_for_routing["tenant"],
+            )
+            for child in children:
+                resolve_repo_profiles(
+                    child["title"] + "\n" + (child.get("body") or ""), None,
+                )
+        except RepositoryProfileError as exc:
+            with write_txn(conn):
+                cur = conn.execute(
+                    """UPDATE tasks
+                          SET status = 'blocked', block_kind = 'needs_input'
+                        WHERE id = ? AND status = 'triage'""",
+                    (task_id,),
+                )
+                if cur.rowcount:
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {"kind": "needs_input", "reason":
+                         f"repository routing configuration required: {exc}"},
+                    )
+            return None
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -8590,19 +8631,50 @@ _PROFILE_DECL_RE = re.compile(
 _ROLE_PROFILE_RE = re.compile(r"\b([a-z0-9]+)-(coder|reviewer)\b")
 
 
-def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Optional[str]:
-    """Resolve a profile prefix from deterministic card declarations."""
-    if text:
-        decl_vals = [m.group("val") for m in _REPO_DECL_RE.finditer(text)]
-        decl_vals += [m.group("val") for m in _PROFILE_DECL_RE.finditer(text)]
-        for val in decl_vals:
-            low = val.lower()
-            role_hit = _ROLE_PROFILE_RE.search(low)
-            if role_hit and role_hit.group(1) in _REPOSITORY_PROFILES:
-                return role_hit.group(1)
+def _declared_repository_profile(text: Optional[str]) -> Optional[RepositoryProfile]:
+    """Resolve an explicit legacy declaration or reject it fail-closed.
+
+    An explicit declaration is an integration boundary, not a routing hint:
+    every declaration line must name a configured profile.  Unknown or
+    unverifiable declarations raise :class:`RepositoryProfileError` so callers
+    can park the card at ``needs_input`` rather than silently using its tenant.
+    """
+    if not text:
+        return None
+    decl_vals = [m.group("val") for m in _REPO_DECL_RE.finditer(text)]
+    decl_vals += [m.group("val") for m in _PROFILE_DECL_RE.finditer(text)]
+    declared: Optional[RepositoryProfile] = None
+    for val in decl_vals:
+        low = val.lower()
+        prefix: Optional[str] = None
+        role_hit = _ROLE_PROFILE_RE.search(low)
+        if role_hit:
+            prefix = role_hit.group(1)
+        else:
             for sig, sig_prefix in _REPO_SIGNATURE_MAP:
                 if sig in low:
-                    return sig_prefix
+                    prefix = sig_prefix
+                    break
+        if prefix is None or prefix not in _REPOSITORY_PROFILES:
+            raise RepositoryProfileError(
+                f"explicit repository declaration {val.strip()!r} does not name "
+                "a configured repository profile"
+            )
+        resolved = _validated_repository_profile(_REPOSITORY_PROFILES[prefix])
+        if declared is not None and declared.name != resolved.name:
+            raise RepositoryProfileError(
+                "conflicting explicit repository declarations: "
+                f"{declared.name!r} and {resolved.name!r}"
+            )
+        declared = resolved
+    return declared
+
+
+def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Optional[str]:
+    """Resolve a profile prefix from deterministic card declarations."""
+    declared = _declared_repository_profile(text)
+    if declared is not None:
+        return declared.name
     return tenant if tenant in _REPOSITORY_PROFILES else None
 
 
@@ -8695,48 +8767,26 @@ def resolve_repo_profiles(
     required to mirror the legacy ``_TENANT_REVIEWER_MAP`` behavior), or
     ``None`` when neither applies (caller falls back as before).
 
-    An explicit declaration that names an UNKNOWN repo signature (or whose
-    profiles don't exist) never crashes and is never silently swallowed:
-    it falls back to the tenant default (then the caller fallback) and
-    emits a structured log warning so the misrouted declaration is
-    visible to the operator.
+    An explicit declaration must resolve to configured, installed role profiles;
+    otherwise :class:`RepositoryProfileError` is raised for the caller to block
+    the card with ``needs_input``. Cards without a declaration keep the tenant
+    fallback unchanged.
     """
-    if text:
-        prefix: Optional[str] = None
-        decl_vals = [m.group("val") for m in _REPO_DECL_RE.finditer(text)]
-        decl_vals += [m.group("val") for m in _PROFILE_DECL_RE.finditer(text)]
-        for val in decl_vals:
-            low = val.lower()
-            role_hit = _ROLE_PROFILE_RE.search(low)
-            if role_hit:
-                prefix = role_hit.group(1)
-                break
-            for sig, sig_prefix in _REPO_SIGNATURE_MAP:
-                if sig in low:
-                    prefix = sig_prefix
-                    break
-            if prefix:
-                break
-        if prefix:
-            pair = (f"{prefix}-coder", f"{prefix}-reviewer")
-            try:
-                from hermes_cli.profiles import profile_exists
-                if profile_exists(pair[0]) and profile_exists(pair[1]):
-                    return (pair[0], pair[1], "declared")
-                _log.warning(
-                    "Repo-Deklaration %r aufgelöst zu %s/%s, aber die "
-                    "Profile existieren nicht — falle auf Tenant-Default "
-                    "(%r) zurück", decl_vals[0].strip(), pair[0], pair[1],
-                    tenant,
-                )
-            except Exception:
-                pass  # declared profiles unverifiable → fall through
-        elif decl_vals:
-            _log.warning(
-                "Unbekannte Repo-Deklaration %r (keine Signatur in der "
-                "Map) — falle auf Tenant-Default (%r) zurück",
-                decl_vals[0].strip(), tenant,
+    profile = _declared_repository_profile(text)
+    if profile is not None:
+        pair = (profile.coder, profile.reviewer)
+        try:
+            from hermes_cli.profiles import profile_exists
+        except Exception as exc:
+            raise RepositoryProfileError(
+                f"cannot verify declared repository profile {profile.name!r}"
+            ) from exc
+        if not (profile_exists(pair[0]) and profile_exists(pair[1])):
+            raise RepositoryProfileError(
+                f"declared repository {profile.name!r} requires installed profiles "
+                f"{pair[0]!r} and {pair[1]!r}"
             )
+        return (pair[0], pair[1], "declared")
     if tenant and tenant in _REPO_PROFILE_PREFIXES:
         return (f"{tenant}-coder", f"{tenant}-reviewer", "tenant")
     return None
