@@ -7221,7 +7221,10 @@ def reap_worker_zombies() -> "list[int]":
                 _record_worker_exit(pid, status)
                 reaped.append(pid)
         except Exception:
-            pass
+            # Swallow (a reap failure must not break the dispatch tick),
+            # but never silently: the 08:52 loop freeze taught us that
+            # invisible trouble in the reap path is undiagnosable.
+            _log.warning("zombie reap aborted mid-loop", exc_info=True)
     return reaped
 
 
@@ -8943,8 +8946,15 @@ def _dispatch_once_locked(
     board. When omitted, the current-board resolution chain is used.
     """
     # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    # reap_worker_zombies() for the full rationale. Guarded so a reap
+    # failure can never abort (or silently wedge) the dispatch tick.
+    try:
+        reap_worker_zombies()
+    except Exception:
+        _log.warning(
+            "dispatch tick: zombie reap failed; continuing tick",
+            exc_info=True,
+        )
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -10050,6 +10060,9 @@ def run_daemon(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
+    watchdog_probe_interval: Optional[float] = None,
+    watchdog_max_strikes: Optional[int] = None,
+    watchdog_on_stall=None,
 ) -> None:
     """Run the dispatcher in a loop until interrupted.
 
@@ -10057,9 +10070,24 @@ def run_daemon(
     on SIGINT / SIGTERM so ``hermes kanban daemon`` is systemd-friendly.
     ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
     callable receiving the :class:`DispatchResult`) are test hooks.
+
+    Liveness: exceptions cannot kill this loop, but a *hang* inside
+    ``dispatch_once`` (e.g. an SQLite lock wait) used to freeze it silently
+    forever — the supervisor only sees "PID alive". Now every iteration
+    writes ``<HERMES_HOME>/state/dispatcher.heartbeat`` (success and
+    failure alike) and bumps a tick counter AFTER the tick, so a hung tick
+    freezes the counter and the out-of-loop stall watchdog
+    (:mod:`hermes_cli.dispatcher_watchdog`) hard-exits with code 75 after
+    ``max_strikes`` missed probes — systemd's ``RestartForceExitStatus=75``
+    turns that into a restart. ``HERMES_DISPATCHER_WATCHDOG=0`` disables
+    the watchdog (rollback path). The ``watchdog_*`` kwargs are test hooks:
+    probe interval / strike budget overrides and an ``on_stall`` callback
+    injected instead of the hard exit.
     """
     import signal
     import threading
+
+    from hermes_cli import dispatcher_watchdog as _watchdog
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -10078,24 +10106,69 @@ def run_daemon(
                 except (ValueError, OSError):
                     pass
 
-    while not stop_event.is_set():
-        try:
-            with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
-                    conn,
-                    max_spawn=max_spawn,
-                    failure_limit=failure_limit,
+    tick_count = 0
+    consecutive_failures = 0
+    watchdog_handle = None
+    if _watchdog.watchdog_enabled():
+        # Stall threshold: ticks legitimately take long while workers spawn,
+        # so the probe interval is at least the tick interval (and at least
+        # the 60s default) — total stall budget max(3*interval, 180s).
+        probe = (
+            float(watchdog_probe_interval)
+            if watchdog_probe_interval is not None
+            else max(float(interval), _watchdog.DEFAULT_PROBE_INTERVAL_S)
+        )
+        strikes = (
+            int(watchdog_max_strikes)
+            if watchdog_max_strikes is not None
+            else _watchdog.DEFAULT_MAX_STRIKES
+        )
+        watchdog_handle = _watchdog.start_stall_watchdog(
+            lambda: tick_count,
+            probe_interval=probe,
+            max_strikes=strikes,
+            on_stall=watchdog_on_stall,
+        )
+    else:
+        _log.info(
+            "kanban daemon: stall watchdog disabled via %s",
+            _watchdog.WATCHDOG_ENV_VAR,
+        )
+
+    try:
+        while not stop_event.is_set():
+            tick_ok = False
+            try:
+                with contextlib.closing(connect()) as conn:
+                    res = dispatch_once(
+                        conn,
+                        max_spawn=max_spawn,
+                        failure_limit=failure_limit,
+                    )
+                tick_ok = True
+                if on_tick is not None:
+                    try:
+                        on_tick(res)
+                    except Exception:
+                        pass
+            except BaseException:
+                # BaseException, not Exception: a SystemExit escaping from
+                # provider/spawn code must not silently kill the daemon;
+                # shutdown is driven by stop_event (signal handler above).
+                _log.error("kanban daemon: dispatch tick failed", exc_info=True)
+            # Progress marker AFTER the tick — a hung dispatch_once freezes
+            # the counter and trips the stall watchdog.
+            tick_count += 1
+            consecutive_failures = 0 if tick_ok else consecutive_failures + 1
+            _watchdog.write_heartbeat(tick_count=tick_count, last_tick_ok=tick_ok)
+            stop_event.wait(
+                timeout=_watchdog.backoff_wait_seconds(
+                    interval, consecutive_failures
                 )
-            if on_tick is not None:
-                try:
-                    on_tick(res)
-                except Exception:
-                    pass
-        except Exception:
-            # Don't let any single tick kill the daemon.
-            import traceback
-            traceback.print_exc()
-        stop_event.wait(timeout=interval)
+            )
+    finally:
+        if watchdog_handle is not None:
+            watchdog_handle.stop()
 
 
 # ---------------------------------------------------------------------------
