@@ -452,7 +452,7 @@ HARDLINE_PATTERNS = [
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
 # load eliminates the ~2.6 ms cold-cache re.compile fan-out on the first
-# terminal() call per process (12 HARDLINE + 47 DANGEROUS patterns, each
+# terminal() call per process (12 HARDLINE + 49 DANGEROUS patterns, each
 # potentially evicted from Python's 512-entry ``re._cache`` by unrelated
 # regex work elsewhere in the agent). DANGEROUS_PATTERNS_COMPILED is built
 # at the end of this module after DANGEROUS_PATTERNS is defined.
@@ -773,6 +773,16 @@ DANGEROUS_PATTERNS = [
     # later command in the same script.
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
+    # Remote branch deletion. `git push --delete`/`-d` and the classic
+    # empty-source refspec (`git push origin :branch`) remove a branch on
+    # the REMOTE — irreversible for everyone sharing it, and previously
+    # invisible to this detector (P13 inventory gap 2026-09-23). The
+    # refspec form only matches a colon that starts its own token
+    # (whitespace before `:`); `src:dst` refspecs and
+    # `--force-with-lease=ref:sha` values keep their colon mid-token and
+    # stay unmatched.
+    (r'\bgit\s+push\b[^;|&\n]*?\s(?:--delete|-d)\b', "git push --delete (deletes remote branch)"),
+    (r'\bgit\s+push\b[^;|&\n]*?\s\+?:\S+', "git push empty-source refspec (deletes remote branch)"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
@@ -2329,57 +2339,265 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     return env_type in ("singularity", "modal", "daytona")
 
 
-def _is_kanban_own_branch_force_push(command: str) -> bool:
-    """True for a kanban worker's --force-with-lease push of its own branch.
+# ---------------------------------------------------------------------------
+# Kanban-worker own-branch force-push exemption (P13, 2026-09-23)
+#
+# Ownership comes from the dispatcher-injected env vars
+# (``HERMES_KANBAN_BRANCH`` / ``HERMES_KANBAN_TASK``). That env check is a
+# GUARDRAIL against confused agents, NOT a security boundary — any process
+# that controls its own environment can claim ownership. What it bypasses is
+# only the interactive dangerous-command approval, which a headless kanban
+# worker cannot answer anyway (live repros: t_2323adbe block-loop;
+# t_ff713e72 / t_b1626afb / t_62fe834a stalled 2026-09-23). Real protection
+# for shared branches comes from the refspec-destination check below, the
+# merge-gate hook, and remote permissions.
 
-    Conditions (all must hold):
-      * ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), and
-      * the command is a single ``git push`` using ``--force-with-lease``
-        (never bare ``--force``/``-f``), and
-      * the task id appears in the command (task branches are named after
-        the task, e.g. ``wt/t_2323adbe``), and
-      * no shared integration branch (main/master/develop/release*) is
-        mentioned anywhere in the command — this keeps
-        ``... wt/t_x:develop`` refspecs gated.
-    """
+# Non-push segments a worker legitimately chains around its push with `&&`:
+# read-only git plumbing, output formatting, and `git rebase` (rewrites only
+# the local branch; arbitrary-exec flags are vetoed below).
+_KANBAN_SAFE_SEGMENT_PREFIXES = frozenset({
+    ("git", "fetch"),
+    ("git", "rev-parse"),
+    ("git", "ls-remote"),
+    ("git", "status"),
+    ("git", "log"),
+    ("git", "diff"),
+    ("git", "show-ref"),
+    ("git", "merge-base"),
+    ("git", "rebase"),
+    ("printf",),
+    ("echo",),
+    ("true",),
+    ("cd",),
+})
+
+# Command substitutions tolerated inside a segment (lease values like
+# ``--force-with-lease=ref:$(git rev-parse FETCH_HEAD)``).
+_KANBAN_SAFE_SUBSTITUTION_PREFIXES = frozenset({
+    ("git", "rev-parse"),
+    ("git", "ls-remote"),
+    ("git", "merge-base"),
+})
+_KANBAN_SUBSTITUTION_RE = re.compile(r"\$\(([^()`$;|&<>\n]*)\)")
+
+# git-push flags that keep the exemption alive. Everything else — including
+# any unknown flag — disqualifies the command (fail closed to the normal
+# approval flow).
+_KANBAN_PUSH_FLAG_ALLOWLIST = frozenset({
+    "-u", "--set-upstream", "-v", "--verbose", "-q", "--quiet",
+    "--porcelain", "--atomic", "--dry-run", "--no-verify",
+})
+
+
+def _kanban_owned_branches() -> set:
+    """Branches this worker may force-with-lease push: the dispatcher-assigned
+    ``HERMES_KANBAN_BRANCH`` plus the ``wt/<task-id>`` naming convention."""
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
+        return set()
+    owned = {f"wt/{task_id}"}
+    assigned = (os.environ.get("HERMES_KANBAN_BRANCH") or "").strip()
+    if assigned:
+        owned.add(assigned)
+        if assigned.startswith("refs/heads/"):
+            owned.add(assigned[len("refs/heads/"):])
+    return owned
+
+
+def _split_top_level_and(command: str):
+    """Split ``command`` on top-level ``&&`` into segments.
+
+    Returns None when the command uses any OTHER shell control construct
+    (``;``, ``|``, ``&``, backticks, redirection, newline, nested ``$( )``,
+    unbalanced quotes) — those disable the exemption entirely.
+    """
+    segments, buf = [], []
+    i, n = 0, len(command)
+    quote = None
+    depth = 0
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command.startswith("$(", i):
+            if depth:  # nested substitution — give up
+                return None
+            depth += 1
+            buf.append("$(")
+            i += 2
+            continue
+        if ch == ")" and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if depth == 0 and command.startswith("&&", i):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in ";|`<>\n" or ch == "&":
+            return None
+        buf.append(ch)
+        i += 1
+    if quote is not None or depth:
+        return None
+    segments.append("".join(buf))
+    segments = [seg.strip() for seg in segments if seg.strip()]
+    return segments or None
+
+
+def _strip_safe_substitutions(segment: str):
+    """Replace read-only ``$(git rev-parse …)``-style substitutions with a
+    placeholder token. Returns None when any substitution is not on the
+    read-only allowlist (or could not be parsed)."""
+    rejected = "\x00"
+
+    def _replace(match):
+        inner = match.group(1).strip().split()
+        if len(inner) >= 2 and (inner[0], inner[1]) in _KANBAN_SAFE_SUBSTITUTION_PREFIXES:
+            return "__HERMES_KANBAN_SUBST__"
+        return rejected
+
+    replaced = _KANBAN_SUBSTITUTION_RE.sub(_replace, segment)
+    if rejected in replaced or "$(" in replaced:
+        return None
+    return replaced
+
+
+def _kanban_segment_vetoed(tokens) -> bool:
+    """Veto flags that turn a safe segment into an arbitrary-command vector
+    (``rebase -x``/``-i``, custom transport helpers)."""
+    for tok in tokens[1:]:
+        if tok in ("-x", "-i") or tok.startswith((
+            "--exec", "--interactive", "--upload-pack", "--receive-pack",
+        )):
+            return True
+    return False
+
+
+def _kanban_push_segment_ok(tokens, owned) -> bool:
+    """Validate one ``git push`` segment: --force-with-lease present, no bare
+    force / deletion / mirror semantics, every refspec DESTINATION on the
+    worker's owned-branch set. The destination check (not a token search) is
+    what keeps ``wt/t_x:develop`` gated while allowing a rebase context that
+    merely mentions ``develop`` elsewhere in the chain."""
+    has_lease = False
+    positionals = []
+    for tok in tokens[2:]:
+        if tok.startswith("--force-with-lease"):
+            has_lease = True
+            continue
+        if tok == "-f" or tok.startswith("--force"):
+            return False  # bare force — no lease protection
+        if tok in ("-d", "--delete", "--mirror", "--all", "--branches",
+                   "--tags", "--follow-tags", "--prune"):
+            return False
+        if tok.startswith("-"):
+            if tok not in _KANBAN_PUSH_FLAG_ALLOWLIST:
+                return False
+            continue
+        positionals.append(tok)
+    if not has_lease:
         return False
-    if "--force-with-lease" not in command:
+    # Require an explicit remote AND refspec(s): an implicit current-branch
+    # push cannot be ownership-checked, so it stays gated.
+    if len(positionals) < 2:
         return False
-    # Only a plain git push — no chaining that could smuggle a second cmd.
-    if re.search(r"[;&|`$(]", command):
-        return False
-    if not re.match(r"^\s*git\s+push\b", command):
-        return False
-    # Bare --force / -f anywhere disables the exemption (e.g. a command
-    # carrying both flags).
-    if re.search(r"(^|\s)--force(\s|$)|(^|\s)-f(\s|$)", command):
-        return False
-    if task_id not in command:
-        return False
-    if re.search(r"\b(main|master|develop|release[\w/-]*)\b", command):
-        return False
+    for refspec in positionals[1:]:
+        if refspec.startswith("+"):
+            return False  # +refspec is a bare force push
+        if refspec.startswith(":"):
+            return False  # empty source deletes the remote ref
+        dst = refspec.split(":", 1)[1] if ":" in refspec else refspec
+        if dst.startswith("refs/heads/"):
+            dst = dst[len("refs/heads/"):]
+        if dst not in owned:
+            return False
     return True
 
 
-def check_dangerous_command(command: str, env_type: str,
-                            approval_callback=None,
-                            has_host_access: bool = False) -> dict:
-    """Check if a command is dangerous and handle approval.
+def _is_kanban_own_branch_force_push(command: str) -> bool:
+    """True for a kanban worker's --force-with-lease push of its OWN branch.
 
-    This is the main entry point called by terminal_tool before executing
-    any command. It orchestrates detection, session checks, and prompting.
+    A dispatcher-spawned worker rebasing its task branch and force-with-lease
+    pushing it back is routine workspace hygiene, not history rewrite of
+    shared state — nobody else builds on the card's branch, and
+    --force-with-lease refuses to clobber a moved remote. Headless workers
+    have no human to answer the generic force-push gate, so without this
+    exemption the coder is structurally unable to complete a rebase.
 
-    Args:
-        command: The shell command to check.
-        env_type: Terminal backend type ('local', 'ssh', 'docker', etc.).
-        approval_callback: Optional CLI callback for interactive prompts.
-        has_host_access: True when a Docker sandbox bind-mounts host paths,
-            so its commands can reach the host and must not skip approval.
+    Conditions (all must hold):
+      * ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker) — see the
+        guardrail-not-security-boundary note above;
+      * the command is one or more segments chained ONLY with ``&&``;
+      * every non-push segment is read-only plumbing from
+        ``_KANBAN_SAFE_SEGMENT_PREFIXES`` (command substitutions only from
+        ``_KANBAN_SAFE_SUBSTITUTION_PREFIXES``);
+      * at least one segment is a ``git push`` that passes
+        ``_kanban_push_segment_ok``: --force-with-lease, never bare
+        ``--force``/``-f``/``+refspec``, no deletion/mirror flags, and every
+        refspec destination on the owned set (``HERMES_KANBAN_BRANCH`` or
+        ``wt/<task-id>``) — pushes toward main/develop/any shared branch
+        fail the destination check and stay gated.
+    """
+    owned = _kanban_owned_branches()
+    if not owned:
+        return False
+    if "--force-with-lease" not in command:
+        return False
+    segments = _split_top_level_and(command)
+    if not segments:
+        return False
+    saw_push = False
+    for segment in segments:
+        cleaned = _strip_safe_substitutions(segment)
+        if cleaned is None:
+            return False
+        try:
+            tokens = shlex.split(cleaned)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        if tokens[:2] == ["git", "push"]:
+            if not _kanban_push_segment_ok(tokens, owned):
+                return False
+            saw_push = True
+            continue
+        if (tuple(tokens[:2]) in _KANBAN_SAFE_SEGMENT_PREFIXES
+                or (tokens[0],) in _KANBAN_SAFE_SEGMENT_PREFIXES):
+            if _kanban_segment_vetoed(tokens):
+                return False
+            continue
+        return False
+    return saw_push
 
-    Returns:
-        {"approved": True/False, "message": str or None, ...}
+
+def _common_pre_gate_checks(command: str, env_type: str,
+                            has_host_access: bool = False):
+    """Shared pre-detection policy for BOTH command gates.
+
+    ``check_all_command_guards`` (the live terminal path) and
+    ``check_dangerous_command`` (legacy/pattern-only entry point) must apply
+    the identical short-circuit policy — container skip, hardline floor,
+    sudo-stdin guard, user deny rules, yolo/mode=off bypass, permanent
+    allowlist, kanban own-branch exemption. Extracting it here keeps the two
+    entry points from drifting (P13: the kanban exemption previously lived
+    only in ``check_dangerous_command``, which has no production callers, so
+    the live path never saw it).
+
+    Returns a decision dict to short-circuit with, or None to continue into
+    detection + approval.
     """
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
@@ -2394,35 +2612,69 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
+    # == Sudo stdin guard ==
+    # Like the hardline floor above, this is unconditional: there is never a
+    # legitimate reason for the agent to pipe passwords to sudo -S when no
+    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
+    # check so even yolo/smart approval/mode=off cannot bypass it.
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
     # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
-    # user saying "never, even under yolo".
+    # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
+    # rule is the user saying "never, even under yolo".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or _get_approval_mode() == "off":
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    # Kanban-worker exemption: a dispatcher-spawned worker force-pushing
-    # ITS OWN task branch with --force-with-lease after a rebase is
-    # routine workspace hygiene, not history rewrite of shared state —
-    # nobody else builds on wt/<task-id>, and --force-with-lease refuses
-    # to clobber a moved remote. Headless workers have no human to
-    # approve the generic force-push gate, so without this exemption the
-    # coder is structurally unable to complete a rebase (live-repro:
-    # t_2323adbe block-looped on the approval gate). Shared integration
-    # branches stay gated: any mention of main/master/develop/release
-    # in the push disables the exemption.
+    # Kanban-worker exemption: routine --force-with-lease of the card's OWN
+    # branch (see _is_kanban_own_branch_force_push for the full rule set and
+    # the guardrail-not-security-boundary note).
     if _is_kanban_own_branch_force_push(command):
         return {"approved": True, "message": None}
+
+    return None
+
+
+def check_dangerous_command(command: str, env_type: str,
+                            approval_callback=None,
+                            has_host_access: bool = False) -> dict:
+    """Pattern-only dangerous-command gate (no tirith / smart approval).
+
+    The live terminal path uses :func:`check_all_command_guards`; this
+    entry point remains for callers that want the dangerous-pattern check
+    without content-security scanning. Both delegate their entire
+    short-circuit policy to :func:`_common_pre_gate_checks` and their
+    human-approval flow to :func:`_run_approval_gate`, so there is no
+    second, drift-prone copy of the policy.
+
+    Args:
+        command: The shell command to check.
+        env_type: Terminal backend type ('local', 'ssh', 'docker', etc.).
+        approval_callback: Optional CLI callback for interactive prompts.
+        has_host_access: True when a Docker sandbox bind-mounts host paths,
+            so its commands can reach the host and must not skip approval.
+
+    Returns:
+        {"approved": True/False, "message": str or None, ...}
+    """
+    early = _common_pre_gate_checks(command, env_type,
+                                    has_host_access=has_host_access)
+    if early is not None:
+        return early
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
@@ -2693,49 +2945,15 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
+    # Shared short-circuit policy (container skip, hardline, sudo guard,
+    # deny rules, yolo/mode=off, allowlist, kanban own-branch exemption) —
+    # single source of truth with check_dangerous_command.
+    early = _common_pre_gate_checks(command, env_type,
+                                    has_host_access=has_host_access)
+    if early is not None:
+        return early
 
-    # Hardline floor: unconditional block for catastrophic commands
-    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
-    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
-    # no session-level setting can bypass it.
-    is_hardline, hardline_desc = detect_hardline_command(command)
-    if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
-
-    # == Sudo stdin guard ==
-    # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
-    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
-    if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
-
-    # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
-    # rule is the user saying "never, even under yolo".
-    deny_pattern = _match_user_deny_rule(command)
-    if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
-        return _user_deny_block_result(deny_pattern)
-
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
-    if _command_matches_permanent_allowlist(command):
-        return {"approved": True, "message": None}
-
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")

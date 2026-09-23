@@ -463,3 +463,190 @@ class TestKanbanOwnBranchForcePushExemption:
         res = check_dangerous_command(
             "git push --force-with-lease origin wt/t_2323adbe", "local")
         assert res["approved"] is True
+
+
+# ---------------------------------------------------------------------------
+# P13 (2026-09-23): generalized kanban own-branch exemption on the LIVE path
+# ---------------------------------------------------------------------------
+
+class TestP13OwnBranchForcePushLivePath:
+    """The three real worker pushes from 2026-09-23 run approval-free through
+    the LIVE gate (check_all_command_guards), simulated in the worker context
+    (HERMES_EXEC_ASK inherited from the gateway process, no notify callback
+    registered — the exact context that previously produced
+    status=pending_approval and a blocked card)."""
+
+    # t_ff713e72 (Fabrik Fix 2): chained fetch + rev-parse + lease-pinned
+    # force-with-lease push of the card's wt/ branch.
+    FIX2_CHAIN = (
+        "git fetch fork refs/heads/wt/t_ff713e72 && "
+        "printf 'LOCAL=' && git rev-parse HEAD && "
+        "printf '\\nREMOTE_BEFORE=' && git rev-parse FETCH_HEAD && "
+        "git push --force-with-lease=refs/heads/wt/t_ff713e72:$(git rev-parse FETCH_HEAD)"
+        " -u fork wt/t_ff713e72 && "
+        "printf 'REMOTE_AFTER=' && git ls-remote fork refs/heads/wt/t_ff713e72"
+    )
+    # t_b1626afb (Fix 1 Neubau): assigned feature/ branch, no task id in the
+    # branch name — ownership comes from HERMES_KANBAN_BRANCH.
+    FIX1_FEATURE_PUSH = (
+        "git push --force-with-lease -u fork feature/fabrik-fix-backlog-parkspalte"
+    )
+    # t_62fe834a: rebase context that mentions "develop" in the command —
+    # the old token search vetoed this; the refspec destination check must not.
+    REBASE_DEVELOP_CHAIN = (
+        "git fetch origin develop && git rebase origin/develop && "
+        "git push --force-with-lease -u fork wt/t_62fe834a"
+    )
+
+    def _run_live(self, cmd, monkeypatch, task, branch=None, session="p13-live"):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        if branch is not None:
+            monkeypatch.setenv("HERMES_KANBAN_BRANCH", branch)
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_BRANCH", raising=False)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        token = set_current_session_key(session)
+        try:
+            return check_all_command_guards(cmd, "local")
+        finally:
+            reset_current_session_key(token)
+
+    def test_fix2_chained_lease_push_is_approval_free(self, monkeypatch):
+        res = self._run_live(self.FIX2_CHAIN, monkeypatch, task="t_ff713e72")
+        assert res["approved"] is True
+        assert res["message"] is None
+        assert not approval_module._pending
+
+    def test_fix1_assigned_feature_branch_is_approval_free(self, monkeypatch):
+        res = self._run_live(
+            self.FIX1_FEATURE_PUSH, monkeypatch, task="t_b1626afb",
+            branch="feature/fabrik-fix-backlog-parkspalte")
+        assert res["approved"] is True
+        assert res["message"] is None
+        assert not approval_module._pending
+
+    def test_rebase_context_mentioning_develop_is_approval_free(self, monkeypatch):
+        res = self._run_live(
+            self.REBASE_DEVELOP_CHAIN, monkeypatch, task="t_62fe834a")
+        assert res["approved"] is True
+        assert res["message"] is None
+        assert not approval_module._pending
+
+    def test_counterfactual_foreign_task_still_pends(self, monkeypatch):
+        """Same context, foreign task id → the gate DOES fire (proves the
+        worker context in these tests is real, not fail-open)."""
+        res = self._run_live(
+            self.FIX1_FEATURE_PUSH, monkeypatch, task="t_someone_else",
+            session="p13-live-counter")
+        assert res["approved"] is False
+        assert res.get("status") == "pending_approval"
+
+
+class TestP13NegativeCasesStayGated:
+    """Rule matrix: everything outside 'force-with-lease onto the card's own
+    branch' keeps requiring approval."""
+
+    def _run_live(self, cmd, monkeypatch, task="t_a11", branch=None,
+                  session="p13-neg"):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        if branch is not None:
+            monkeypatch.setenv("HERMES_KANBAN_BRANCH", branch)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        token = set_current_session_key(session)
+        try:
+            return check_all_command_guards(cmd, "local")
+        finally:
+            reset_current_session_key(token)
+
+    def test_bare_force_own_branch_stays_gated(self, monkeypatch):
+        res = self._run_live("git push --force fork wt/t_a11", monkeypatch)
+        assert res["approved"] is False
+
+    def test_short_f_own_branch_stays_gated(self, monkeypatch):
+        res = self._run_live("git push -f fork wt/t_a11", monkeypatch)
+        assert res["approved"] is False
+
+    def test_plus_refspec_force_stays_gated(self, monkeypatch):
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git push --force-with-lease fork +wt/t_a11:wt/t_a11")
+
+    def test_lease_push_foreign_branch_stays_gated(self, monkeypatch):
+        res = self._run_live(
+            "git push --force-with-lease fork wt/t_other", monkeypatch)
+        assert res["approved"] is False
+
+    def test_lease_refspec_to_main_stays_gated(self, monkeypatch):
+        res = self._run_live(
+            "git push --force-with-lease fork wt/t_a11:main", monkeypatch)
+        assert res["approved"] is False
+
+    def test_lease_refspec_to_develop_stays_gated(self, monkeypatch):
+        res = self._run_live(
+            "git push --force-with-lease fork wt/t_a11:develop", monkeypatch)
+        assert res["approved"] is False
+
+    def test_lease_refspec_to_merge_target_stays_gated(self, monkeypatch):
+        res = self._run_live(
+            "git push --force-with-lease fork wt/t_a11:release/2.4", monkeypatch)
+        assert res["approved"] is False
+
+    def test_chain_with_writing_segment_stays_gated(self, monkeypatch):
+        res = self._run_live(
+            "git push --force-with-lease -u fork wt/t_a11 && git reset --hard HEAD~1",
+            monkeypatch)
+        assert res["approved"] is False
+
+    def test_chain_with_unknown_substitution_stays_gated(self, monkeypatch):
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git push --force-with-lease=refs/heads/wt/t_a11:$(cat /tmp/x)"
+            " fork wt/t_a11")
+
+    def test_rebase_exec_flag_stays_gated(self, monkeypatch):
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git rebase --exec 'touch pwned' origin/main && "
+            "git push --force-with-lease -u fork wt/t_a11")
+
+    def test_implicit_current_branch_push_stays_gated(self, monkeypatch):
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git push --force-with-lease")
+
+
+class TestRemoteBranchDeletionPattern:
+    """New DANGEROUS_PATTERNS entries: remote branch deletion via
+    `git push --delete`/-d and the empty-source `:ref` refspec."""
+
+    def _detect(self, cmd):
+        from tools.approval import detect_dangerous_command
+        return detect_dangerous_command(cmd)
+
+    def test_push_delete_long_flag_detected(self):
+        is_dangerous, _key, desc = self._detect("git push fork --delete wt/t_x")
+        assert is_dangerous
+        assert "delete" in desc.lower()
+
+    def test_push_delete_short_flag_detected(self):
+        is_dangerous, _key, desc = self._detect("git push -d fork wt/t_x")
+        assert is_dangerous
+        assert "delete" in desc.lower()
+
+    def test_push_empty_source_refspec_detected(self):
+        is_dangerous, _key, desc = self._detect("git push fork :wt/t_x")
+        assert is_dangerous
+        assert "delete" in desc.lower()
+
+    def test_src_dst_refspec_not_flagged(self):
+        is_dangerous, _key, _desc = self._detect("git push fork HEAD:refs/heads/wt/t_x")
+        assert not is_dangerous
+
+    def test_dry_run_not_flagged_as_deletion(self):
+        is_dangerous, _key, _desc = self._detect("git push --dry-run fork wt/t_x")
+        assert not is_dangerous
+
+    def test_exemption_never_covers_deletion(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_a11")
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git push --force-with-lease fork :wt/t_a11")
+        assert not approval_module._is_kanban_own_branch_force_push(
+            "git push --force-with-lease --delete fork wt/t_a11")
