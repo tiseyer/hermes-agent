@@ -21,6 +21,23 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
+# ``GET /board`` historically serialised the Task dataclass fields below,
+# followed by dashboard-owned card metadata. Keep this literal contract rather
+# than deriving it from the current Task dataclass: new persistence fields must
+# remain invisible unless ``family_view=true`` is explicitly requested.
+_LEGACY_BOARD_CARD_KEYS = (
+    "id", "title", "body", "assignee", "status", "priority", "created_by",
+    "created_at", "started_at", "completed_at", "workspace_kind", "workspace_path",
+    "claim_lock", "claim_expires", "tenant", "branch_name", "project_id", "result",
+    "idempotency_key", "consecutive_failures", "worker_pid", "last_failure_error",
+    "max_runtime_seconds", "last_heartbeat_at", "current_run_id",
+    "workflow_template_id", "current_step_key", "skills", "model_override",
+    "max_retries", "goal_mode", "goal_max_turns", "session_id", "block_kind",
+    "block_recurrences", "parent_id", "initiative_id", "age", "latest_summary",
+    "link_counts", "comment_count", "progress",
+)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -113,6 +130,49 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_board_family_view_is_opt_in_and_default_payload_hides_family_fields(client):
+    """The family projection must not mutate the established default wire shape."""
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="family root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "first", "assignee": "worker", "parents": []},
+                {"title": "second", "assignee": "worker", "parents": [0]},
+            ],
+        )
+    assert child_ids is not None
+
+    legacy = client.get("/api/plugins/kanban/board")
+    explicit_legacy = client.get("/api/plugins/kanban/board?family_view=false")
+    assert legacy.status_code == explicit_legacy.status_code == 200
+    assert legacy.content == explicit_legacy.content
+    legacy_cards = [task for column in legacy.json()["columns"] for task in column["tasks"]]
+    assert {task["id"] for task in legacy_cards} == {root_id, *child_ids}
+    # This is the pre-family default wire contract, including order: do not
+    # compare against ``family_view=false`` alone because both paths could
+    # regress together.
+    for task in legacy_cards:
+        # ``initiative`` was an existing optional dashboard rollup, emitted
+        # only for initiative roots; it is unrelated to family membership.
+        expected_keys = _LEGACY_BOARD_CARD_KEYS + (
+            ("initiative",) if "initiative" in task else ()
+        )
+        assert tuple(task) == expected_keys
+    assert all("family_order" not in task for task in legacy_cards)
+    assert all("family_root_id" not in task for task in legacy_cards)
+    assert all("child_role" not in task for task in legacy_cards)
+
+    projected = client.get("/api/plugins/kanban/board?family_view=true")
+    assert projected.status_code == 200
+    cards = [task for column in projected.json()["columns"] for task in column["tasks"]]
+    family = next(task for task in cards if task["id"] == root_id)
+    assert [child["id"] for child in family["children"]] == child_ids
+    assert [child["child_role"] for child in family["children"]] == ["work", "work"]
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(

@@ -921,6 +921,14 @@ class Task:
     # top-level / standalone cards.
     parent_id: Optional[str] = None
     initiative_id: Optional[str] = None
+    # A decomposed root and its descendants share this durable family id.
+    # NULL preserves the behaviour of ordinary dependency graphs.
+    family_root_id: Optional[str] = None
+    # Stable order for the opt-in board family projection (root = 0).
+    family_order: Optional[int] = None
+    # ``human_check`` stays visible in a family but does not gate root done.
+    # Legacy rows are ordinary work by default.
+    child_role: str = "work"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1012,6 +1020,21 @@ class Task:
                 row["initiative_id"]
                 if "initiative_id" in keys and row["initiative_id"]
                 else None
+            ),
+            family_root_id=(
+                row["family_root_id"]
+                if "family_root_id" in keys and row["family_root_id"]
+                else None
+            ),
+            family_order=(
+                int(row["family_order"])
+                if "family_order" in keys and row["family_order"] is not None
+                else None
+            ),
+            child_role=(
+                row["child_role"]
+                if "child_role" in keys and row["child_role"]
+                else "work"
             ),
         )
 
@@ -1202,7 +1225,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Root initiative of this card, stable across arbitrarily deep
     -- parent chains (a grandchild carries the same initiative_id as its
     -- parent). NULL = this card IS an initiative root / standalone card.
-    initiative_id        TEXT
+    initiative_id        TEXT,
+    -- Family identity is assigned only by decomposition or descendants of a
+    -- decomposed card. NULL means ordinary dependency semantics.
+    family_root_id       TEXT,
+    family_order         INTEGER,
+    child_role           TEXT NOT NULL DEFAULT 'work'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2042,6 +2070,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "initiative_id", "initiative_id TEXT"
         )
 
+    if "family_root_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "family_root_id", "family_root_id TEXT")
+    if "family_order" not in cols:
+        _add_column_if_missing(conn, "tasks", "family_order", "family_order INTEGER")
+    if "child_role" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "child_role", "child_role TEXT NOT NULL DEFAULT 'work'"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2062,6 +2099,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_initiative_id ON tasks(initiative_id)"
     )
+    # Some migration-isolation callers intentionally provide only the
+    # additive-column subset of the historical schema. The family index needs
+    # the core ``status`` column, so defer it until the complete task shape is
+    # available; normal board initialization always has that column.
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "status" in task_columns:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_family_root "
+            "ON tasks(family_root_id, family_order, child_role, status)"
+        )
+    _install_family_state_triggers(conn)
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2160,6 +2208,59 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+
+def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
+    """Mirror the active work child's state onto a decomposed family root."""
+    state_sql = """
+        UPDATE tasks SET status = CASE
+          WHEN NOT EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status != 'done') THEN 'done'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'blocked') THEN 'blocked'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'running') THEN 'running'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'review') THEN 'review'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'ready') THEN 'ready'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'scheduled') THEN 'scheduled'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'triage') THEN 'triage'
+          ELSE 'todo' END,
+          completed_at = CASE WHEN NOT EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status != 'done') THEN CAST(strftime('%s', 'now') AS INTEGER)
+            ELSE NULL END
+        WHERE id = NEW.family_root_id;
+    """
+    conn.execute("DROP TRIGGER IF EXISTS sync_family_root_after_insert")
+    conn.execute("DROP TRIGGER IF EXISTS sync_family_root_after_update")
+    conn.executescript(
+        "CREATE TRIGGER sync_family_root_after_insert AFTER INSERT ON tasks "
+        "WHEN NEW.family_root_id IS NOT NULL AND NEW.id != NEW.family_root_id BEGIN "
+        + state_sql + " END;"
+        "CREATE TRIGGER sync_family_root_after_update "
+        "AFTER UPDATE OF status, child_role, family_root_id ON tasks "
+        "WHEN NEW.family_root_id IS NOT NULL AND NEW.id != NEW.family_root_id BEGIN "
+        + state_sql + " END;"
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2472,6 +2573,7 @@ def create_task(
     project_id: Optional[str] = None,
     parent_task_id: Optional[str] = None,
     initiative_id: Optional[str] = None,
+    child_role: str = "work",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2507,6 +2609,8 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    if child_role not in {"work", "human_check"}:
+        raise ValueError("child_role must be 'work' or 'human_check'")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2683,6 +2787,26 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                family_roots = {
+                    row["family_root_id"]
+                    for row in conn.execute(
+                        "SELECT family_root_id FROM tasks WHERE id IN ("
+                        + ",".join("?" * len(parents))
+                        + ") AND family_root_id IS NOT NULL",
+                        parents,
+                    )
+                } if parents else set()
+                if len(family_roots) > 1:
+                    raise ValueError("cannot attach one child to multiple card families")
+                family_root_id = next(iter(family_roots), None)
+                family_order = None
+                if family_root_id is not None:
+                    family_order = conn.execute(
+                        "SELECT COALESCE(MAX(family_order), 0) + 1 "
+                        "FROM tasks WHERE family_root_id = ?",
+                        (family_root_id,),
+                    ).fetchone()[0]
+
                 # Resolve HIERARCHY placement (orthogonal to the dependency
                 # ``parents`` above; see docstring). Explicit initiative_id
                 # wins; otherwise derive it from the hierarchy parent.
@@ -2742,8 +2866,9 @@ def create_task(
                         branch_name, project_id, tenant, merge_group, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        parent_id, initiative_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        parent_id, initiative_id, family_root_id, family_order,
+                        child_role
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2769,6 +2894,9 @@ def create_task(
                         session_id,
                         hier_parent,
                         hier_initiative,
+                        family_root_id,
+                        family_order,
+                        child_role,
                     ),
                 )
                 for pid in parents:
@@ -2790,6 +2918,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "parent_task_id": hier_parent,
                         "initiative_id": hier_initiative,
+                        "child_role": child_role if family_root_id else None,
                     },
                 )
                 if task_status == "blocked":
@@ -2952,6 +3081,29 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        # ``task_links`` is the public dependency path used by workers to
+        # append follow-up cards.  A child linked below a decomposed member is
+        # therefore part of that member's family, just like a child created
+        # with ``parents=[...]``.  Do not silently merge two existing families:
+        # a card can only have one durable family root.
+        parent_family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()["family_root_id"]
+        child_family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()["family_root_id"]
+        if parent_family and child_family and parent_family != child_family:
+            raise ValueError("cannot attach one child to multiple card families")
+        if parent_family and not child_family:
+            family_order = conn.execute(
+                "SELECT COALESCE(MAX(family_order), 0) + 1 "
+                "FROM tasks WHERE family_root_id = ?",
+                (parent_family,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET family_root_id = ?, family_order = ? WHERE id = ?",
+                (parent_family, family_order, child_id),
+            )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
@@ -3633,6 +3785,13 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        # Roots are visible projections of work children, never dispatchable
+        # workers themselves.
+        if family and family["family_root_id"] == task_id:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3762,6 +3921,11 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if family and family["family_root_id"] == task_id:
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6098,6 +6262,13 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        # The root is a family member and a board projection of its children;
+        # further descendants inherit this stable family id through create_task.
+        conn.execute(
+            "UPDATE tasks SET family_root_id = ?, family_order = 0 "
+            "WHERE id = ?",
+            (task_id, task_id),
+        )
         tenant = root_row["tenant"]
         # Repo→profile resolution for role-profile children: an explicit
         # repo/profile declaration on the root beats the tenant default
@@ -6175,8 +6346,8 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, "
-                " parent_id, initiative_id) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
+                " parent_id, initiative_id, family_root_id, family_order, child_role) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'work')",
                 (
                     new_id,
                     title,
@@ -6189,6 +6360,8 @@ def decompose_triage_task(
                     (author or "decomposer"),
                     task_id,
                     child_initiative,
+                    task_id,
+                    idx + 1,
                 ),
             )
             _append_event(
@@ -6223,17 +6396,19 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
+        # The root is only a family projection. Leave its state to the SQLite
+        # family trigger; only retain the orchestration assignee for display.
+        sets = []
         params: list[Any] = []
         if root_assignee is not None:
             sets.append("assignee = ?")
             params.append(root_assignee)
-        params.append(task_id)
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
-            tuple(params),
-        )
+        if sets:
+            params.append(task_id)
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
@@ -8794,7 +8969,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "    AND (family_root_id IS NULL OR id != family_root_id)"
     ).fetchall()
     if not rows:
         return False
@@ -8972,17 +9148,20 @@ def _dispatch_once_locked(
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # than a per-tick spawn budget. Family roots mirror a work child's state,
+    # but never own a worker themselves, so exclude them from every worker
+    # concurrency calculation. See the docstring above for the full rationale;
+    # the short version is that a 60-second tick interval with a per-tick
+    # budget of N would grow concurrency by N every tick on a busy board,
+    # since "running" tasks aren't reclaimed by completion alone — they sit in
+    # status='running' until the worker calls kanban_complete/kanban_block (or
+    # the dispatcher TTL-reclaims them).
     running_count = 0
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+                "AND (family_root_id IS NULL OR id != family_root_id)"
             ).fetchone()[0]
         )
 
@@ -8997,7 +9176,8 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+            "AND (family_root_id IS NULL OR id != family_root_id)"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -9023,6 +9203,7 @@ def _dispatch_once_locked(
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
+            "AND (family_root_id IS NULL OR id != family_root_id) "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
