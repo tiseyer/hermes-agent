@@ -241,6 +241,42 @@ def test_redecompose_inherits_structured_repository_to_children(
         assert kb.get_task(conn, child_ids[1]).assignee == "hermes-reviewer"
 
 
+def test_review_block_honors_structured_repository_on_redecomposed_child(
+    kanban_home, role_profiles_exist,
+):
+    """Review routing must use the inherited field after the body lost it."""
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="Framework-Bug fixen",
+            body="Keine Legacy-Repo-Zeile.",
+            repository="hermes",
+            tenant="voicera",
+            triage=True,
+        )
+        (child_id,) = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{
+                "title": "Implementierung",
+                "body": "Der Redekompositionsschritt ohne Repo-Deklaration.",
+                "assignee": "voicera-coder",
+                "parents": [],
+            }],
+        )
+        child = kb.get_task(conn, child_id)
+        assert child.repository == "hermes"
+        assert "Repository:" not in (child.body or "")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child_id,))
+
+        assert kb.block_task(conn, child_id, reason="Review requested", kind="review")
+        routed = kb.get_task(conn, child_id)
+
+    assert routed.status == "review"
+    assert routed.assignee == "hermes-reviewer"
+
+
 def test_structured_repository_beats_conflicting_legacy_body(
     kanban_home, role_profiles_exist,
 ):
