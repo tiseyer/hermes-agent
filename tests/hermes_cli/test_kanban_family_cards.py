@@ -63,6 +63,37 @@ def test_existing_cards_are_work_and_not_family_members(kanban_home):
     assert task.family_root_id is None
 
 
+def test_linking_child_to_family_member_inherits_family_metadata(kanban_home):
+    """The public link path appends an existing card to the parent's family."""
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "work", "assignee": "worker", "parents": []}],
+        )
+        assert child_ids is not None
+        work_child = child_ids[0]
+        assert kb.complete_task(conn, work_child, result="done")
+
+        human_check = kb.create_task(
+            conn,
+            title="acceptance",
+            assignee="till",
+            child_role="human_check",
+        )
+        kb.link_tasks(conn, work_child, human_check)
+
+        appended = kb.get_task(conn, human_check)
+        assert (appended.family_root_id, appended.family_order, appended.child_role) == (
+            root_id,
+            2,
+            "human_check",
+        )
+        assert kb.get_task(conn, root_id).status == "done"
+
+
 @pytest.mark.parametrize("concurrency_limit", [
     {"max_in_progress": 2},
     {"max_spawn": 2},

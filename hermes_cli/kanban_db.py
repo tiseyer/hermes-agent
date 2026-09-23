@@ -3081,6 +3081,29 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        # ``task_links`` is the public dependency path used by workers to
+        # append follow-up cards.  A child linked below a decomposed member is
+        # therefore part of that member's family, just like a child created
+        # with ``parents=[...]``.  Do not silently merge two existing families:
+        # a card can only have one durable family root.
+        parent_family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()["family_root_id"]
+        child_family = conn.execute(
+            "SELECT family_root_id FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()["family_root_id"]
+        if parent_family and child_family and parent_family != child_family:
+            raise ValueError("cannot attach one child to multiple card families")
+        if parent_family and not child_family:
+            family_order = conn.execute(
+                "SELECT COALESCE(MAX(family_order), 0) + 1 "
+                "FROM tasks WHERE family_root_id = ?",
+                (parent_family,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET family_root_id = ?, family_order = ? WHERE id = ?",
+                (parent_family, family_order, child_id),
+            )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
