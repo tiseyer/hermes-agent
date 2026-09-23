@@ -106,7 +106,8 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
-    assert root.status == "todo"
+    assert root.status == "ready"
+    assert root.family_root_id == tid
     assert c0.status == "ready"
     assert c1.status == "todo"
     assert c0.assignee == "researcher"

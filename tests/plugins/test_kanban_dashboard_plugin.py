@@ -115,6 +115,39 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_family_view_is_opt_in_and_default_payload_hides_family_fields(client):
+    """The family projection must not mutate the established default wire shape."""
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="family root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "first", "assignee": "worker", "parents": []},
+                {"title": "second", "assignee": "worker", "parents": [0]},
+            ],
+        )
+    assert child_ids is not None
+
+    legacy = client.get("/api/plugins/kanban/board")
+    explicit_legacy = client.get("/api/plugins/kanban/board?family_view=false")
+    assert legacy.status_code == explicit_legacy.status_code == 200
+    assert legacy.content == explicit_legacy.content
+    legacy_cards = [task for column in legacy.json()["columns"] for task in column["tasks"]]
+    assert {task["id"] for task in legacy_cards} == {root_id, *child_ids}
+    assert all("family_order" not in task for task in legacy_cards)
+    assert all("family_root_id" not in task for task in legacy_cards)
+    assert all("child_role" not in task for task in legacy_cards)
+
+    projected = client.get("/api/plugins/kanban/board?family_view=true")
+    assert projected.status_code == 200
+    cards = [task for column in projected.json()["columns"] for task in column["tasks"]]
+    family = next(task for task in cards if task["id"] == root_id)
+    assert [child["id"] for child in family["children"]] == child_ids
+    assert [child["child_role"] for child in family["children"]] == ["work", "work"]
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):

@@ -1217,6 +1217,7 @@ def _handle_create(args: dict, **kw) -> str:
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
+                child_role=str(args.get("child_role") or "work"),
                 initial_status=str(initial_status),
                 merge_group=merge_group,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
@@ -1904,6 +1905,11 @@ KANBAN_CREATE_SCHEMA = {
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
                 ),
+            },
+            "child_role": {
+                "type": "string",
+                "enum": ["work", "human_check"],
+                "description": "Family role; human_check does not delay family completion.",
             },
             "skills": {
                 "type": "array",

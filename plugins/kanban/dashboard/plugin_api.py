@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import sqlite3
@@ -159,8 +160,15 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    include_family: bool = False,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # The legacy list endpoint must remain byte-compatible until the caller
+    # explicitly selects the family projection.
+    if not include_family:
+        d.pop("family_root_id", None)
+        d.pop("family_order", None)
+        d.pop("child_role", None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -380,6 +388,7 @@ def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    family_view: bool = Query(False, description="Show family roots with embedded children"),
     workflow_template_id: Optional[str] = Query(
         None, description="Restrict to tasks using this workflow template id",
     ),
@@ -500,6 +509,17 @@ def get_board(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()["m"]
 
+        family_children: dict[str, list[kanban_db.Task]] = defaultdict(list)
+        if family_view:
+            for task in tasks:
+                if task.family_root_id and task.id != task.family_root_id:
+                    family_children[task.family_root_id].append(task)
+            for children in family_children.values():
+                children.sort(key=lambda task: (
+                    task.family_order is None, task.family_order, task.created_at, task.id
+                ))
+            tasks = [task for task in tasks if not task.family_root_id or task.id == task.family_root_id]
+
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
@@ -515,7 +535,16 @@ def get_board(
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(t, latest_summary=preview, include_family=family_view)
+            if family_view and t.id in family_children:
+                d["children"] = [
+                    _task_dict(
+                        child,
+                        latest_summary=(summary_map.get(child.id, "")[:_CARD_SUMMARY_PREVIEW_CHARS] or None),
+                        include_family=True,
+                    )
+                    for child in family_children[t.id]
+                ]
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -717,6 +746,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    child_role: str = "work"
     # Hierarchy placement (orthogonal to ``parents`` above, which stays a
     # pure scheduling/dependency relation).
     parent_task_id: Optional[str] = None
@@ -745,6 +775,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            child_role=payload.child_role,
             parent_task_id=payload.parent_task_id,
             initiative_id=payload.initiative_id,
         )

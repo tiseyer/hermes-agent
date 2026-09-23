@@ -57,15 +57,18 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         c0 = kb.get_task(conn, child_ids[0])
         c1 = kb.get_task(conn, child_ids[1])
 
-    # Root flipped to todo with orchestrator assignee, gated by children.
-    assert root.status == "todo"
+    # Root mirrors its family's active work lane, not a dispatchable root job.
+    assert root.status == "ready"
     assert root.assignee == "orchestrator"
+    assert (root.family_root_id, root.family_order) == (tid, 0)
     # First child has no internal parents → ready on recompute_ready.
     assert c0.status == "ready"
     assert c0.assignee == "researcher"
+    assert (c0.family_root_id, c0.family_order, c0.child_role) == (tid, 1, "work")
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+    assert (c1.family_root_id, c1.family_order, c1.child_role) == (tid, 2, "work")
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):
