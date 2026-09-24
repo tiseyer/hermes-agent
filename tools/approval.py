@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shlex
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -2390,8 +2391,13 @@ _KANBAN_PUSH_FLAG_ALLOWLIST = frozenset({
 
 
 def _kanban_owned_branches() -> set:
-    """Branches this worker may force-with-lease push: the dispatcher-assigned
-    ``HERMES_KANBAN_BRANCH`` plus the ``wt/<task-id>`` naming convention."""
+    """Return this worker's own branch and active family members' DB branches.
+
+    The dispatcher's explicit branch and ``wt/<task-id>`` convention remain
+    available without a board lookup. Family branches are read from the
+    persisted ``branch_name`` fields and are fail-closed if the board cannot
+    be opened or the current task has no family.
+    """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return set()
@@ -2401,6 +2407,37 @@ def _kanban_owned_branches() -> set:
         owned.add(assigned)
         if assigned.startswith("refs/heads/"):
             owned.add(assigned[len("refs/heads/"):])
+
+    try:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        db_path = kanban_db_path()
+        if not db_path.is_file():
+            return owned
+        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(db_uri, uri=True) as conn:
+            task = conn.execute(
+                "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task or not task[0]:
+                return owned
+            rows = conn.execute(
+                "SELECT branch_name FROM tasks "
+                "WHERE family_root_id = ? "
+                "AND status NOT IN ('done', 'archived') "
+                "AND branch_name IS NOT NULL",
+                (task[0],),
+            ).fetchall()
+    except (ImportError, OSError, sqlite3.Error):
+        return owned
+
+    for (branch_name,) in rows:
+        branch = str(branch_name).strip()
+        if not branch:
+            continue
+        owned.add(branch)
+        if branch.startswith("refs/heads/"):
+            owned.add(branch[len("refs/heads/"):])
     return owned
 
 

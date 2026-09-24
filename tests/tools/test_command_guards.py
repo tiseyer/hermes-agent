@@ -447,6 +447,36 @@ class TestKanbanOwnBranchForcePushExemption:
         assert not self._check(
             "git push --force-with-lease origin wt/t_other", monkeypatch)
 
+    def test_active_family_branch_is_allowed_but_foreign_branch_stays_gated(
+            self, monkeypatch, tmp_path):
+        """Only active cards in this task's family contribute their DB branch."""
+        from hermes_cli import kanban_db as kb
+
+        db_path = tmp_path / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        with kb.connect_closing() as conn:
+            current = kb.create_task(
+                conn, title="current", workspace_kind="worktree",
+                workspace_path=str(tmp_path), branch_name="feature/current")
+            family = kb.create_task(
+                conn, title="family", workspace_kind="worktree",
+                workspace_path=str(tmp_path), branch_name="feature/family")
+            foreign = kb.create_task(
+                conn, title="foreign", workspace_kind="worktree",
+                workspace_path=str(tmp_path), branch_name="feature/foreign")
+            conn.execute(
+                "UPDATE tasks SET family_root_id = ? WHERE id IN (?, ?)",
+                (current, current, family),
+            )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", current)
+        assert self._check(
+            "git push --force-with-lease fork feature/family", monkeypatch,
+            task=current)
+        assert not self._check(
+            "git push --force-with-lease fork feature/foreign", monkeypatch,
+            task=current)
+
     def test_shared_branch_refspec_stays_gated(self, monkeypatch):
         assert not self._check(
             "git push --force-with-lease origin wt/t_2323adbe:develop",
