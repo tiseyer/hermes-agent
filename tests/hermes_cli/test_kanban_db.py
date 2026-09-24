@@ -1656,23 +1656,39 @@ def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
 def test_backlog_is_visible_but_never_promoted_or_dispatched(
     kanban_home, all_assignees_spawnable,
 ):
-    """A parked card needs an explicit manual move to ``ready`` before spawn."""
+    """Backlog is inert; moving a card to todo or ready activates it."""
     spawned = []
     with kb.connect() as conn:
-        parked = kb.create_task(conn, title="parked", assignee="alice")
+        parked = kb.create_task(conn, title="activate through todo", assignee="alice")
+        direct_ready = kb.create_task(conn, title="activate through ready", assignee="carol")
         control = kb.create_task(conn, title="control", assignee="bob")
         conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (parked,))
+        conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (direct_ready,))
 
-        assert kb.recompute_ready(conn) == 0
-        result = kb.dispatch_once(
+        result_while_parked = kb.dispatch_once(
+            conn, dry_run=True, spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        parked_after = kb.get_task(conn, parked)
+        direct_ready_after = kb.get_task(conn, direct_ready)
+        assert parked_after is not None
+        assert direct_ready_after is not None
+        assert parked_after.status == "backlog"
+        assert direct_ready_after.status == "backlog"
+
+        # A human activation into todo uses the normal promotion path; a
+        # direct move to ready is dispatched without another promotion.
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (parked,))
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (direct_ready,))
+        result_after_activation = kb.dispatch_once(
             conn, dry_run=True, spawn_fn=lambda task, _workspace: spawned.append(task.id),
         )
 
-        parked_after = kb.get_task(conn, parked)
-        assert parked_after is not None
-        assert parked_after.status == "backlog"
-    assert parked not in {entry[0] for entry in result.spawned}
-    assert control in {entry[0] for entry in result.spawned}
+    parked_before_spawn = {entry[0] for entry in result_while_parked.spawned}
+    activated_spawn = {entry[0] for entry in result_after_activation.spawned}
+    assert parked not in parked_before_spawn
+    assert direct_ready not in parked_before_spawn
+    assert control in parked_before_spawn
+    assert {parked, direct_ready, control} <= activated_spawn
     assert spawned == []  # dry-run preserves the independent control task.
 
 

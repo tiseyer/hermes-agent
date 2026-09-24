@@ -73,18 +73,20 @@ def repo_with_remote(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 1. Parent-less todo cards stay put
+# 1. Dedicated backlog cards stay put; todo activates work
 # ---------------------------------------------------------------------------
 
-def test_recompute_ready_leaves_parentless_todo_alone(kanban_home):
+def test_recompute_ready_promotes_parentless_todo_after_manual_activation(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="backlog card")
-        # Operator parks the card in the todo backlog.
+        # Backlog is inert; explicitly moving it to todo activates the
+        # normal dependency-free promotion path.
+        conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (tid,))
         conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
         promoted = kb.recompute_ready(conn)
         task = kb.get_task(conn, tid)
-        assert task.status == "todo"
-        assert promoted == 0
+        assert task.status == "ready"
+        assert promoted == 1
 
 
 def test_recompute_ready_still_promotes_dependency_gated(kanban_home):
@@ -104,7 +106,7 @@ def test_decompose_promotes_only_its_own_children(kanban_home):
     with kb.connect() as conn:
         bystander = kb.create_task(conn, title="unrelated backlog")
         conn.execute(
-            "UPDATE tasks SET status = 'todo' WHERE id = ?", (bystander,)
+            "UPDATE tasks SET status = 'backlog' WHERE id = ?", (bystander,)
         )
         root = kb.create_task(conn, title="root", triage=True)
         child_ids = kb.decompose_triage_task(
@@ -118,7 +120,7 @@ def test_decompose_promotes_only_its_own_children(kanban_home):
         assert child_ids and len(child_ids) == 2
         assert kb.get_task(conn, child_ids[0]).status == "ready"
         assert kb.get_task(conn, child_ids[1]).status == "todo"
-        assert kb.get_task(conn, bystander).status == "todo"
+        assert kb.get_task(conn, bystander).status == "backlog"
 
 
 # ---------------------------------------------------------------------------

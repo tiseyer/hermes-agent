@@ -3738,16 +3738,12 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            # Parent-less ``todo`` tasks are deliberate backlog — a card
-            # sitting in todo with NO dependency links was placed there by
-            # an operator (or a decompose flow that will promote its own
-            # children explicitly). Auto-promoting them here meant every
-            # recompute_ready() sweep (decompose, archive, dispatch tick)
-            # launched unrelated backlog cards board-wide (t_60b203d0 /
-            # goal "orchestrator-autonomy" §1). Only dependency-gated tasks
-            # — or blocked tasks recovering from a parent-wait — promote.
-            if not parents and cur_status == "todo":
-                continue
+            # ``backlog`` is the dedicated inert parking column. A card is
+            # considered for automatic work only after an operator moves it
+            # into ``todo`` (or directly into ``ready``); parent-less todos
+            # therefore follow the same normal promotion path as todos whose
+            # parents are already terminal. ``backlog`` is deliberately not
+            # in ``todo_rows`` above, so no dispatcher sweep can activate it.
             if all(p["status"] in ("done", "archived") for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
