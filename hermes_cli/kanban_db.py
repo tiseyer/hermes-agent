@@ -8565,6 +8565,7 @@ class RepositoryProfile:
     reviewer: str
     base_ref: str
     merge_target: str
+    push_target: str
 
 
 class RepositoryProfileError(ValueError):
@@ -8581,6 +8582,9 @@ _REPOSITORY_PROFILES = {
         reviewer="hermes-reviewer",
         base_ref="fork/main",
         merge_target="main",
+        # upstream (origin) is NousResearch, read-only; workers push to the
+        # personal fork (tiseyer/hermes-agent). See fork-push rule 3be97e69f5.
+        push_target="fork",
     ),
     "goya": RepositoryProfile(
         name="goya",
@@ -8588,6 +8592,7 @@ _REPOSITORY_PROFILES = {
         reviewer="goya-reviewer",
         base_ref="origin/develop",
         merge_target="develop",
+        push_target="origin",
     ),
     "voicera": RepositoryProfile(
         name="voicera",
@@ -8595,6 +8600,29 @@ _REPOSITORY_PROFILES = {
         reviewer="voicera-reviewer",
         base_ref="origin/develop",
         merge_target="develop",
+        push_target="origin",
+    ),
+    # ams-erp: main-based, no develop branch (verified via ls-remote against
+    # git@github-ams-erp:tiseyer/ams-erp.git, 2026-09-24 — only main + feature
+    # branches exist). Values confirmed by Till.
+    "ams-erp": RepositoryProfile(
+        name="ams-erp",
+        coder="ams-erp-coder",
+        reviewer="ams-erp-reviewer",
+        base_ref="origin/main",
+        merge_target="main",
+        push_target="origin",
+    ),
+    # voicera-website: production website, main-based, no develop branch
+    # (verified via ls-remote against tiseyer/voicera-website, 2026-09-24 —
+    # only main + feature/wartungsseite exist). main IS production.
+    "voicera-website": RepositoryProfile(
+        name="voicera-website",
+        coder="voicera-website-coder",
+        reviewer="voicera-website-reviewer",
+        base_ref="origin/main",
+        merge_target="main",
+        push_target="origin",
     ),
 }
 
@@ -8609,6 +8637,11 @@ _REPO_SIGNATURE_MAP = (
     (".hermes/hermes-agent", "hermes"),
     ("hermes-agent", "hermes"),
     ("hermes_agent", "hermes"),
+    ("ams-erp", "ams-erp"),
+    ("ams_erp", "ams-erp"),
+    # voicera-website MUST precede the bare "voicera" signature so a website
+    # declaration does not collapse into the voicera-os profile.
+    ("voicera-website", "voicera-website"),
     ("voicera-os", "voicera"),
     ("voicera", "voicera"),
     ("goya-v2", "goya"),
@@ -8675,7 +8708,7 @@ def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Op
 
 
 def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfile:
-    for field_name in ("base_ref", "merge_target"):
+    for field_name in ("base_ref", "merge_target", "push_target"):
         value = getattr(profile, field_name).strip()
         if not value:
             raise RepositoryProfileError(
@@ -10542,7 +10575,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "Repository profile: "
                 f"{repository_profile.name} "
                 f"(base ref: {repository_profile.base_ref}; "
-                f"merge target: {repository_profile.merge_target})"
+                f"merge target: {repository_profile.merge_target}; "
+                f"push target: {repository_profile.push_target})"
             )
     lines.append("")
 

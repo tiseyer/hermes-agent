@@ -100,8 +100,133 @@ def test_worker_context_surfaces_repository_merge_target_for_merger(
 
         context = kb.build_worker_context(conn, task_id)
 
-    assert "Repository profile: hermes (base ref: fork/main; merge target: main)" in context
+    assert (
+        "Repository profile: hermes (base ref: fork/main; "
+        "merge target: main; push target: fork)"
+    ) in context
     assert "merge target: develop" not in context
+
+
+# ---------------------------------------------------------------------------
+# Paket 4 (P08): push_target as a third profile field + full repo coverage.
+# ---------------------------------------------------------------------------
+
+# (repo signature, base_ref, merge_target, push_target)
+_PROFILE_ROUTING_EXPECTATIONS = [
+    ("hermes-agent", "hermes", "fork/main", "main", "fork"),
+    ("voicera-os", "voicera", "origin/develop", "develop", "origin"),
+    ("goya-v2", "goya", "origin/develop", "develop", "origin"),
+    ("ams-erp", "ams-erp", "origin/main", "main", "origin"),
+    ("voicera-website", "voicera-website", "origin/main", "main", "origin"),
+]
+
+
+@pytest.mark.parametrize(
+    "signature,name,base_ref,merge_target,push_target",
+    _PROFILE_ROUTING_EXPECTATIONS,
+)
+def test_repository_profile_routing_matrix(
+    kanban_home, signature, name, base_ref, merge_target, push_target,
+):
+    """Every configured repo resolves base_ref, merge_target and push_target.
+
+    Paket-4 requirement 5: the full profile x field matrix, incl. the
+    ams-erp entry (no develop) and voicera-website (production, main-based).
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="repo-routing card",
+            body=f"Repository: {signature}",
+            tenant=None,
+        )
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+
+    assert profile is not None
+    assert profile.name == name
+    assert profile.base_ref == base_ref
+    assert profile.merge_target == merge_target
+    assert profile.push_target == push_target
+    # No repo silently keeps the old hardcoded develop assumption.
+    if name in ("ams-erp", "voicera-website", "hermes"):
+        assert profile.merge_target != "develop"
+
+
+@pytest.mark.parametrize(
+    "signature,name,base_ref,merge_target,push_target",
+    _PROFILE_ROUTING_EXPECTATIONS,
+)
+def test_worker_context_surfaces_push_target(
+    kanban_home, signature, name, base_ref, merge_target, push_target,
+):
+    """The merger reads base ref, merge target AND push target from the
+    profile line in its worker context — not from a hardcoded default."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="merge this",
+            body=f"Repository: {signature}",
+            assignee="merger",
+            tenant=None,
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert (
+        f"Repository profile: {name} (base ref: {base_ref}; "
+        f"merge target: {merge_target}; push target: {push_target})"
+    ) in context
+
+
+def test_ams_erp_uses_main_never_develop(kanban_home):
+    """ams-erp is main-based: merge target main, push origin, no develop.
+
+    Verified 2026-09-24 via ls-remote git@github-ams-erp:tiseyer/ams-erp.git
+    (only refs/heads/main + feature branches; no develop).
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="ERP fix", body="Repository: ams-erp", tenant=None,
+        )
+        profile = kb.resolve_task_repository_profile(conn, task_id)
+    assert profile is not None
+    assert (profile.base_ref, profile.merge_target, profile.push_target) == (
+        "origin/main", "main", "origin",
+    )
+
+
+def test_repository_profile_missing_push_target_fails_closed(
+    kanban_home, role_profiles_exist, monkeypatch,
+):
+    """An empty push_target is a fail-closed config error, like base_ref."""
+    profile = kb._REPOSITORY_PROFILES["hermes"]
+    monkeypatch.setitem(
+        kb._REPOSITORY_PROFILES,
+        "hermes",
+        kb.RepositoryProfile(
+            name=profile.name,
+            coder=profile.coder,
+            reviewer=profile.reviewer,
+            base_ref=profile.base_ref,
+            merge_target=profile.merge_target,
+            push_target="",
+        ),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Framework-Fix", body="Repository: hermes-agent",
+            tenant="voicera",
+        )
+        with pytest.raises(kb.RepositoryProfileError, match="push_target"):
+            kb.resolve_task_repository_profile(conn, task_id)
+        context = kb.build_worker_context(conn, task_id)
+    assert "Repository profile: INVALID" in context
+    assert "missing required push_target" in context
+
+
+def test_all_registered_profiles_have_push_target(kanban_home):
+    """Every profile in the registry carries a non-empty push_target."""
+    for name, profile in kb._REPOSITORY_PROFILES.items():
+        assert profile.push_target.strip(), f"{name} missing push_target"
 
 
 def test_repository_profile_missing_required_field_fails_closed(
@@ -117,6 +242,7 @@ def test_repository_profile_missing_required_field_fails_closed(
             reviewer=profile.reviewer,
             base_ref="",
             merge_target=profile.merge_target,
+            push_target=profile.push_target,
         ),
     )
     with kb.connect() as conn:
@@ -149,6 +275,7 @@ def test_dispatch_blocks_for_missing_repository_profile_field(
             reviewer=profile.reviewer,
             base_ref=profile.base_ref,
             merge_target="",
+            push_target=profile.push_target,
         ),
     )
     with kb.connect() as conn:
