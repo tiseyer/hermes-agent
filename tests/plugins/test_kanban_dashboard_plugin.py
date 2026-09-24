@@ -323,6 +323,31 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
 
+def test_backlog_tasks_have_a_park_column_and_manual_ready_exit(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "defer this", "assignee": "ops"},
+    ).json()["task"]
+
+    parked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "backlog"},
+    )
+    assert parked.status_code == 200
+    assert parked.json()["task"]["status"] == "backlog"
+
+    columns = {
+        column["name"]: column["tasks"]
+        for column in client.get("/api/plugins/kanban/board").json()["columns"]
+    }
+    assert any(t["id"] == task["id"] for t in columns["backlog"])
+    assert not any(t["id"] == task["id"] for t in columns["ready"])
+
+    activated = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert activated.status_code == 200
+    assert activated.json()["task"]["status"] == "ready"
+
+
 def test_tenant_filter(client):
     client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
     client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})

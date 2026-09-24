@@ -87,13 +87,15 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = ["triage", "backlog", "todo", "scheduled", "ready", "running", "blocked", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
+    backlog: "Backlog",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
@@ -102,7 +104,9 @@
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
+    backlog: "Parked — never dispatched until manually moved to Ready",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting for its scheduled time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
@@ -153,7 +157,9 @@
 
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
+    backlog: "hermes-kanban-dot-backlog",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
@@ -2316,6 +2322,11 @@
       h("span", { className: "hermes-kanban-bulk-count" },
         `${props.count} ${tx(t, "selected", "selected")}`),
       h(Button, {
+        onClick: function () { props.onApply({ status: "backlog" }); },
+        size: "sm",
+        title: "Park selected tasks in Backlog. Backlog tasks are never dispatched.",
+      }, "→ backlog"),
+      h(Button, {
         onClick: function () { props.onApply({ status: "todo" }); },
         size: "sm",
         title: "Move selected tasks to Todo.",
@@ -2774,6 +2785,7 @@
   // Staleness tiers — amber after a grace window, red when clearly stuck.
   // Values below are seconds.
   const STALENESS = {
+    backlog: { amber: 30 * 24 * 60 * 60, red: 90 * 24 * 60 * 60 },
     ready:   { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
     running: { amber: 10 * 60,       red: 60 * 60 },
     blocked: { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },

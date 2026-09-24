@@ -75,6 +75,16 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def test_auto_decomposer_selection_excludes_backlog_cards(kanban_home):
+    """The gateway auto-decomposer must only receive triage ids."""
+    with kb.connect() as conn:
+        triage = kb.create_task(conn, title="needs decomposition", triage=True)
+        parked = kb.create_task(conn, title="parked initiative")
+        conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (parked,))
+
+    assert decomp.list_triage_ids() == [triage]
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
