@@ -181,6 +181,27 @@ def test_board_family_view_is_opt_in_and_default_payload_hides_family_fields(cli
     assert [child["child_role"] for child in family["children"]] == ["work", "work"]
 
 
+def test_repository_is_hidden_only_from_legacy_board_payload(client):
+    """Repository routing remains available from non-legacy task responses."""
+    created = client.post("/api/plugins/kanban/tasks", json={"title": "routed task"})
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+
+    # Create responses are task details, not the legacy board wire contract.
+    assert "repository" in created.json()["task"]
+
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET repository = ? WHERE id = ?", ("hermes", task_id))
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["task"]["repository"] == "hermes"
+
+    updated = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"priority": 1})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["task"]["repository"] == "hermes"
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):
