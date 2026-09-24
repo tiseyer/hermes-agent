@@ -145,6 +145,10 @@ def test_board_family_view_is_opt_in_and_default_payload_hides_family_fields(cli
                 {"title": "second", "assignee": "worker", "parents": [0]},
             ],
         )
+        # Repository routing is a structured persistence field. It belongs to
+        # the family projection, but must not expand the legacy /board wire
+        # contract.
+        conn.execute("UPDATE tasks SET repository = ? WHERE id = ?", ("hermes", root_id))
     assert child_ids is not None
 
     legacy = client.get("/api/plugins/kanban/board")
@@ -166,11 +170,13 @@ def test_board_family_view_is_opt_in_and_default_payload_hides_family_fields(cli
     assert all("family_order" not in task for task in legacy_cards)
     assert all("family_root_id" not in task for task in legacy_cards)
     assert all("child_role" not in task for task in legacy_cards)
+    assert all("repository" not in task for task in legacy_cards)
 
     projected = client.get("/api/plugins/kanban/board?family_view=true")
     assert projected.status_code == 200
     cards = [task for column in projected.json()["columns"] for task in column["tasks"]]
     family = next(task for task in cards if task["id"] == root_id)
+    assert family["repository"] == "hermes"
     assert [child["id"] for child in family["children"]] == child_ids
     assert [child["child_role"] for child in family["children"]] == ["work", "work"]
 

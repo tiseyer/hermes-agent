@@ -166,6 +166,7 @@ def _task_dict(
     # The legacy list endpoint must remain byte-compatible until the caller
     # explicitly selects the family projection.
     if not include_family:
+        d.pop("repository", None)
         d.pop("family_root_id", None)
         d.pop("family_order", None)
         d.pop("child_role", None)
