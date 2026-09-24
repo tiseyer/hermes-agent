@@ -118,6 +118,7 @@ _PROFILE_ROUTING_EXPECTATIONS = [
     ("goya-v2", "goya", "origin/develop", "develop", "origin"),
     ("ams-erp", "ams-erp", "origin/main", "main", "origin"),
     ("voicera-website", "voicera-website", "origin/main", "main", "origin"),
+    ("life-os", "life-os", "origin/main", "main", "origin"),
 ]
 
 

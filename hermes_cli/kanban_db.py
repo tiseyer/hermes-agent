@@ -8615,11 +8615,26 @@ _REPOSITORY_PROFILES = {
     ),
     # voicera-website: production website, main-based, no develop branch
     # (verified via ls-remote against tiseyer/voicera-website, 2026-09-24 —
-    # only main + feature/wartungsseite exist). main IS production.
+    # only main + feature/wartungsseite exist). main IS production; confirmed
+    # by Till. NOTE: site is currently behind a Wartungsseite — merges to
+    # main happen ONLY with an explicit per-card Till GO, and this profile
+    # must be re-checked before the public launch.
     "voicera-website": RepositoryProfile(
         name="voicera-website",
         coder="voicera-website-coder",
         reviewer="voicera-website-reviewer",
+        base_ref="origin/main",
+        merge_target="main",
+        push_target="origin",
+    ),
+    # life-os: Vercel-hosted, main = production, feature branches = preview
+    # (Till, 2026-09-24). ls-remote git@github-life-os:tiseyer/life-os.git
+    # shows main + develop; the main-based Vercel flow is the chosen model
+    # (develop exists but is intentionally not the integration target here).
+    "life-os": RepositoryProfile(
+        name="life-os",
+        coder="life-os-coder",
+        reviewer="life-os-reviewer",
         base_ref="origin/main",
         merge_target="main",
         push_target="origin",
@@ -8639,6 +8654,8 @@ _REPO_SIGNATURE_MAP = (
     ("hermes_agent", "hermes"),
     ("ams-erp", "ams-erp"),
     ("ams_erp", "ams-erp"),
+    ("life-os", "life-os"),
+    ("life_os", "life-os"),
     # voicera-website MUST precede the bare "voicera" signature so a website
     # declaration does not collapse into the voicera-os profile.
     ("voicera-website", "voicera-website"),
