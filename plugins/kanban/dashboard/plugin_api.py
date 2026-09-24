@@ -160,15 +160,8 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
-    include_family: bool = False,
 ) -> dict[str, Any]:
     d = asdict(task)
-    # The legacy list endpoint must remain byte-compatible until the caller
-    # explicitly selects the family projection.
-    if not include_family:
-        d.pop("family_root_id", None)
-        d.pop("family_order", None)
-        d.pop("child_role", None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -181,6 +174,25 @@ def _task_dict(
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
+    return d
+
+
+def _board_task_dict(
+    task: kanban_db.Task,
+    *,
+    latest_summary: Optional[str] = None,
+    include_family: bool = False,
+) -> dict[str, Any]:
+    """Serialize a task for the board's legacy or family projection only."""
+    d = _task_dict(task, latest_summary=latest_summary)
+    # The legacy board endpoint must remain byte-compatible until the caller
+    # explicitly selects the family projection. Detail and mutation responses
+    # use _task_dict directly and retain structured routing fields.
+    if not include_family:
+        d.pop("repository", None)
+        d.pop("family_root_id", None)
+        d.pop("family_order", None)
+        d.pop("child_role", None)
     return d
 
 
@@ -463,7 +475,7 @@ def get_board(
                 if t.initiative_id == initiative and t.id != initiative
             ]
             initiative_root_payload = {
-                "task": _task_dict(root_task),
+                "task": _board_task_dict(root_task, include_family=family_view),
                 "rollup": rollups.get(initiative),
             }
         # Pre-fetch link counts per task (cheap: one query).
@@ -535,10 +547,10 @@ def get_board(
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview, include_family=family_view)
+            d = _board_task_dict(t, latest_summary=preview, include_family=family_view)
             if family_view and t.id in family_children:
                 d["children"] = [
-                    _task_dict(
+                    _board_task_dict(
                         child,
                         latest_summary=(summary_map.get(child.id, "")[:_CARD_SUMMARY_PREVIEW_CHARS] or None),
                         include_family=True,
