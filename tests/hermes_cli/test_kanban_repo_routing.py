@@ -241,6 +241,42 @@ def test_redecompose_inherits_structured_repository_to_children(
         assert kb.get_task(conn, child_ids[1]).assignee == "hermes-reviewer"
 
 
+def test_review_block_honors_structured_repository_on_redecomposed_child(
+    kanban_home, role_profiles_exist,
+):
+    """Review routing must use the inherited field after the body lost it."""
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="Framework-Bug fixen",
+            body="Keine Legacy-Repo-Zeile.",
+            repository="hermes",
+            tenant="voicera",
+            triage=True,
+        )
+        (child_id,) = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{
+                "title": "Implementierung",
+                "body": "Der Redekompositionsschritt ohne Repo-Deklaration.",
+                "assignee": "voicera-coder",
+                "parents": [],
+            }],
+        )
+        child = kb.get_task(conn, child_id)
+        assert child.repository == "hermes"
+        assert "Repository:" not in (child.body or "")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child_id,))
+
+        assert kb.block_task(conn, child_id, reason="Review requested", kind="review")
+        routed = kb.get_task(conn, child_id)
+
+    assert routed.status == "review"
+    assert routed.assignee == "hermes-reviewer"
+
+
 def test_structured_repository_beats_conflicting_legacy_body(
     kanban_home, role_profiles_exist,
 ):
@@ -437,48 +473,40 @@ def test_loop_brake_without_declaration_uses_tenant(
 
 
 # ---------------------------------------------------------------------------
-# Negative case (Review-Nachlieferung 19.08.): UNKNOWN explicit declaration
-# → tenant-default fallback + log warning, never a crash, never silent
+# Negative case: an explicit, unknown declaration is an integration boundary,
+# not a hint. It must never fall through to the tenant default.
 # ---------------------------------------------------------------------------
 
-def test_resolver_unknown_declaration_falls_back_to_tenant_with_warning(
-    kanban_home, role_profiles_exist, caplog,
-):
-    import logging
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        resolved = kb.resolve_repo_profiles(
-            "Titel\nRepository: unbekanntes-repo\nmehr text", "voicera",
-        )
-    assert resolved == ("voicera-coder", "voicera-reviewer", "tenant"), (
-        "unknown explicit declaration must fall back to the tenant default"
-    )
-    assert any(
-        "Unbekannte Repo-Deklaration" in r.message and "unbekanntes-repo" in r.message
-        for r in caplog.records
-    ), "the unknown declaration must be surfaced as a log warning"
-
-
-def test_resolver_unknown_declaration_without_tenant_returns_none(
-    kanban_home, role_profiles_exist, caplog,
-):
-    import logging
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        resolved = kb.resolve_repo_profiles(
-            "Repository: unbekanntes-repo", None,
-        )
-    assert resolved is None, (
-        "no known declaration and no tenant → None (caller legacy fallback)"
-    )
-    assert any(
-        "Unbekannte Repo-Deklaration" in r.message for r in caplog.records
-    )
-
-
-def test_decompose_unknown_declaration_keeps_tenant_default(
+def test_resolver_unknown_declaration_fails_closed(
     kanban_home, role_profiles_exist,
 ):
-    """End-to-end pin: a root that declares an unknown repo must route its
-    children exactly like an undeclared card — tenant pair, no crash."""
+    with pytest.raises(kb.RepositoryProfileError, match="unbekanntes-repo"):
+        kb.resolve_repo_profiles("Repository: unbekanntes-repo", "voicera")
+
+
+def test_dispatch_unknown_declaration_blocks_needs_input(
+    kanban_home, role_profiles_exist,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Kaputte Deklaration",
+            body="Repository: unbekanntes-repo\nBitte umsetzen.",
+            assignee="voicera-coder", tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 1)
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.assignee == "voicera-coder"
+    assert task_id in result.auto_blocked
+
+
+def test_decompose_unknown_declaration_blocks_root_needs_input(
+    kanban_home, role_profiles_exist,
+):
     with kb.connect() as conn:
         root = kb.create_task(
             conn, title="Kaputte Deklaration",
@@ -487,12 +515,57 @@ def test_decompose_unknown_declaration_keeps_tenant_default(
         )
         child_ids = kb.decompose_triage_task(
             conn, root, root_assignee="orchestrator",
-            children=[
-                {"title": "code it", "assignee": "voicera-coder", "parents": []},
-                {"title": "review it", "assignee": "voicera-reviewer",
-                 "parents": [0]},
-            ],
+            children=[{"title": "code it", "assignee": "voicera-coder", "parents": []}],
         )
-        assert child_ids
-        assert kb.get_task(conn, child_ids[0]).assignee == "voicera-coder"
-        assert kb.get_task(conn, child_ids[1]).assignee == "voicera-reviewer"
+        task = kb.get_task(conn, root)
+
+    assert child_ids is None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+
+
+def test_review_handoff_unknown_declaration_blocks_needs_input(
+    kanban_home, role_profiles_exist,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Kaputte Deklaration",
+            body="Repository: unbekanntes-repo", assignee="voicera-coder",
+            tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+        assert kb.block_task(conn, task_id, reason="Review requested", kind="review")
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.assignee == "voicera-coder"
+
+
+def test_loop_brake_unknown_declaration_blocks_needs_input(
+    kanban_home, role_profiles_exist, monkeypatch,
+):
+    """The loop brake must not let an invalid declaration abort a tick."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Kaputte Deklaration in Fehlerschleife",
+            body="Repository: unbekanntes-repo\nBitte umsetzen.",
+            assignee="voicera-coder",
+            tenant="voicera",
+        )
+        _fail_run(conn, task_id, "AssertionError in tests/test_x.py:42")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        _fail_run(conn, task_id, "AssertionError in tests/test_x.py:42")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 1)
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.assignee == "voicera-coder"
+    assert task_id in result.auto_blocked
