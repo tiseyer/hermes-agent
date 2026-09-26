@@ -71,6 +71,75 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert (c1.family_root_id, c1.family_order, c1.child_role) == (tid, 2, "work")
 
 
+def _promoted_events(conn, task_id):
+    return [e for e in kb.list_events(conn, task_id) if e.kind == "promoted"]
+
+
+def test_decompose_leaf_chain_promotes_and_progresses(kanban_home):
+    """P06 promoted-Fix (Paket 2): decompose promotes parent-free leaves
+    to ``ready`` directly (promoted>0), and the dependency chain then
+    advances A done -> B ready -> ... -> root done.
+
+    This is the regression guard for the fork-local deadlock where
+    ``recompute_ready``'s backlog rule (parent-less ``todo`` = backlog)
+    swallowed decompose leaves forever, so ``promoted`` stayed 0 and no
+    child ever dispatched. The negative probe (restoring the old
+    ``if auto_promote: recompute_ready(conn)`` body) turns this test red.
+    """
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="ship a feature")
+
+    # Pure chain: A is a parent-free leaf, B waits on A, C waits on B.
+    children = [
+        {"title": "A", "assignee": "engineer", "parents": []},
+        {"title": "B", "assignee": "engineer", "parents": [0]},
+        {"title": "C", "assignee": "engineer", "parents": [1]},
+    ]
+    with kb.connect() as conn:
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=children, author="decomposer",
+        )
+    assert child_ids is not None and len(child_ids) == 3
+    a, b, c = child_ids
+
+    # --- promoted>0: the leaf is promoted to ready by decompose itself ---
+    with kb.connect() as conn:
+        assert kb.get_task(conn, a).status == "ready"     # leaf: startable now
+        assert kb.get_task(conn, b).status == "todo"      # waits on A
+        assert kb.get_task(conn, c).status == "todo"      # waits on B
+        # The decompose fan-out emitted at least one 'promoted' event
+        # (the P06 fix). Old code left every leaf in 'todo' -> zero.
+        promoted_total = sum(len(_promoted_events(conn, x)) for x in child_ids)
+        assert promoted_total >= 1
+        assert len(_promoted_events(conn, a)) == 1
+
+    # --- chain progression: A done -> B ready ---
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, a, result="A done")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, a).status == "done"
+        assert kb.get_task(conn, b).status == "ready"     # promoted by chain
+        assert kb.get_task(conn, c).status == "todo"
+        assert len(_promoted_events(conn, b)) == 1
+
+    # --- B done -> C ready ---
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, b, result="B done")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, b).status == "done"
+        assert kb.get_task(conn, c).status == "ready"
+
+    # --- C done -> root (Mutter) done ---
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, c, result="C done")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, c).status == "done"
+        # Root waits on the whole graph via task_links; once every child
+        # is terminal the family projection settles to done.
+        assert kb.get_task(conn, tid).status == "done"
+
+
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
         result = kb.decompose_triage_task(
