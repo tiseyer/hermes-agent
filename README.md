@@ -245,6 +245,19 @@ uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
 
+### Repository Profiles
+
+Kanban tasks use repository profiles to select their git integration points:
+
+| Profile | Base ref | Merge target | Push target |
+| --- | --- | --- | --- |
+| `hermes` | `fork/main` | `main` | `fork` |
+| `goya` | `origin/develop` | `develop` | `origin` |
+| `voicera` | `origin/develop` | `develop` | `origin` |
+| `ams-erp` | `origin/main` | `main` | `origin` |
+| `voicera-website` | `origin/main` | `main` | `origin` |
+| `life-os` | `origin/main` | `main` | `origin` |
+
 ---
 
 ## Community
