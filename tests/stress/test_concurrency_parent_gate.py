@@ -34,9 +34,13 @@ WORKERS_RUN_DURATION_S = 8
 
 
 def run() -> int:
-    home = tempfile.mkdtemp(prefix="hermes_parent_gate_stress_")
-    os.environ["HERMES_HOME"] = home
-    os.environ["HOME"] = home
+    # Force a throwaway HOME *and* temp DB, dropping any inherited
+    # HERMES_KANBAN_DB (the dispatcher injects it → would hit the prod board).
+    # See tests/stress/_isolation.py (RCA 2026-09-27, W3-01).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _isolation import isolate_home
+
+    home = isolate_home(prefix="hermes_parent_gate_stress_")
 
     from hermes_cli import kanban_db as kb
 

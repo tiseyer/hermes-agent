@@ -18,6 +18,12 @@ import tempfile
 import time
 
 WT = str(Path(__file__).resolve().parents[2])
+
+# Isolation guard (RCA 2026-09-27): drop any inherited HERMES_KANBAN_DB before
+# any DB access so this stress script never touches the shared production board.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _isolation import drop_inherited_pins as _drop_inherited_pins
+_drop_inherited_pins()
 FAKE_WORKER = str(Path(__file__).parent / "_fake_worker.py")
 PY = sys.executable
 
