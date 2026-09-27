@@ -32,6 +32,13 @@ from pathlib import Path
 _THIS = Path(__file__).resolve()
 WT = _THIS.parents[2] if _THIS.parent.name == "stress" else Path.cwd()
 
+# Isolation guard (RCA 2026-09-27): drop any inherited HERMES_KANBAN_DB before
+# any DB access (incl. subprocess env built from os.environ) so this stress
+# script never touches the shared production board.
+sys.path.insert(0, str(_THIS.parent))
+from _isolation import drop_inherited_pins as _drop_inherited_pins
+_drop_inherited_pins()
+
 FAILURES: list[str] = []
 SKIPS: list[str] = []
 _REGISTERED: list = []

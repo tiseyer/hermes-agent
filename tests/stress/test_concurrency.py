@@ -32,6 +32,12 @@ NUM_TASKS = 100
 WORKER_TIMEOUT_S = 60
 WT = str(Path(__file__).resolve().parents[2])
 
+# Isolation guard (RCA 2026-09-27): drop any inherited HERMES_KANBAN_DB before
+# any DB access so this stress script never touches the shared production board.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _isolation import drop_inherited_pins as _drop_inherited_pins
+_drop_inherited_pins()
+
 
 def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
     """One worker's inner loop. Runs in a fresh Python process.
