@@ -1383,8 +1383,37 @@ def test_claim_rejects_when_parents_not_done(kanban_home):
         ).fetchall()
     kinds = [e["kind"] for e in events]
     assert "claim_rejected" in kinds
+    assert "spawn_rejected" in kinds
     # No 'claimed' event was emitted for the blocked attempt.
     assert "claimed" not in kinds
+
+
+def test_family_root_is_consistently_unspawnable_and_records_rejection(
+    kanban_home, all_assignees_spawnable,
+):
+    """The health check, dispatcher and claim gate agree that roots never run.
+
+    A root can be forced to ``ready`` by legacy/manual writers.  It must not
+    make health telemetry report real worker work, and its rejected dispatch
+    must leave an operator-visible reason instead of a silent ``None``.
+    """
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="family root", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET family_root_id = ? WHERE id = ?", (root, root),
+        )
+
+        assert kb.has_spawnable_ready(conn) is False
+        assert kb.claim_task(conn, root, claimer="host:1") is None
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: pytest.fail("root spawned"),
+        )
+        events = kb.list_events(conn, root)
+
+    assert result.spawned == []
+    rejected = [e for e in events if e.kind == "spawn_rejected"]
+    assert rejected
+    assert rejected[-1].payload == {"reason": "family_root"}
 
 
 def test_claim_succeeds_once_parents_done(kanban_home):
@@ -2132,10 +2161,13 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
 
     kinds = [e.kind for e in events]
     assert "respawn_guarded" in kinds
+    assert "spawn_rejected" in kinds
     guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+    rejected_evt = next(e for e in events if e.kind == "spawn_rejected")
+    assert rejected_evt.payload == {"reason": "recent_success"}
 
 
 # ---------------------------------------------------------------------------

@@ -4083,6 +4083,37 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def get_spawn_rejection_reason(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a structural worker rejection reason, or ``None``.
+
+    This is the shared structural gate for dispatcher candidate selection,
+    health telemetry, and the atomic claim path.  Profile routing, assignment,
+    and transient respawn guards are dispatcher policy layered on top of this
+    predicate.  It deliberately owns the invariants that made the prior three
+    call sites disagree: family roots never run and unfinished parents gate a
+    child even if a racy writer marked it ready.
+    """
+    row = conn.execute(
+        "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return "missing_task"
+    # Roots are visible projections of work children, never workers.
+    if row["family_root_id"] == task_id:
+        return "family_root"
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if undone:
+        return "parents_not_done"
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4099,12 +4130,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        family = conn.execute(
-            "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        # Roots are visible projections of work children, never dispatchable
-        # workers themselves.
-        if family and family["family_root_id"] == task_id:
+        rejection_reason = get_spawn_rejection_reason(conn, task_id)
+        if rejection_reason == "family_root":
+            _append_event(
+                conn, task_id, "spawn_rejected", {"reason": rejection_reason},
+            )
             return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4114,13 +4144,7 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        if rejection_reason == "parents_not_done":
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -4128,6 +4152,10 @@ def claim_task(
             )
             _append_event(
                 conn, task_id, "claim_rejected",
+                {"reason": "parents_not_done"},
+            )
+            _append_event(
+                conn, task_id, "spawn_rejected",
                 {"reason": "parents_not_done"},
             )
             return None
@@ -9413,19 +9441,22 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL "
-        "    AND (family_root_id IS NULL OR id != family_root_id)"
+        "AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
+    candidates = [
+        row for row in rows
+        if get_spawn_rejection_reason(conn, row["id"]) is None
+    ]
+    if not candidates:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    for row in rows:
+    for row in candidates:
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -9680,6 +9711,15 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        # Keep dispatcher candidate selection in lock-step with the health
+        # check and atomic claim gate.  Claiming a rejected structural
+        # candidate records the operator-visible event and, for an unfinished
+        # parent, atomically repairs ready -> todo.
+        candidate_rejection = get_spawn_rejection_reason(conn, row["id"])
+        if candidate_rejection in ("family_root", "parents_not_done"):
+            if not dry_run:
+                claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            continue
         # GO-Gate (goal "orchestrator-autonomy" / Canary 4): Smoke-, Deploy-
         # und Live-Karten dürfen NIE ungefragt vom default-Fallback starten.
         # Ohne expliziten menschlichen Assignee (oder mit 'default') werden
@@ -9905,6 +9945,10 @@ def _dispatch_once_locked(
                         (reviewer, row["id"]),
                     )
                     if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "spawn_rejected",
+                            {"reason": "loop_detected"},
+                        )
                         conn.execute(
                             "INSERT INTO task_comments "
                             "(task_id, author, body, created_at) "
@@ -9939,6 +9983,10 @@ def _dispatch_once_locked(
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason},
+                    )
+                    _append_event(
+                        conn, row["id"], "spawn_rejected",
                         {"reason": guard_reason},
                     )
             continue
