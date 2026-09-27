@@ -221,6 +221,8 @@ def test_loop_detected_after_two_identical_failures(kanban_home, all_assignees_s
         assert task.assignee == "voicera-reviewer"
         events = [e for e in kb.list_events(conn, tid) if e.kind == "loop_detected"]
         assert events
+        rejected = [e for e in kb.list_events(conn, tid) if e.kind == "spawn_rejected"]
+        assert rejected[-1].payload == {"reason": "loop_detected"}
         comments = kb.list_comments(conn, tid)
         assert any("diagnose" in (c.body or "").lower() for c in comments)
 
