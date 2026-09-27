@@ -4,6 +4,8 @@ worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -71,3 +73,44 @@ def test_unknown_project_id_falls_back_gracefully(kanban_conn):
     task = kb.get_task(kanban_conn, tid)
     assert task.workspace_kind == "scratch"
     assert task.project_id is None
+
+
+def test_reviewer_uses_project_primary_path_when_coder_workspace_is_unavailable(
+    kanban_conn, tmp_path,
+):
+    """A project link remains a repo anchor for review on boards without defaults.
+
+    The reviewer process may not be able to inspect a coder worktree path from
+    another worker host.  It must still resolve the repository via the task's
+    project instead of requiring ``board.default_workdir``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("test\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+
+    proj = _make_project(repo=str(repo))
+    assert proj is not None
+    tid = kb.create_task(kanban_conn, title="Review me", project_id=proj.id)
+    task = kb.get_task(kanban_conn, tid)
+    assert task is not None
+    assert task.branch_name is not None
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", task.branch_name],
+        check=True,
+        capture_output=True,
+    )
+    # The board has no default_workdir. ``--project`` persisted this future
+    # worktree target, but the coder checkout is unavailable to the reviewer.
+    assert task.workspace_path is not None
+    assert not Path(task.workspace_path).exists()
+
+    review_ws, branch = kb._resolve_review_worktree_workspace(task)
+
+    assert review_ws == Path(repo) / ".worktrees" / f"{tid}-review"
+    assert review_ws.is_dir()
+    assert branch == task.branch_name

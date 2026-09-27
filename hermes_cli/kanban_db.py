@@ -7356,8 +7356,11 @@ def _resolve_review_worktree_workspace(
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
 
-    # Resolve the main repo root. The coder's workspace_path is a linked
-    # worktree — its git-common-dir points into the main checkout.
+    # Resolve the main repo root. The coder's workspace_path is normally a
+    # linked worktree — its git-common-dir points into the main checkout. A
+    # project-linked task persists a future ``<repo>/.worktrees/<task-id>``
+    # path before the worker materializes it, though, so also recover its repo
+    # anchor from that target when the checkout itself is unavailable.
     repo_root: Optional[Path] = None
     if task.workspace_path:
         coder_ws = Path(task.workspace_path).expanduser()
@@ -7366,6 +7369,8 @@ def _resolve_review_worktree_workspace(
             if common is not None:
                 # <repo>/.git → repo root is its parent
                 repo_root = common.parent
+        if repo_root is None:
+            repo_root = _repo_root_for_worktree_target(coder_ws.parent)
     if repo_root is None:
         board_slug = board if board else get_current_board()
         board_default = (
