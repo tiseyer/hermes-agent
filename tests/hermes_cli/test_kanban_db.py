@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -5592,6 +5593,86 @@ def test_create_human_card_hard_rejects_overlong_kurzbeschreibung(kanban_home):
                 conn, title="ok",
                 kurzbeschreibung="y" * (kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX + 1),
             )
+
+
+def test_relabel_sets_title_and_kurzbeschreibung_and_leaves_rest(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="alt", body="alter body",
+                             assignee="worker", priority=3)
+        _set(conn, tid, status="running")
+        before = kb.get_task(conn, tid)
+
+        assert kb.relabel_task(
+            conn, tid, title="neu", kurzbeschreibung="neue kurzbeschreibung",
+            actor="manager",
+        ) is True
+
+        after = kb.get_task(conn, tid)
+        assert after.title == "neu"
+        assert after.body == "neue kurzbeschreibung"
+        # Pure relabel — nothing else moves.
+        assert after.status == before.status == "running"
+        assert after.assignee == before.assignee
+        assert after.priority == before.priority
+        assert after.family_root_id == before.family_root_id
+
+        # Audit event with old→new + actor.
+        ev = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'relabeled'", (tid,)
+        ).fetchone()
+        assert ev is not None
+        payload = json.loads(ev["payload"])
+        assert payload["actor"] == "manager"
+        assert payload["title"] == {"old": "alt", "new": "neu"}
+        assert payload["kurzbeschreibung"]["old"] == "alter body"
+        assert payload["kurzbeschreibung"]["new"] == "neue kurzbeschreibung"
+
+
+def test_relabel_title_only_leaves_body_untouched(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="alt", body="behalten")
+        assert kb.relabel_task(conn, tid, title="neu") is True
+        after = kb.get_task(conn, tid)
+        assert (after.title, after.body) == ("neu", "behalten")
+
+
+def test_relabel_rejects_overlong_title(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ok")
+        with pytest.raises(ValueError, match="title too long"):
+            kb.relabel_task(conn, tid, title="x" * (kb.HUMAN_CARD_TITLE_MAX + 1))
+        # Rejected write must not have landed.
+        assert kb.get_task(conn, tid).title == "ok"
+
+
+def test_relabel_rejects_overlong_kurzbeschreibung(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ok")
+        with pytest.raises(ValueError, match="kurzbeschreibung too long"):
+            kb.relabel_task(
+                conn, tid,
+                kurzbeschreibung="y" * (kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX + 1),
+            )
+
+
+def test_relabel_requires_at_least_one_field(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ok")
+        with pytest.raises(ValueError, match="at least one"):
+            kb.relabel_task(conn, tid)
+
+
+def test_relabel_blank_title_rejected(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ok")
+        with pytest.raises(ValueError, match="title is required"):
+            kb.relabel_task(conn, tid, title="   ")
+
+
+def test_relabel_unknown_id_returns_false(kanban_home):
+    with kb.connect() as conn:
+        assert kb.relabel_task(conn, "t_does_not_exist", title="neu") is False
 
 
 def test_family_progress_counts_done_over_live_work_children(kanban_home):

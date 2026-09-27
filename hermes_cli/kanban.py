@@ -604,6 +604,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
+    p_relabel = sub.add_parser(
+        "relabel",
+        help="Change ONLY a card's title/kurzbeschreibung (labels); "
+             "never moves or changes status",
+    )
+    p_relabel.add_argument("task_id")
+    p_relabel.add_argument(
+        "--title", default=None,
+        help=f"New title (max {kb.HUMAN_CARD_TITLE_MAX} chars, not truncated)",
+    )
+    p_relabel.add_argument(
+        "--kurzbeschreibung", "--desc", default=None, dest="kurzbeschreibung",
+        help=(f"New short description (max {kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX} "
+              "chars, not truncated)"),
+    )
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -1012,6 +1028,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "relabel":  _cmd_relabel,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -2074,6 +2091,32 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_relabel(args: argparse.Namespace) -> int:
+    title = getattr(args, "title", None)
+    kurz = getattr(args, "kurzbeschreibung", None)
+    if title is None and kurz is None:
+        print(
+            "kanban: relabel needs --title and/or --kurzbeschreibung",
+            file=sys.stderr,
+        )
+        return 2
+    actor = _profile_author()
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.relabel_task(
+                conn, args.task_id,
+                title=title, kurzbeschreibung=kurz, actor=actor,
+            )
+    except ValueError as exc:
+        print(f"kanban: relabel: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"cannot relabel {args.task_id} (unknown id)", file=sys.stderr)
+        return 1
+    print(f"Relabeled {args.task_id}")
     return 0
 
 

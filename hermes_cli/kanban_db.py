@@ -3157,6 +3157,80 @@ def create_human_card(
     return task_id
 
 
+def relabel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    kurzbeschreibung: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> bool:
+    """Change ONLY a card's labels — its ``title`` and/or ``kurzbeschreibung``
+    (stored in ``body``, the DTO's short-text source).
+
+    A pure relabel: it never touches status, family linkage, assignee, priority
+    or any other field, and it never moves the card. Built for the manager's
+    title sweep (Foxtrot gate), where existing cards need cleaner beschriftung
+    without disturbing the running board.
+
+    Same HARD length limits as ``create_human_card`` (``HUMAN_CARD_TITLE_MAX`` /
+    ``HUMAN_CARD_KURZBESCHREIBUNG_MAX``): overflow RAISES ``ValueError`` rather
+    than silently clipping, so the manager is forced to formulate to the limit.
+
+    Writes a ``relabeled`` audit event capturing old→new values and ``actor``.
+
+    Returns ``True`` on success, ``False`` if ``task_id`` is unknown. Raises
+    ``ValueError`` if neither field is given, if ``title`` is empty/blank, or if
+    either field exceeds its length limit.
+    """
+    if title is None and kurzbeschreibung is None:
+        raise ValueError(
+            "relabel needs at least one of title / kurzbeschreibung"
+        )
+    if title is not None:
+        if not title.strip():
+            raise ValueError("title is required")
+        if len(title) > HUMAN_CARD_TITLE_MAX:
+            raise ValueError(
+                f"title too long: {len(title)} > {HUMAN_CARD_TITLE_MAX} chars "
+                "(formulate a shorter title — it is not truncated)"
+            )
+    if (
+        kurzbeschreibung is not None
+        and len(kurzbeschreibung) > HUMAN_CARD_KURZBESCHREIBUNG_MAX
+    ):
+        raise ValueError(
+            f"kurzbeschreibung too long: {len(kurzbeschreibung)} > "
+            f"{HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
+            "(formulate a shorter description — it is not truncated)"
+        )
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        sets: list[str] = []
+        params: list = []
+        payload: dict = {"actor": actor}
+        if title is not None:
+            sets.append("title = ?")
+            params.append(title)
+            payload["title"] = {"old": row["title"], "new": title}
+        if kurzbeschreibung is not None:
+            sets.append("body = ?")
+            params.append(kurzbeschreibung)
+            payload["kurzbeschreibung"] = {"old": row["body"],
+                                           "new": kurzbeschreibung}
+        params.append(task_id)
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
+        )
+        _append_event(conn, task_id, "relabeled", payload)
+    return True
+
+
 def family_progress(conn: sqlite3.Connection, root_id: str) -> dict:
     """Return ``{'erledigt': N, 'gesamt': M}`` for a family root.
 
