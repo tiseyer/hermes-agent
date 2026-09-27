@@ -2278,21 +2278,27 @@ def _set_user_version(conn: sqlite3.Connection, version: int) -> None:
 def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     """Move legacy human-signalling cards to the first-class ``human`` status.
 
-    A card wanders to ``human`` iff it is still ACTIVE and carries at least one
-    of the three legacy crutches:
+    A card wanders to ``human`` iff it is still ACTIVE and carries a legacy
+    human signal:
 
       (1) its status is NOT already terminal/handled
           (``archived``/``done``/``review``/``human``); AND
-      (2) at least one of:
-            * ``block_kind = 'needs_input'``          (spontaneous "needs a human"), OR
-            * ``child_role = 'human_check'``          (planned human step in a family), OR
-            * (``assignee = 'till'`` AND ``status = 'blocked'``)  (parked-for-Till).
+      (2) either
+            * ``child_role = 'human_check'``  (a planned human step — regardless
+              of its column), OR
+            * ``status = 'blocked'`` AND (``block_kind = 'needs_input'`` OR
+              ``assignee = 'till'``)  (a genuinely parked waiting card).
 
-    Crucially this is NOT "``assignee='till'`` alone": that matches every card
-    Till ever owned (incl. long-archived ones), so a naive migration would
-    resurrect 100+ archived cards. Clause (1) is the guard that keeps
-    archived/done/review cards out; ``assignee='till'`` only counts while the
-    card is genuinely parked (``blocked``).
+    Two guards, both learned from real misfires:
+      * NOT "``assignee='till'`` alone" — that matches every card Till ever
+        owned (incl. long-archived ones); a naive migration resurrected 100+
+        archived cards.
+      * ``needs_input`` only counts while ``blocked`` — a ``needs_input`` on a
+        ``backlog``/``scheduled``/``triage`` card is a CONTROL card (e.g. the
+        P33 evening-briefing trigger ``Briefing-Anforderungen``), not an inbox
+        item; it must stay in its column, not jump to Till's inbox (Foxtrot
+        finding 27.09.). ``human_check`` children are the only signal that
+        crosses column boundaries, because they are human steps by definition.
 
     Idempotent: migrated rows now hold ``status='human'``, which clause (1)
     excludes, so a second call moves nothing. ``child_role``/``block_kind`` are
@@ -2312,9 +2318,9 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
         SELECT id, title FROM tasks
          WHERE status NOT IN ('archived', 'done', 'review', 'human')
            AND (
-                 block_kind = 'needs_input'
-              OR child_role = 'human_check'
-              OR (assignee = 'till' AND status = 'blocked')
+                 child_role = 'human_check'
+              OR (status = 'blocked'
+                  AND (block_kind = 'needs_input' OR assignee = 'till'))
            )
         """
     ).fetchall()
