@@ -99,8 +99,30 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "backlog", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "backlog", "todo", "scheduled", "ready", "running", "blocked", "human", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# ``human`` is the single status for "a person (Till) must act on this card".
+# It unifies the three legacy crutches (assignee='till', child_role='human_check',
+# block_kind='needs_input') behind one first-class column — see
+# ``_migrate_legacy_human_status``. Like ``blocked`` it is NEVER pulled by the
+# dispatcher: the only auto-promotion path (``recompute_ready``) selects on an
+# allow-list of ('todo','blocked'), so a ``human`` card can never become
+# ``ready`` and be spawned. The manager/orchestrator creates ``human`` cards
+# via ``create_human_card``; a person clears them via the chat tools.
+
+# Hard schema limits for human cards. The manager must formulate title/short
+# description to fit (like a chat title), never have them silently truncated —
+# so the helper RAISES when they overflow instead of clipping.
+HUMAN_CARD_TITLE_MAX = 80
+HUMAN_CARD_KURZBESCHREIBUNG_MAX = 160
+
+# ``PRAGMA user_version`` bit marking the one-shot legacy→``human`` migration as
+# applied, so the block_kind/assignee reclassification in
+# ``_migrate_legacy_human_status`` runs exactly once per DB and does not re-fire
+# on every ``connect()`` (which would resurrect the old block_kind→human
+# coupling for cards blocked with ``needs_input`` AFTER the migration).
+_USER_VERSION_HUMAN_STATUS = 1
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -2217,6 +2239,97 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # One-shot legacy → ``human`` status migration. Guarded by user_version so
+    # it fires exactly once per DB (the family-state triggers are already
+    # installed above, so the status UPDATEs correctly re-project any affected
+    # family roots to ``human``). Idempotent by construction, but the guard
+    # additionally prevents the block_kind='needs_input' clause from re-sweeping
+    # cards that a worker legitimately blocks with needs_input AFTER migration.
+    # Defensive: this function must also tolerate hand-crafted skeleton tables
+    # (see test_migrate_add_optional_columns_tolerates_concurrent_migration).
+    # ``status``/``assignee`` are base v1 columns supplied by SCHEMA_SQL in every
+    # real board DB but are not added here; skip the reclassification if the
+    # table predates them.
+    _human_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if (
+        {"status", "assignee", "block_kind", "child_role"} <= _human_cols
+        and _read_user_version(conn) < _USER_VERSION_HUMAN_STATUS
+    ):
+        moved = _apply_human_status_migration(conn)
+        if moved:
+            _log.info(
+                "kanban: migrated %d card(s) to status='human': %s",
+                len(moved),
+                ", ".join(f"{tid}({title!r})" for tid, title in moved),
+            )
+        _set_user_version(conn, _USER_VERSION_HUMAN_STATUS)
+
+
+def _read_user_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute("PRAGMA user_version").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _set_user_version(conn: sqlite3.Connection, version: int) -> None:
+    # PRAGMA does not accept bound parameters; the value is our own int constant.
+    conn.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Move legacy human-signalling cards to the first-class ``human`` status.
+
+    A card wanders to ``human`` iff it is still ACTIVE and carries at least one
+    of the three legacy crutches:
+
+      (1) its status is NOT already terminal/handled
+          (``archived``/``done``/``review``/``human``); AND
+      (2) at least one of:
+            * ``block_kind = 'needs_input'``          (spontaneous "needs a human"), OR
+            * ``child_role = 'human_check'``          (planned human step in a family), OR
+            * (``assignee = 'till'`` AND ``status = 'blocked'``)  (parked-for-Till).
+
+    Crucially this is NOT "``assignee='till'`` alone": that matches every card
+    Till ever owned (incl. long-archived ones), so a naive migration would
+    resurrect 100+ archived cards. Clause (1) is the guard that keeps
+    archived/done/review cards out; ``assignee='till'`` only counts while the
+    card is genuinely parked (``blocked``).
+
+    Idempotent: migrated rows now hold ``status='human'``, which clause (1)
+    excludes, so a second call moves nothing. ``child_role``/``block_kind`` are
+    preserved as informational metadata — they are no longer the trigger.
+
+    Returns the ``(id, title)`` of every card moved, for logging/tests.
+
+    Uses plain ``conn.execute`` (no ``write_txn``) to mirror the sibling
+    one-shot passes in ``_migrate_add_optional_columns`` (e.g. the event-kind
+    rename): that function runs under ``connect()``'s connection management, so
+    opening a nested ``BEGIN IMMEDIATE`` here would raise "cannot start a
+    transaction within a transaction". Standalone callers use an autocommit
+    (``isolation_level=None``) connection, so each statement still commits.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, title FROM tasks
+         WHERE status NOT IN ('archived', 'done', 'review', 'human')
+           AND (
+                 block_kind = 'needs_input'
+              OR child_role = 'human_check'
+              OR (assignee = 'till' AND status = 'blocked')
+           )
+        """
+    ).fetchall()
+    moved = [(r["id"], r["title"]) for r in rows]
+    for tid, _title in moved:
+        conn.execute(
+            "UPDATE tasks SET status = 'human' WHERE id = ?",
+            (tid,),
+        )
+        _append_event(
+            conn, tid, "human",
+            {"reason": "legacy human-signal migrated to status=human"},
+        )
+    return moved
+
 
 def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
     """Mirror the active work child's state onto a decomposed family root."""
@@ -2230,6 +2343,10 @@ def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
             WHERE member.family_root_id = NEW.family_root_id
               AND member.id != NEW.family_root_id AND member.child_role = 'work'
               AND member.status = 'blocked') THEN 'blocked'
+          WHEN EXISTS (SELECT 1 FROM tasks AS member
+            WHERE member.family_root_id = NEW.family_root_id
+              AND member.id != NEW.family_root_id AND member.child_role = 'work'
+              AND member.status = 'human') THEN 'human'
           WHEN EXISTS (SELECT 1 FROM tasks AS member
             WHERE member.family_root_id = NEW.family_root_id
               AND member.id != NEW.family_root_id AND member.child_role = 'work'
@@ -2959,6 +3076,111 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def create_human_card(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    kurzbeschreibung: Optional[str] = None,
+    priority: int = 5,
+    family_root_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+    board: Optional[str] = None,
+    tenant: Optional[str] = None,
+) -> str:
+    """Create a card in the ``human`` status — a task only a person (Till) resolves.
+
+    The manager calls this whenever a human decision/answer is needed. ``title``
+    and ``kurzbeschreibung`` are HARD-limited (``HUMAN_CARD_TITLE_MAX`` /
+    ``HUMAN_CARD_KURZBESCHREIBUNG_MAX``): overflowing RAISES ``ValueError`` so the
+    manager is forced to formulate to the limit (like a chat title) rather than
+    have the text silently clipped in the inbox UI.
+
+    ``kurzbeschreibung`` is stored in ``body`` (the DTO's short-text/volltext
+    source). With ``family_root_id`` the card is attached to that family as the
+    ``human_check`` step, so the whole initiative shows — in its child chain —
+    that it will need Till once. A ``human_check`` child never gates the family
+    root (the family-state trigger only counts ``work`` children).
+    """
+    if not title or not title.strip():
+        raise ValueError("title is required")
+    if len(title) > HUMAN_CARD_TITLE_MAX:
+        raise ValueError(
+            f"title too long: {len(title)} > {HUMAN_CARD_TITLE_MAX} chars "
+            "(formulate a shorter title — it is not truncated)"
+        )
+    if (
+        kurzbeschreibung is not None
+        and len(kurzbeschreibung) > HUMAN_CARD_KURZBESCHREIBUNG_MAX
+    ):
+        raise ValueError(
+            f"kurzbeschreibung too long: {len(kurzbeschreibung)} > "
+            f"{HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
+            "(formulate a shorter description — it is not truncated)"
+        )
+
+    # Born ``blocked`` (never a transient ``ready`` the dispatcher could grab),
+    # then flipped to ``human`` below in the same connection.
+    task_id = create_task(
+        conn,
+        title=title,
+        body=kurzbeschreibung,
+        priority=priority,
+        created_by=created_by,
+        board=board,
+        tenant=tenant,
+        child_role="human_check",
+        initial_status="blocked",
+    )
+    with write_txn(conn):
+        if family_root_id is not None:
+            order = conn.execute(
+                "SELECT COALESCE(MAX(family_order), 0) + 1 FROM tasks "
+                "WHERE family_root_id = ?",
+                (family_root_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET status = 'human', family_root_id = ?, "
+                "family_order = ? WHERE id = ?",
+                (family_root_id, order, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'human' WHERE id = ?",
+                (task_id,),
+            )
+        _append_event(
+            conn, task_id, "human",
+            {"reason": "human card created", "family_root_id": family_root_id},
+        )
+    return task_id
+
+
+def family_progress(conn: sqlite3.Connection, root_id: str) -> dict:
+    """Return ``{'erledigt': N, 'gesamt': M}`` for a family root.
+
+    Counts the family's ``work`` children (``child_role='work'``, excluding the
+    root itself), mirroring the family-state trigger which also only tracks work
+    children. ``human_check`` steps are excluded — they gate on Till, not on
+    family completion. ``archived`` children (cut scope) are excluded from the
+    denominator so the progress ring reflects the LIVE plan; ``erledigt`` counts
+    ``done`` work children.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS gesamt,
+          COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS erledigt
+        FROM tasks
+        WHERE family_root_id = ?
+          AND id != ?
+          AND child_role = 'work'
+          AND status != 'archived'
+        """,
+        (root_id, root_id),
+    ).fetchone()
+    return {"erledigt": int(row["erledigt"]), "gesamt": int(row["gesamt"])}
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:

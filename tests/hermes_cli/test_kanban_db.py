@@ -5437,3 +5437,202 @@ def test_gc_worker_logs_age_and_cap_combined(kanban_home):
     assert removed == 1
     assert not stale.exists(), "backdated log must be rotated away"
     assert fresh.exists(), "fresh log must survive"
+
+
+# ---------------------------------------------------------------------------
+# Status ``human`` — first-class human-in-the-loop status, migration, helpers
+# (Bauplan 2 / Teil A). See ``kanban_db._apply_human_status_migration``.
+# ---------------------------------------------------------------------------
+
+def _set(conn, tid, **cols):
+    """Directly set columns on a task row (seed legacy shapes in tests)."""
+    assigns = ", ".join(f"{k} = ?" for k in cols)
+    conn.execute(f"UPDATE tasks SET {assigns} WHERE id = ?", (*cols.values(), tid))
+
+
+def test_human_is_a_valid_status_between_blocked_and_review():
+    assert "human" in kb.VALID_STATUSES
+    # It must NOT be an initial status (only the manager/migration produces it).
+    assert "human" not in kb.VALID_INITIAL_STATUSES
+
+
+def test_migration_moves_exactly_the_active_legacy_cards(kanban_home):
+    with kb.connect() as conn:
+        # (A) blocked + assignee=till  -> moves (parked-for-Till)
+        a = kb.create_task(conn, title="A parked till", assignee="till")
+        _set(conn, a, status="blocked")
+        # (B) blocked + needs_input    -> moves
+        b = kb.create_task(conn, title="B needs input")
+        _set(conn, b, status="blocked", block_kind="needs_input")
+        # (C) child_role=human_check    -> moves (even when not blocked)
+        c = kb.create_task(conn, title="C human check", child_role="human_check")
+        _set(conn, c, status="todo")
+        # (D) backlog + needs_input     -> moves (clause 2 independent of status)
+        d = kb.create_task(conn, title="D backlog needs input")
+        _set(conn, d, status="backlog", block_kind="needs_input")
+
+        # --- negatives (must NOT move) ---
+        # (N1) archived + assignee=till  -> excluded by clause (1)
+        n1 = kb.create_task(conn, title="N1 archived till", assignee="till")
+        _set(conn, n1, status="archived")
+        # (N2) done + needs_input        -> excluded by clause (1)
+        n2 = kb.create_task(conn, title="N2 done needs input")
+        _set(conn, n2, status="done", block_kind="needs_input")
+        # (N3) assignee=till but ready   -> "till alone" must NOT move it
+        n3 = kb.create_task(conn, title="N3 ready till", assignee="till")  # ready
+        # (N4) plain running card        -> no legacy signal
+        n4 = kb.create_task(conn, title="N4 plain")  # ready/running, no signal
+
+        moved = kb._apply_human_status_migration(conn)
+        moved_ids = {tid for tid, _ in moved}
+
+        assert moved_ids == {a, b, c, d}, moved_ids
+        for tid in (a, b, c, d):
+            assert kb.get_task(conn, tid).status == "human"
+        for tid in (n1, n2, n3, n4):
+            assert kb.get_task(conn, tid).status != "human"
+
+
+def test_migration_negative_probe_archived_till_card_stays(kanban_home):
+    """Explicit negative probe: an archived till card does NOT reactivate."""
+    with kb.connect() as conn:
+        arch = kb.create_task(conn, title="old archived till", assignee="till")
+        _set(conn, arch, status="archived")
+        kb._apply_human_status_migration(conn)
+        assert kb.get_task(conn, arch).status == "archived"
+
+
+def test_migration_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs input", )
+        _set(conn, t, status="blocked", block_kind="needs_input")
+        first = kb._apply_human_status_migration(conn)
+        assert {tid for tid, _ in first} == {t}
+        second = kb._apply_human_status_migration(conn)
+        assert second == []  # nothing left to move
+        assert kb.get_task(conn, t).status == "human"
+
+
+def test_migration_is_one_shot_and_does_not_resweep_new_needs_input(kanban_home):
+    """The user_version guard: a needs_input block created AFTER the migration
+    must NOT be swept into ``human`` on a subsequent init/connect — otherwise the
+    old block_kind→human coupling would silently return."""
+    with kb.connect() as conn:
+        # `kanban_home` already ran init_db() once -> user_version is stamped.
+        assert kb._read_user_version(conn) >= kb._USER_VERSION_HUMAN_STATUS
+        # A worker legitimately blocks a card with needs_input afterwards.
+        later = kb.create_task(conn, title="later needs input")
+        _set(conn, later, status="blocked", block_kind="needs_input")
+    # Re-run the whole migration pass (init_db always re-runs it).
+    kb.init_db()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, later).status == "blocked"
+
+
+def test_human_card_is_never_promoted_by_dispatcher_and_negative_probe(kanban_home):
+    """Dispatcher exclusion + negative probe.
+
+    A ``blocked`` (non-sticky) card with undone-free parents WOULD be promoted to
+    ``ready`` by ``recompute_ready`` (the old blocked@till → ready@till limbo).
+    Once migrated to ``human`` it is excluded from the promotion sweep, so it can
+    never be claimed/spawned.
+    """
+    with kb.connect() as conn:
+        card = kb.create_task(conn, title="parked till", assignee="till")
+        # Non-sticky block (direct status set emits no 'blocked' event).
+        _set(conn, card, status="blocked")
+
+        # Negative probe: WITHOUT the human status, recompute_ready promotes it.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, card).status == "ready", (
+            "precondition: a non-sticky blocked card is promotable — if this "
+            "fails the negative probe proves nothing"
+        )
+
+        # Put it back to the pre-migration shape and migrate.
+        _set(conn, card, status="blocked")
+        kb._apply_human_status_migration(conn)
+        assert kb.get_task(conn, card).status == "human"
+
+        # Now the dispatcher's promotion sweep must leave it alone.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, card).status == "human"
+
+        # And it can never be claimed (claim only transitions ready -> running).
+        assert kb.claim_task(conn, card) is None
+
+
+def test_create_human_card_sets_human_status_and_human_check_role(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_human_card(
+            conn, title="Freigabe Deploy?", kurzbeschreibung="Prod-Deploy ok?",
+            priority=8,
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "human"
+        assert t.child_role == "human_check"
+        assert t.priority == 8
+        # Never claimable.
+        assert kb.claim_task(conn, tid) is None
+
+
+def test_create_human_card_hard_rejects_overlong_title(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="title too long"):
+            kb.create_human_card(
+                conn, title="x" * (kb.HUMAN_CARD_TITLE_MAX + 1),
+                kurzbeschreibung="ok",
+            )
+
+
+def test_create_human_card_hard_rejects_overlong_kurzbeschreibung(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="kurzbeschreibung too long"):
+            kb.create_human_card(
+                conn, title="ok",
+                kurzbeschreibung="y" * (kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX + 1),
+            )
+
+
+def test_family_progress_counts_done_over_live_work_children(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="Root")
+        # Attach three work children + one human_check + one archived.
+        kids = []
+        for i in range(3):
+            k = kb.create_task(conn, title=f"work {i}")
+            _set(conn, k, family_root_id=root, family_order=i, child_role="work")
+            kids.append(k)
+        hc = kb.create_task(conn, title="human step", child_role="human_check")
+        _set(conn, hc, family_root_id=root, family_order=9, child_role="human_check")
+        arch = kb.create_task(conn, title="cut")
+        _set(conn, arch, family_root_id=root, family_order=8,
+             child_role="work", status="archived")
+
+        # Mark 2 of 3 work children done.
+        _set(conn, kids[0], status="done")
+        _set(conn, kids[1], status="done")
+
+        prog = kb.family_progress(conn, root)
+        # gesamt excludes root, human_check and archived -> 3 live work kids.
+        assert prog == {"erledigt": 2, "gesamt": 3}, prog
+
+
+def test_family_root_reflects_human_not_todo_when_work_child_migrates(kanban_home):
+    """Migrating a WORK child to ``human`` must surface ``human`` on the family
+    root (via the family-state trigger's new branch), never silently reopen a
+    completed root to ``todo``."""
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="Done family root")
+        child = kb.create_task(conn, title="leftover till smoke", assignee="till")
+        _set(conn, child, family_root_id=root, family_order=0, child_role="work")
+        # Bring the family to 'done' first (only work child done).
+        _set(conn, child, status="done")
+        assert kb.get_task(conn, root).status == "done"
+
+        # Now the child is a parked-for-till blocker again, then migrates.
+        _set(conn, child, status="blocked")
+        kb._apply_human_status_migration(conn)
+
+        assert kb.get_task(conn, child).status == "human"
+        assert kb.get_task(conn, root).status == "human"  # not 'todo'
