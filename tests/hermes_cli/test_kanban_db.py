@@ -5464,12 +5464,9 @@ def test_migration_moves_exactly_the_active_legacy_cards(kanban_home):
         # (B) blocked + needs_input    -> moves
         b = kb.create_task(conn, title="B needs input")
         _set(conn, b, status="blocked", block_kind="needs_input")
-        # (C) child_role=human_check    -> moves (even when not blocked)
+        # (C) child_role=human_check    -> moves (human step, any non-terminal column)
         c = kb.create_task(conn, title="C human check", child_role="human_check")
         _set(conn, c, status="todo")
-        # (D) backlog + needs_input     -> moves (clause 2 independent of status)
-        d = kb.create_task(conn, title="D backlog needs input")
-        _set(conn, d, status="backlog", block_kind="needs_input")
 
         # --- negatives (must NOT move) ---
         # (N1) archived + assignee=till  -> excluded by clause (1)
@@ -5482,14 +5479,18 @@ def test_migration_moves_exactly_the_active_legacy_cards(kanban_home):
         n3 = kb.create_task(conn, title="N3 ready till", assignee="till")  # ready
         # (N4) plain running card        -> no legacy signal
         n4 = kb.create_task(conn, title="N4 plain")  # ready/running, no signal
+        # (N5) backlog + needs_input     -> a CONTROL card (e.g. P33 briefing
+        #      trigger), NOT an inbox item — needs_input only counts while blocked.
+        n5 = kb.create_task(conn, title="N5 backlog needs input")
+        _set(conn, n5, status="backlog", block_kind="needs_input")
 
         moved = kb._apply_human_status_migration(conn)
         moved_ids = {tid for tid, _ in moved}
 
-        assert moved_ids == {a, b, c, d}, moved_ids
-        for tid in (a, b, c, d):
+        assert moved_ids == {a, b, c}, moved_ids
+        for tid in (a, b, c):
             assert kb.get_task(conn, tid).status == "human"
-        for tid in (n1, n2, n3, n4):
+        for tid in (n1, n2, n3, n4, n5):
             assert kb.get_task(conn, tid).status != "human"
 
 
@@ -5500,6 +5501,21 @@ def test_migration_negative_probe_archived_till_card_stays(kanban_home):
         _set(conn, arch, status="archived")
         kb._apply_human_status_migration(conn)
         assert kb.get_task(conn, arch).status == "archived"
+
+
+def test_migration_control_cards_with_needs_input_do_not_wander(kanban_home):
+    """Foxtrot 27.09.: needs_input on a non-blocked column is a CONTROL card
+    (e.g. the P33 evening-briefing trigger), not an inbox item — it must stay
+    in its column. needs_input only counts while ``blocked``."""
+    with kb.connect() as conn:
+        parked = {}
+        for st in ("backlog", "scheduled", "triage", "todo"):
+            tid = kb.create_task(conn, title=f"control {st}")
+            _set(conn, tid, status=st, block_kind="needs_input")
+            parked[st] = tid
+        kb._apply_human_status_migration(conn)
+        for st, tid in parked.items():
+            assert kb.get_task(conn, tid).status == st, f"{st} card wandered"
 
 
 def test_migration_is_idempotent(kanban_home):
