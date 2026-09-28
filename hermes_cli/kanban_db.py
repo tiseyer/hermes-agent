@@ -3163,6 +3163,105 @@ def create_human_card(
     return task_id
 
 
+def move_to_human(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    kurzbeschreibung: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> str:
+    """Flip an EXISTING card's status to ``human`` — "Till must act on this".
+
+    Unlike :func:`create_human_card` (which mints a separate ``human_check``
+    card), this escalates the card already on the board — typically a ``blocked``
+    card whose block turns out to need a human decision. The card's OWN status
+    becomes the durable escalation memory: the manager re-derives "must I
+    escalate?" from the status at every tick, so a decision made once survives
+    hundreds of ticks and a rolled journal window, and re-invoking is a safe
+    no-op. Like ``blocked``, a ``human`` card is never pulled by the dispatcher
+    (``recompute_ready`` selects only ('todo','blocked')).
+
+    Idempotent and side-effect-free on repeat: returns
+
+      * ``"noop"``     — already ``human``; nothing written.
+      * ``"terminal"`` — ``done``/``archived``; a resolved card is never
+                          re-escalated; nothing written.
+      * ``"notfound"`` — unknown id.
+      * ``"moved"``    — flipped to ``human`` (stale run pointer defensively
+                          closed like :func:`unblock_task`), a ``human`` event
+                          appended, and the card optionally relabelled.
+
+    ``title``/``kurzbeschreibung`` optionally relabel in the same transaction so
+    the manager can give Till a human-readable inbox line. Same HARD limits as
+    :func:`create_human_card` — overflow RAISES ``ValueError`` rather than
+    silently clipping.
+    """
+    if title is not None:
+        if not title.strip():
+            raise ValueError("title is required")
+        if len(title) > HUMAN_CARD_TITLE_MAX:
+            raise ValueError(
+                f"title too long: {len(title)} > {HUMAN_CARD_TITLE_MAX} chars "
+                "(formulate a shorter title — it is not truncated)"
+            )
+    if (
+        kurzbeschreibung is not None
+        and len(kurzbeschreibung) > HUMAN_CARD_KURZBESCHREIBUNG_MAX
+    ):
+        raise ValueError(
+            f"kurzbeschreibung too long: {len(kurzbeschreibung)} > "
+            f"{HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
+            "(formulate a shorter description — it is not truncated)"
+        )
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return "notfound"
+        status = row["status"]
+        if status == "human":
+            return "noop"
+        if status in ("done", "archived"):
+            return "terminal"
+        # Defensively close any stale run pointer before flipping status so the
+        # runs invariant (current_run_id IS NULL ⇔ run in terminal state) holds,
+        # mirroring unblock_task.
+        if row["current_run_id"]:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'reclaimed', outcome = 'reclaimed',
+                       summary = COALESCE(summary, 'invariant recovery on human'),
+                       ended_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND ended_at IS NULL
+                """,
+                (now, int(row["current_run_id"])),
+            )
+        sets = ["status = 'human'", "current_run_id = NULL"]
+        params: list = []
+        if title is not None:
+            sets.append("title = ?")
+            params.append(title)
+        if kurzbeschreibung is not None:
+            sets.append("body = ?")
+            params.append(kurzbeschreibung)
+        params.append(task_id)
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
+        )
+        _append_event(
+            conn, task_id, "human",
+            {"reason": "escalated to human", "from": status, "actor": actor},
+        )
+    return "moved"
+
+
 def relabel_task(
     conn: sqlite3.Connection,
     task_id: str,
