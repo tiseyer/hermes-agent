@@ -5643,6 +5643,68 @@ def test_create_human_card_hard_rejects_overlong_kurzbeschreibung(kanban_home):
             )
 
 
+def test_move_to_human_flips_blocked_card_and_relabels(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t_ab-technisch", body="alt",
+                             assignee="default")
+        kb.block_task(conn, tid, reason="needs Till", kind="needs_input")
+        out = kb.move_to_human(
+            conn, tid,
+            title="Voicera-Chat: Karten anlegen — Vertrag entscheiden",
+            kurzbeschreibung="Pflichtfelder für kanban_create festlegen",
+            actor="manager",
+        )
+        assert out == "moved"
+        t = kb.get_task(conn, tid)
+        assert t.status == "human"
+        assert t.title == "Voicera-Chat: Karten anlegen — Vertrag entscheiden"
+        assert t.body == "Pflichtfelder für kanban_create festlegen"
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'human' "
+            "ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        assert json.loads(ev["payload"])["from"] == "blocked"
+
+
+def test_move_to_human_is_idempotent_noop_when_already_human(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="default")
+        kb.block_task(conn, tid, kind="needs_input")
+        assert kb.move_to_human(conn, tid) == "moved"
+        n_events = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE task_id = ? AND kind='human'",
+            (tid,),
+        ).fetchone()["c"]
+        # Second (and any further) call is a pure no-op: no flip, no new event.
+        assert kb.move_to_human(conn, tid) == "noop"
+        assert kb.move_to_human(conn, tid) == "noop"
+        again = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE task_id = ? AND kind='human'",
+            (tid,),
+        ).fetchone()["c"]
+        assert again == n_events
+        assert kb.get_task(conn, tid).status == "human"
+
+
+def test_move_to_human_refuses_terminal_and_unknown(kanban_home):
+    with kb.connect() as conn:
+        assert kb.move_to_human(conn, "t_does_not_exist") == "notfound"
+        tid = kb.create_task(conn, title="done card", assignee="default")
+        _set(conn, tid, status="done")
+        assert kb.move_to_human(conn, tid) == "terminal"
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_move_to_human_hard_rejects_overlong_title(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="default")
+        kb.block_task(conn, tid, kind="needs_input")
+        with pytest.raises(ValueError, match="title too long"):
+            kb.move_to_human(conn, tid, title="x" * (kb.HUMAN_CARD_TITLE_MAX + 1))
+        # Rejected before any write — card stays blocked.
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_relabel_sets_title_and_kurzbeschreibung_and_leaves_rest(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="alt", body="alter body",

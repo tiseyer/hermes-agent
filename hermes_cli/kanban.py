@@ -620,6 +620,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
               "chars, not truncated)"),
     )
 
+    p_human = sub.add_parser(
+        "human",
+        help="Escalate a card to Till: flip its status to 'human' (idempotent)",
+    )
+    p_human.add_argument("task_id")
+    p_human.add_argument(
+        "--title", default=None,
+        help=(f"Human-readable inbox title (max {kb.HUMAN_CARD_TITLE_MAX} chars, "
+              "not truncated) — no branch/commit/Datei:Zeile"),
+    )
+    p_human.add_argument(
+        "--kurzbeschreibung", "--kurz", "--desc", default=None,
+        dest="kurzbeschreibung",
+        help=(f"Human-readable short description (max "
+              f"{kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars, not truncated)"),
+    )
+    p_human.add_argument(
+        "--reason", default=None,
+        help="Why Till is needed (appended as a comment only on the actual move)",
+    )
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -1029,6 +1050,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "relabel":  _cmd_relabel,
+            "human":    _cmd_human,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -2117,6 +2139,41 @@ def _cmd_relabel(args: argparse.Namespace) -> int:
         print(f"cannot relabel {args.task_id} (unknown id)", file=sys.stderr)
         return 1
     print(f"Relabeled {args.task_id}")
+    return 0
+
+
+def _cmd_human(args: argparse.Namespace) -> int:
+    actor = _profile_author()
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    try:
+        with kb.connect_closing() as conn:
+            outcome = kb.move_to_human(
+                conn, args.task_id,
+                title=getattr(args, "title", None),
+                kurzbeschreibung=getattr(args, "kurzbeschreibung", None),
+                actor=actor,
+            )
+            # Comment only on the actual move — keeps a repeat call a pure no-op.
+            if outcome == "moved" and reason:
+                kb.add_comment(conn, args.task_id, actor, f"HUMAN: {reason}")
+    except ValueError as exc:
+        print(f"kanban: human: {exc}", file=sys.stderr)
+        return 2
+    if outcome == "notfound":
+        print(f"cannot escalate {args.task_id} (unknown id)", file=sys.stderr)
+        return 1
+    if outcome == "terminal":
+        print(
+            f"cannot escalate {args.task_id} (already done/archived)",
+            file=sys.stderr,
+        )
+        return 1
+    if outcome == "noop":
+        print(f"{args.task_id} already human (no-op)")
+        return 0
+    print(f"Escalated {args.task_id} → human" + (f": {reason}" if reason else ""))
     return 0
 
 
