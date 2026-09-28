@@ -55,7 +55,12 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    # Append the block reason as a compact suffix so `needs_input`
+    # (waiting on a human) is distinguishable from a dependency/review
+    # block at a glance. Only blocked cards carry it; unblocked rows stay
+    # aligned on the 8-wide status column.
+    status = t.status + (f"[{t.block_kind}]" if t.block_kind else "")
+    return f"{icon} {t.id}  {status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -65,6 +70,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "block_kind": t.block_kind,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -1610,6 +1616,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    # Why the card is blocked: `needs_input` (waiting on a human) vs.
+    # `dependency`/`review` (technically blocked). Only shown when set.
+    if task.block_kind:
+        print(f"  block_kind: {task.block_kind}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
