@@ -240,3 +240,80 @@ def test_dispatch_still_repairs_ready_child_with_undone_parent(
         assert kb.get_task(conn, child).status == "todo"
         # The repair path still records its operator-visible signal.
         assert "spawn_rejected" in _event_kinds(conn, child)
+
+
+# ---------------------------------------------------------------------------
+# B2.1 (family-root filter) x B3b-ii (GO gate) interaction
+# ---------------------------------------------------------------------------
+
+def test_merger_card_is_not_family_root_and_is_go_gated(
+    kanban_home, all_assignees_spawnable,
+):
+    """The two mechanisms compose. The family-root filter (B2.1) removes only
+    family roots from dispatch candidates; a standalone merger card has
+    ``family_root_id IS NULL``, so it still reaches the loop — where the
+    broadened GO gate (B3b-ii) parks it instead of auto-merging.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect_closing() as conn:
+        mid = kb.create_task(
+            conn, title="Integrate all feature branches", assignee="merger",
+        )
+        card = kb.get_task(conn, mid)
+        assert card.family_root_id is None  # not a root -> not filtered by B2.1
+        assert card.status == "ready"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        # Gated by B3b-ii: parked, never spawned.
+        assert spawns == []
+        assert [task_id for task_id, _, _ in result.spawned] == []
+        parked = kb.get_task(conn, mid)
+        assert parked.status == "blocked"
+        assert parked.assignee == "till"
+        assert "go_gate_held" in _event_kinds(conn, mid)
+
+
+def test_family_terminal_merge_child_parked_while_root_filtered(
+    kanban_home, all_assignees_spawnable,
+):
+    """Inside one decomposed family: the root is filtered (B2.1, no
+    spawn_rejected noise) while the terminal merge child is GO-gated
+    (B3b-ii) rather than auto-spawned.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect_closing() as conn:
+        root_id = kb.create_task(conn, title="root", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "Merge feature branch to main",
+                 "assignee": "merger", "parents": []},
+            ],
+        )
+        assert child_ids is not None
+        merge_child = child_ids[0]
+        # Parent-free child is auto-promoted to ready by decompose.
+        assert kb.get_task(conn, merge_child).status == "ready"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        # Root: filtered by B2.1 (no claim, no spawn_rejected noise).
+        assert "spawn_rejected" not in _event_kinds(conn, root_id)
+        # Terminal merge child: gated by B3b-ii.
+        assert spawns == []
+        assert [task_id for task_id, _, _ in result.spawned] == []
+        child = kb.get_task(conn, merge_child)
+        assert child.status == "blocked"
+        assert child.assignee == "till"
+        assert "go_gate_held" in _event_kinds(conn, merge_child)

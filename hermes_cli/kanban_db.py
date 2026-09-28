@@ -8963,8 +8963,60 @@ _clear_spawn_failures = _clear_failure_counter
 # for an explicit human GO (goal "orchestrator-autonomy" / Canary 4).
 _GO_GATE_RE = re.compile(
     r"(?i)\b(smoke[- ]?tests?|smoke\b|deploy(ment|s|en)?\b|go[- ]?live"
-    r"|live[- ]?(gang|schalt\w*|aktivierung)|production|prod[- ]?release)"
+    r"|live[- ]?(gang|schalt\w*|aktivierung)|production|prod[- ]?release"
+    # B3a: merge / release vocabulary. A terminal MERGE is exactly the
+    # "requires Till's GO" action the original gate missed (verified: the
+    # old regex matched deploy/smoke/live but NOT merge/PR/release —
+    # kartiert in ~/lueckezwei-b1-b3-plan.md B3a). ``merge\w*`` also matches
+    # "merge conflict" in a body; that is an accepted false-positive — the
+    # release valve is an explicit human unblock, so an over-gated card is
+    # a one-line GO away, never a lost card.
+    # ``(?-i:PR)`` is case-SENSITIVE on purpose: a lowercase two-letter "pr"
+    # glued into words ("has-pr", "prüfen") must NOT trip the gate — only the
+    # uppercase acronym PR/PRs counts (regression: "has-pr" was wrongly gated).
+    r"|merge\w*|pull[- ]?request|(?-i:PR)s?\b|release\w*|ver[öo]ffentlich\w*)"
 )
+
+
+def _is_merger_profile(assignee: Optional[str]) -> bool:
+    """True when the assignee is the merger integration profile.
+
+    A merger card performs the terminal branch merge, so it is a GO-gated
+    card regardless of vocabulary (its title may just say "Integrate
+    feature-X"). Only ``merger`` exists today; the ``-merger`` suffix match
+    future-proofs a tenant-scoped merger (e.g. ``voicera-merger``) so no
+    code change is needed when one is added (B3b-ii build-time check:
+    ~/.hermes/profiles has exactly one merger profile, no tenant variants).
+    """
+    if not assignee:
+        return False
+    a = assignee.strip().lower()
+    return a == "merger" or a.endswith("-merger")
+
+
+def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a human has explicitly released this card past the GO gate.
+
+    The GO gate parks a terminal card as ``blocked@till`` with a sticky
+    ``blocked`` event. The one legitimate exit is an explicit
+    ``unblock_task`` (``hermes kanban unblock``), which writes an
+    ``unblocked`` event. A card is therefore 'released' iff its most recent
+    ``blocked``/``unblocked`` event is ``unblocked``.
+
+    This is what lets the broadened gate (B3b-ii) park terminal cards even
+    when they are pre-assigned WITHOUT deadlocking Till's GO: once he
+    unblocks (and re-assigns to a real profile), the card is released and
+    the dispatcher spawns it on the next tick instead of re-parking it. A
+    fresh terminal card has no such event → not released → gated.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "unblocked"
+
 
 # Tenant → reviewer profile routing. Used by the review block path and
 # the loop-detection diagnosis routing so both always agree.
@@ -9754,7 +9806,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, title, body, tenant FROM tasks "
+        "SELECT id, assignee, title, body, tenant, merge_group FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         # Family roots are visible projections of their work children, never
         # workers (get_spawn_rejection_reason -> 'family_root'). Excluding them
@@ -9831,16 +9883,29 @@ def _dispatch_once_locked(
             if not dry_run:
                 claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
             continue
-        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): Smoke-, Deploy-
-        # und Live-Karten dürfen NIE ungefragt vom default-Fallback starten.
-        # Ohne expliziten menschlichen Assignee (oder mit 'default') werden
-        # sie an 'till' geparkt — kein Hermes-Profil, also nicht spawnbar —
-        # bis ein Mensch GO gibt (Assignee auf ein echtes Profil setzt).
-        # Explizit von Hand einem Profil zugewiesene Karten passieren das
-        # Gate unverändert.
-        if (not row_assignee or row_assignee == "default") and _GO_GATE_RE.search(
-            f"{row['title'] or ''}\n{row['body'] or ''}"
-        ):
+        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): TERMINAL cards
+        # — smoke/deploy/live/merge/release actions (_GO_GATE_RE), merger-
+        # profile cards, or explicit merge groups — dürfen NIE ungefragt
+        # starten und werden an 'till' geparkt (kein Hermes-Profil, also
+        # nicht spawnbar), bis ein Mensch GO gibt.
+        #
+        # B3b-ii: das Gate greift jetzt AUCH bei vorab zugewiesenen Karten.
+        # Die alte Bedingung "nur ohne Assignee" war die Umgehungslücke —
+        # eine "Deploy prod"-Karte an ein Coder-Profil oder eine Merge-Karte
+        # an den Merger segelten daran vorbei (kartiert in
+        # ~/lueckezwei-b1-b3-plan.md B3b-ii). Der EINZIGE legitime Release
+        # ist ein expliziter menschlicher unblock (_go_gate_released): dessen
+        # 'unblocked'-Event macht die Karte spawnbar, statt sie erneut zu
+        # parken. Der manuelle `hermes kanban claim` (kanban.py) umgeht das
+        # Gate bewusst — ein Direkt-Claim IST das menschliche GO.
+        _go_text = f"{row['title'] or ''}\n{row['body'] or ''}"
+        _row_merge_group = row["merge_group"]
+        _is_terminal_card = (
+            bool(_GO_GATE_RE.search(_go_text))
+            or _is_merger_profile(row_assignee)
+            or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
+        )
+        if _is_terminal_card and not _go_gate_released(conn, row["id"]):
             result.skipped_nonspawnable.append(row["id"])
             if not dry_run:
                 with write_txn(conn):
@@ -9851,25 +9916,29 @@ def _dispatch_once_locked(
                     # ``blocked`` event keeps recompute_ready from
                     # ping-ponging it back; the human GO is an explicit
                     # unblock + assignee change.
+                    #
+                    # B3b-ii: the UPDATE no longer requires the card to be
+                    # unassigned. Parking DELIBERATELY takes a pre-assigned
+                    # terminal card away from its merger/coder and hands it
+                    # to 'till' — the GO is the human re-assign + unblock.
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = 'till', "
                         "status = 'blocked', block_kind = 'needs_input' "
-                        "WHERE id = ? AND status = 'ready' "
-                        "AND (assignee IS NULL OR assignee = '' "
-                        "     OR assignee = 'default')",
+                        "WHERE id = ? AND status = 'ready'",
                         (row["id"],),
                     )
                     if cur.rowcount == 1:
                         _append_event(
                             conn, row["id"], "blocked",
                             {"kind": "needs_input",
-                             "reason": "go_gate: smoke/deploy/live card "
+                             "reason": "go_gate: terminal card "
+                                       "(smoke/deploy/live/merge/release) "
                                        "requires explicit human GO"},
                         )
                         _append_event(
                             conn, row["id"], "go_gate_held",
                             {"assignee": "till", "status": "blocked",
-                             "reason": "smoke/deploy/live card requires "
+                             "reason": "terminal card requires "
                                        "explicit human GO"},
                         )
                         conn.execute(
@@ -9879,10 +9948,11 @@ def _dispatch_once_locked(
                             (
                                 row["id"],
                                 "orchestrator",
-                                "GO-Gate: Diese Karte verlangt Smoke/Deploy/"
-                                "Live-Aktionen und wird nicht automatisch "
-                                "gestartet. Assignee auf 'till' gesetzt — "
-                                "für GO einem echten Profil zuweisen.",
+                                "GO-Gate: Diese Karte verlangt eine terminale "
+                                "Aktion (Smoke/Deploy/Live/Merge/Release) und "
+                                "wird nicht automatisch gestartet. Assignee auf "
+                                "'till' gesetzt — für GO einem echten Profil "
+                                "zuweisen und die Karte entblocken.",
                                 int(time.time()),
                             ),
                         )
