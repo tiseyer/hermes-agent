@@ -9756,6 +9756,13 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee, title, body, tenant FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        # Family roots are visible projections of their work children, never
+        # workers (get_spawn_rejection_reason -> 'family_root'). Excluding them
+        # here — the same predicate the running_count/per-profile scans already
+        # use — stops the dispatcher from claiming a root every tick and
+        # spamming spawn_rejected. A root's state is left to roll up from its
+        # children via the family-state trigger; it simply waits on them.
+        "AND (family_root_id IS NULL OR id != family_root_id) "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
