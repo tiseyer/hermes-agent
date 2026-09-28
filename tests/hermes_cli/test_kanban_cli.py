@@ -565,3 +565,64 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# block_kind rendering (show human + JSON, ls suffix)
+#
+# The manager reads block_kind to tell "waiting on a human" (needs_input)
+# apart from "technically blocked" (dependency/review). It must be visible
+# in the human `show`, machine-readable in the JSON, and a compact suffix
+# in `ls`. Pure display — no logic/DB-schema change.
+# ---------------------------------------------------------------------------
+
+def _make_task_with_block_kind(block_kind):
+    """Create a card and stamp block_kind directly (display fixture)."""
+    import re
+    out = kc.run_slash("create 'blockkind demo' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    if block_kind is not None:
+        with kb.connect_closing() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind=? WHERE id=?",
+                (block_kind, tid),
+            )
+            conn.commit()
+    return tid
+
+
+def test_show_renders_block_kind_when_set(kanban_home):
+    tid = _make_task_with_block_kind("needs_input")
+    show = kc.run_slash(f"show {tid}")
+    assert "block_kind: needs_input" in show
+
+
+def test_show_omits_block_kind_when_empty(kanban_home):
+    tid = _make_task_with_block_kind(None)
+    show = kc.run_slash(f"show {tid}")
+    assert "block_kind" not in show
+
+
+def test_show_json_includes_block_kind(kanban_home):
+    tid_set = _make_task_with_block_kind("dependency")
+    payload = json.loads(kc.run_slash(f"show {tid_set} --json"))
+    assert payload["task"]["block_kind"] == "dependency"
+
+    tid_empty = _make_task_with_block_kind(None)
+    payload = json.loads(kc.run_slash(f"show {tid_empty} --json"))
+    # Key is always present (machine-readable), null when unset.
+    assert payload["task"]["block_kind"] is None
+
+
+def test_ls_appends_block_kind_suffix(kanban_home):
+    # The suffix is status-agnostic ("<status>[<block_kind>]"); assert on the
+    # bracketed reason itself, not the status word (which recompute may flip).
+    _make_task_with_block_kind("needs_input")
+    assert "[needs_input]" in kc.run_slash("ls")
+
+
+def test_ls_omits_suffix_when_block_kind_empty(kanban_home):
+    _make_task_with_block_kind(None)
+    listing = kc.run_slash("ls")
+    # No bracketed block-reason suffix on a card without a block_kind.
+    assert "[" not in listing
