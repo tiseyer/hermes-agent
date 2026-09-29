@@ -307,6 +307,7 @@ _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
+_CTX_MAX_GOAL_BYTES     = 2 * 1024   # 2 KB per surfaced family-root goal (Leitstern)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
 
@@ -6783,6 +6784,19 @@ def decompose_triage_task(
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
+        # Leitstern (Kurz-Zeiger): every decomposed child gets a one-line
+        # pointer back to the family root's goal, so a worker reading a
+        # leaf sees WHY it exists. Deliberately NOT a full copy of the
+        # root body — single source of truth is the root card; the full
+        # goal is surfaced at read-time by build_worker_context. Computed
+        # once, prepended per child below (after repo-profile resolution,
+        # so the pointer text never perturbs repo routing).
+        _root_goal_title = (root_row["title"] or "").strip()
+        _goal_pointer = (
+            "## Übergeordnetes Ziel\n"
+            f"Teil von: {_root_goal_title[:120]} (Ziel siehe Wurzelkarte)"
+        ) if _root_goal_title else ""
+
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -6830,6 +6844,17 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Prepend the Leitstern pointer to the stored child body. Placed
+            # here (after repo-profile resolution above) so the pointer text
+            # can't shift repo routing. Idempotent: never double-prepend if a
+            # body already opens with the marker.
+            _existing_body = body if isinstance(body, str) and body.strip() else ""
+            if not _goal_pointer or _existing_body.startswith("## Übergeordnetes Ziel"):
+                stored_body = body if isinstance(body, str) else None
+            elif _existing_body:
+                stored_body = _goal_pointer + "\n\n" + _existing_body
+            else:
+                stored_body = _goal_pointer
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
@@ -6839,7 +6864,7 @@ def decompose_triage_task(
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    stored_body,
                     assignee,
                     child_ws_kind,
                     child_ws_path,
@@ -11163,6 +11188,25 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    # Übergeordnetes Ziel (Leitstern) — walk up the decomposition family to
+    # the root card and surface its goal, so a worker/manager reading a leaf
+    # sees WHY it exists, not just the local fix. Read-only: follows the
+    # existing family_root_id/initiative_id pointers, adds no column and
+    # never mutates. Skipped when this card IS the root (its own body is
+    # already shown above) or the root is unreadable.
+    root_ref = task.family_root_id or task.initiative_id
+    if root_ref and root_ref != task.id:
+        root_task = get_task(conn, root_ref)
+        if root_task is not None and (
+            (root_task.title or "").strip() or (root_task.body or "").strip()
+        ):
+            lines.append(f"## Übergeordnetes Ziel (Familien-Wurzel {root_task.id})")
+            lines.append((root_task.title or "(ohne Titel)").strip())
+            if root_task.body and root_task.body.strip():
+                lines.append("")
+                lines.append(_cap(root_task.body, _CTX_MAX_GOAL_BYTES))
+            lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has
