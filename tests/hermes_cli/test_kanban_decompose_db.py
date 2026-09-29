@@ -328,3 +328,77 @@ def test_decompose_rewrites_wrong_tenant_role_profiles(kanban_home, monkeypatch)
         assert child_ids
         assert kb.get_task(conn, child_ids[0]).assignee == "voicera-coder"
         assert kb.get_task(conn, child_ids[1]).assignee == "voicera-reviewer"
+
+
+# --- Leitstern: goal visibility (Ziel lesbar machen, (d) + (e)) ----------
+
+def test_decompose_prepends_goal_pointer_to_children(kanban_home):
+    """(d) Every decomposed child body opens with a one-line pointer back
+    to the family root's goal — a POINTER, NOT a full copy of the root body
+    (single source of truth = the root card)."""
+    root_title = "Cockpit-Chat urteilsfähig machen"
+    root_body = "GEHEIMER_ZIELTEXT: der große Zweck der ganzen Familie."
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title=root_title, body=root_body)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "teil A", "body": "mach A", "parents": []},
+                {"title": "teil B", "body": "", "parents": [0]},
+            ],
+            author="decomposer",
+        )
+    assert child_ids and len(child_ids) == 2
+    with kb.connect() as conn:
+        c0 = kb.get_task(conn, child_ids[0])
+        c1 = kb.get_task(conn, child_ids[1])
+    ptr = f"## Übergeordnetes Ziel\nTeil von: {root_title} (Ziel siehe Wurzelkarte)"
+    # child with a body: pointer prepended, original body preserved after it
+    assert c0.body.startswith(ptr)
+    assert "mach A" in c0.body
+    # child with empty body: just the pointer
+    assert c1.body == ptr
+    # POINTER, not full copy: the root body text is never embedded in children
+    assert "GEHEIMER_ZIELTEXT" not in (c0.body or "")
+    assert "GEHEIMER_ZIELTEXT" not in (c1.body or "")
+
+
+def test_decompose_goal_pointer_idempotent(kanban_home):
+    """A child body that already opens with the Ziel marker is not
+    double-prepended (guards re-decompose / model-authored markers)."""
+    pre = "## Übergeordnetes Ziel\nTeil von: etwas anderes (Ziel siehe Wurzelkarte)"
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="root", body="root goal")
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "x", "body": pre + "\n\neigentlicher body"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        c = kb.get_task(conn, child_ids[0])
+    assert c.body.count("## Übergeordnetes Ziel") == 1  # no stacking
+    assert c.body.startswith(pre)
+
+
+def test_build_worker_context_surfaces_root_goal(kanban_home):
+    """(e) A leaf's worker context surfaces the family root's goal
+    (title + full body) under a Leitstern header; the root's own context
+    does not (it IS the goal)."""
+    root_title = "Cockpit-Chat urteilsfähig machen"
+    root_body = "ZIELTEXT_WURZEL: warum die ganze Familie existiert."
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title=root_title, body=root_body)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "leaf", "body": "local fix"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        child_ctx = kb.build_worker_context(conn, child_ids[0])
+        root_ctx = kb.build_worker_context(conn, tid)
+    # child sees the root goal surfaced at read-time (full body, not just pointer)
+    assert f"## Übergeordnetes Ziel (Familien-Wurzel {tid})" in child_ctx
+    assert "ZIELTEXT_WURZEL" in child_ctx
+    assert root_title in child_ctx
+    # the root card itself gets no goal-surfacing block (root_ref == self)
+    assert "Übergeordnetes Ziel (Familien-Wurzel" not in root_ctx
