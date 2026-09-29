@@ -660,6 +660,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason", default=None,
         help="Why Till is needed (appended as a comment only on the actual move)",
     )
+    p_human.add_argument(
+        "--category", default=None, choices=sorted(kb.VALID_CATEGORIES),
+        help=(
+            "What the card wants from Till, for the inbox colour pill: "
+            "frage (info needed) · entscheidung (design/irreversible) · "
+            "abnahme (sign-off/smoke) · blocker (technical, with diagnosis) · "
+            "go_noetig (terminal action awaiting explicit GO)"
+        ),
+    )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
@@ -2177,6 +2186,7 @@ def _cmd_human(args: argparse.Namespace) -> int:
                 conn, args.task_id,
                 title=getattr(args, "title", None),
                 kurzbeschreibung=getattr(args, "kurzbeschreibung", None),
+                category=getattr(args, "category", None),
                 actor=actor,
             )
             # Comment only on the actual move — keeps a repeat call a pure no-op.
