@@ -1721,11 +1721,35 @@ class TestGitDestructiveOps:
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
-    def test_safe_git_push_not_flagged(self):
-        """Normal push without --force must not be flagged."""
-        cmd = "git push origin main"
-        dangerous, _, _ = detect_dangerous_command(cmd)
-        assert dangerous is False
+    def test_safe_git_push_feature_branch_not_flagged(self):
+        """Non-force push to a FEATURE branch must not be flagged.
+
+        Workers push feature branches freely; only the protected
+        destinations main/master/develop are gated (see the Prod-Wand
+        test below).
+        """
+        for cmd in (
+            "git push origin feature/kanban-self-healing",
+            "git push fork wt/human-status",
+            "git push origin develop-ui",   # merely prefixed, not the branch
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
+    def test_git_push_to_protected_branch_flagged(self):
+        """Prod-Wand (2026-09-29): non-force push to main/master/develop is
+        gated so a merge to a shared branch always reaches a human — no matter
+        which agent triggers it. Force-push is covered by its own pattern."""
+        for cmd in (
+            "git push origin main",
+            "git push fork main",
+            "git push origin HEAD:master",
+            "git push origin feature/x:develop",
+            "ssh voiceraos 'cd /home/till/voicera-os && git push origin main'",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+            assert "main/master/develop" in desc
 
     def test_git_branch_lowercase_d_also_flagged(self):
         """git branch -d triggers approval too — IGNORECASE is global.
@@ -2560,3 +2584,78 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+class TestProdWandFailClosed:
+    """Prod-Wand (2026-09-29): the three irreversible actions (merge to main,
+    prod deploy, db drop) must NEVER auto-approve without a human, regardless of
+    process topology. In a non-interactive / non-gateway / non-ask context the
+    historical behavior is fail-OPEN; for the always-escalate actions it must be
+    fail-CLOSED instead. Benign commands keep the fail-open behavior."""
+
+    from unittest.mock import patch as _patch
+
+    def _noninteractive(self):
+        # Force the "no human present" context deterministically.
+        from unittest.mock import patch as _p
+        return (
+            _p("tools.approval._is_interactive_cli", return_value=False),
+            _p("tools.approval._is_gateway_approval_context", return_value=False),
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        "gh pr merge 123 --squash",
+        "git push origin main",
+        "git push fork main",
+        "docker compose up -d",
+        "cd /home/till/voicera-os && docker compose up -d",
+        "dropdb voicera",
+    ])
+    def test_irreversible_blocked_without_human(self, cmd, monkeypatch):
+        from tools.approval import check_all_command_guards
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        p1, p2 = self._noninteractive()
+        with p1, p2:
+            r = check_all_command_guards(cmd, "local")
+        assert r.get("approved") is False, cmd
+        assert "Prod-Wand" in (r.get("message") or ""), cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "git push origin feature/kanban-self-healing",
+        "docker compose -p voicera-staging-app up -d",
+        "docker compose -p preview-slug up -d",
+        "docker compose ps",
+        "ls -la",
+    ])
+    def test_benign_still_fail_open_without_human(self, cmd, monkeypatch):
+        from tools.approval import check_all_command_guards
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        p1, p2 = self._noninteractive()
+        with p1, p2:
+            r = check_all_command_guards(cmd, "local")
+        assert r.get("approved") is True, cmd
+
+    def test_execute_code_contiguous_irreversible_blocked(self, monkeypatch):
+        from tools.approval import check_execute_code_guard
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        p1, p2 = self._noninteractive()
+        with p1, p2:
+            r = check_execute_code_guard(
+                'import os; os.system("gh pr merge 12 --squash")', "local")
+        assert r.get("approved") is False
+        assert "Prod-Wand" in (r.get("message") or "")
+
+    def test_always_escalate_set_matches_pattern_descriptions(self):
+        """Every description in the always-escalate set must exist as a real
+        DANGEROUS_PATTERNS description — else a typo silently disables the wall."""
+        from tools.approval import (
+            _ALWAYS_ESCALATE_DESCRIPTIONS, DANGEROUS_PATTERNS,
+        )
+        known = {desc for _, desc in DANGEROUS_PATTERNS}
+        missing = _ALWAYS_ESCALATE_DESCRIPTIONS - known
+        assert not missing, f"orphan always-escalate descriptions: {missing}"
