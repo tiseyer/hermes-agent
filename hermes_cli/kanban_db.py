@@ -8967,14 +8967,38 @@ _GO_GATE_RE = re.compile(
     # B3a: merge / release vocabulary. A terminal MERGE is exactly the
     # "requires Till's GO" action the original gate missed (verified: the
     # old regex matched deploy/smoke/live but NOT merge/PR/release —
-    # kartiert in ~/lueckezwei-b1-b3-plan.md B3a). ``merge\w*`` also matches
-    # "merge conflict" in a body; that is an accepted false-positive — the
-    # release valve is an explicit human unblock, so an over-gated card is
-    # a one-line GO away, never a lost card.
+    # kartiert in ~/lueckezwei-b1-b3-plan.md B3a).
+    # SCOPE: this full regex is matched against the card TITLE only (see the
+    # dispatcher gate). ``merge\w*``/``release\w*`` are common words that also
+    # appear incidentally in prose ("kein Merge ohne Tills GO" in a spec
+    # card's body) — matching them in a body wrongly parked a spec card
+    # (diagnosed live 2026-09-29). The body is checked by the NARROWER
+    # ``_GO_GATE_BODY_RE`` below; merge/release/PR are caught in a title or
+    # by the structural legs (_is_merger_profile / merge_group), never by a
+    # bare mention in a body.
     # ``(?-i:PR)`` is case-SENSITIVE on purpose: a lowercase two-letter "pr"
     # glued into words ("has-pr", "prüfen") must NOT trip the gate — only the
     # uppercase acronym PR/PRs counts (regression: "has-pr" was wrongly gated).
     r"|merge\w*|pull[- ]?request|(?-i:PR)s?\b|release\w*|ver[öo]ffentlich\w*)"
+)
+
+# Narrow terminal vocabulary for the card BODY. Only the UNAMBIGUOUS
+# deploy/go-live/smoke phrases — the ones that practically never occur
+# incidentally in prose — keep gating from a body mention. The promiscuous
+# merge/release/PR/veröffentlichen words are DELIBERATELY excluded here
+# (they gate via title or the structural legs instead). This preserves the
+# safety net for the dangerous "no deploy/go-live without Till's GO" class
+# (a card that names the deploy step only in its body) while ending the
+# false-positive where "…kein Merge ohne GO…" in a spec body parked the card.
+# ``deploy`` gates from a body only together with a nearby ``prod`` (Till's
+# "deploy…prod") — a bare "nach dem Deployment testen" must NOT trip it.
+_GO_GATE_BODY_RE = re.compile(
+    r"(?i)("
+    r"\bsmoke[- ]?tests?\b|\bsmoke\b"
+    r"|\bgo[- ]?live\b|\blive[- ]?(gang|schalt\w*|aktivierung)\b"
+    r"|\bproduction\b|\bprod[- ]?release\b"
+    r"|\bdeploy\w*[^\n]{0,40}?\bprod|\bprod\w*[^\n]{0,40}?\bdeploy"
+    r")"
 )
 
 
@@ -9898,10 +9922,17 @@ def _dispatch_once_locked(
         # 'unblocked'-Event macht die Karte spawnbar, statt sie erneut zu
         # parken. Der manuelle `hermes kanban claim` (kanban.py) umgeht das
         # Gate bewusst — ein Direkt-Claim IST das menschliche GO.
-        _go_text = f"{row['title'] or ''}\n{row['body'] or ''}"
+        # Title carries the full terminal vocabulary; the body only the
+        # narrow, unambiguous phrases (_GO_GATE_BODY_RE). Splitting the two
+        # ends the false-positive where a bare "…kein Merge ohne GO…" note in
+        # a spec body parked the card, while keeping the deploy/go-live safety
+        # net for a card that names the terminal step only in its body.
+        _title = row["title"] or ""
+        _body = row["body"] or ""
         _row_merge_group = row["merge_group"]
         _is_terminal_card = (
-            bool(_GO_GATE_RE.search(_go_text))
+            bool(_GO_GATE_RE.search(_title))
+            or bool(_GO_GATE_BODY_RE.search(_body))
             or _is_merger_profile(row_assignee)
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
         )

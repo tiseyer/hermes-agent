@@ -421,6 +421,72 @@ def test_go_gate_ignores_normal_cards(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, tid).assignee == "default"
 
 
+def test_go_gate_ignores_spec_card_with_merge_word_only_in_body(
+    kanban_home, all_assignees_spawnable,
+):
+    # The fixed false-positive (diagnosed live 2026-09-29): a spec card whose
+    # title has no terminal vocabulary but whose body carries the boundary
+    # note "kein Merge ohne Tills GO" was wrongly parked, because merge\w* was
+    # matched against title+body concatenated. The full regex now applies to
+    # the TITLE only; a bare "merge" in a body must NOT gate the card.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Spezifikation: chat_v2 Queue-API baureif festlegen",
+            body=(
+                "Nur eine Spezifikation erstellen. Grenze: kein Merge ohne "
+                "Tills GO. Kein Release, kein PR in diesem Schritt."
+            ),
+            assignee="alice",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == [tid]  # runs — no longer parked
+        assert kb.get_task(conn, tid).assignee == "alice"
+
+
+def test_go_gate_holds_deploy_card_with_terminal_phrase_only_in_body(
+    kanban_home, all_assignees_spawnable,
+):
+    # The safety net that title-only would have thrown away: a card whose
+    # title is ordinary but whose body names an unambiguous terminal action
+    # ("go-live auf prod") must STILL be parked. _GO_GATE_BODY_RE keeps the
+    # dangerous deploy/go-live/smoke class gated even from a body mention.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="chat_v2 Queue-API fertigstellen",
+            body="Letzter Schritt: go-live auf prod, danach Monitoring prüfen.",
+            assignee="hermes-coder",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        assert task.block_kind == "needs_input"
+
+
+def test_go_gate_holds_merge_card_with_merge_word_in_title(
+    kanban_home, all_assignees_spawnable,
+):
+    # Regression: a genuine merge card carrying "merge" in its TITLE is still
+    # gated after the title/body split (the merge class stays covered via
+    # title + the structural legs, only body-only mentions were dropped).
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="W3-05 nach main mergen",
+            body="Feature-Branch in main integrieren.",
+            assignee="alice",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        assert kb.get_task(conn, tid).assignee == "till"
+
+
 # ---------------------------------------------------------------------------
 # 5. Reviewer worktree isolation
 # ---------------------------------------------------------------------------
