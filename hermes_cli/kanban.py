@@ -57,9 +57,23 @@ def _fmt_task_line(t: kb.Task) -> str:
     tenant = f" [{t.tenant}]" if t.tenant else ""
     # Append the block reason as a compact suffix so `needs_input`
     # (waiting on a human) is distinguishable from a dependency/review
-    # block at a glance. Only blocked cards carry it; unblocked rows stay
-    # aligned on the 8-wide status column.
-    status = t.status + (f"[{t.block_kind}]" if t.block_kind else "")
+    # block at a glance. GATED on an actively-parked status: `block_kind`
+    # is deliberately NOT cleared when a card leaves `blocked` (unblock /
+    # recompute_ready auto-promotion preserve it as durable re-block
+    # metadata — see kanban_db.py unblock_task and the schema comment), so
+    # a live `ready`/`running` card can still carry a stale
+    # `block_kind='needs_input'`. Fusing that into `ready[needs_input]`
+    # made the manager misread a running card as "waiting on Till"; the
+    # suffix therefore only renders while the status justifies it. The
+    # column value stays in the DB (and visible in `show`/`--json`) — only
+    # this fused board token is suppressed. Unblocked rows stay aligned on
+    # the 8-wide status column.
+    suffix = (
+        f"[{t.block_kind}]"
+        if t.block_kind and t.status in ("blocked", "human")
+        else ""
+    )
+    status = t.status + suffix
     return f"{icon} {t.id}  {status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 

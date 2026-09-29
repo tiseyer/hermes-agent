@@ -614,10 +614,25 @@ def test_show_json_includes_block_kind(kanban_home):
     assert payload["task"]["block_kind"] is None
 
 
+def _make_sticky_blocked_card(kind="needs_input"):
+    """Create a card and block it via the real `block` verb.
+
+    A plain SQL status='blocked' stamp is NON-sticky (no `blocked` event), so
+    `ls` runs recompute_ready on read and auto-promotes it straight back to
+    `ready` — which is exactly the sticky-metadata state the display gate now
+    suppresses. To assert on a card that is genuinely `blocked` AT DISPLAY
+    TIME, the block must emit a `blocked` event so recompute leaves it alone.
+    """
+    import re
+    out = kc.run_slash("create 'blockkind demo' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"block {tid} review-required --kind {kind}")
+    return tid
+
+
 def test_ls_appends_block_kind_suffix(kanban_home):
-    # The suffix is status-agnostic ("<status>[<block_kind>]"); assert on the
-    # bracketed reason itself, not the status word (which recompute may flip).
-    _make_task_with_block_kind("needs_input")
+    # A genuinely (stickily) blocked card renders `blocked[needs_input]`.
+    _make_sticky_blocked_card("needs_input")
     assert "[needs_input]" in kc.run_slash("ls")
 
 
@@ -626,3 +641,56 @@ def test_ls_omits_suffix_when_block_kind_empty(kanban_home):
     listing = kc.run_slash("ls")
     # No bracketed block-reason suffix on a card without a block_kind.
     assert "[" not in listing
+
+
+# ---------------------------------------------------------------------------
+# Sticky block_kind: the suffix is gated on status, not on the column alone.
+#
+# `block_kind` is deliberately preserved across a transition OUT of `blocked`
+# (unblock_task / recompute_ready auto-promotion leave it set as durable
+# re-block metadata — kanban_db.py + schema comment). So a live `ready`/
+# `running` card can still carry `block_kind='needs_input'`. The board `ls`
+# suffix MUST NOT fuse that into `ready[needs_input]`, or the manager misreads
+# a running card as "waiting on Till" and falsely escalates it to the inbox.
+# ---------------------------------------------------------------------------
+
+def _make_task_with_status_and_block_kind(status, block_kind):
+    """Create a card and stamp an explicit (status, block_kind) pair.
+
+    Unlike ``_make_task_with_block_kind`` (which forces status='blocked'),
+    this models the sticky state: a non-``blocked`` card that still carries a
+    leftover ``block_kind`` because unblock/auto-promote did not clear it.
+    """
+    import re
+    out = kc.run_slash("create 'blockkind demo' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status=?, block_kind=? WHERE id=?",
+            (status, block_kind, tid),
+        )
+        conn.commit()
+    return tid
+
+
+def test_ls_omits_stale_suffix_when_ready(kanban_home):
+    # ready + leftover needs_input → the card still lists, but WITHOUT the
+    # misleading suffix (this is the manager-misread the gate closes).
+    tid = _make_task_with_status_and_block_kind("ready", "needs_input")
+    listing = kc.run_slash("ls")
+    assert tid in listing
+    assert "[needs_input]" not in listing
+
+
+def test_ls_omits_stale_suffix_when_running(kanban_home):
+    # running[needs_input] must not appear either — a claimed card is live.
+    tid = _make_task_with_status_and_block_kind("running", "needs_input")
+    listing = kc.run_slash("ls")
+    assert tid in listing
+    assert "[needs_input]" not in listing
+
+
+def test_ls_shows_suffix_when_human(kanban_home):
+    # `human` is an actively-parked (inbox) status → the suffix belongs there.
+    _make_task_with_status_and_block_kind("human", "needs_input")
+    assert "[needs_input]" in kc.run_slash("ls")
