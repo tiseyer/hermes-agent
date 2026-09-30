@@ -146,6 +146,15 @@ _USER_VERSION_HUMAN_STATUS = 1
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "review"}
 
+# Escalation category for a human/inbox card — what the card WANTS from Till, so
+# he can batch his work (all questions, then all sign-offs, then all blockers).
+# Set at the moment of escalation (``move_to_human`` / ``create_human_card`` for
+# the manager's SOUL step 5a) or when a terminal card is GO-gate parked
+# (``go_noetig``). ``None`` = an un-categorised card (legacy or non-escalation).
+# Mirrors the SOUL 5a discriminated cases: Blocker/Entscheidung/Abnahme are the
+# three native triggers; ``frage`` and ``go_noetig`` are the two additions.
+VALID_CATEGORIES = {"frage", "entscheidung", "abnahme", "blocker", "go_noetig"}
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -954,6 +963,13 @@ class Task:
     # ``human_check`` stays visible in a family but does not gate root done.
     # Legacy rows are ordinary work by default.
     child_role: str = "work"
+    # Column-dwell clock: epoch seconds of the last status transition. Feeds the
+    # inbox "wartet seit N Tagen" line (distinct from ``created_at`` = card age).
+    # Maintained by the ``stamp_status_changed_at_*`` + family-root triggers.
+    status_changed_at: Optional[int] = None
+    # Escalation category (VALID_CATEGORIES) or None — what the card wants from
+    # Till, for the inbox colour pill. Set at escalation / GO-gate time.
+    category: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1061,6 +1077,16 @@ class Task:
                 row["child_role"]
                 if "child_role" in keys and row["child_role"]
                 else "work"
+            ),
+            status_changed_at=(
+                row["status_changed_at"]
+                if "status_changed_at" in keys and row["status_changed_at"] is not None
+                else None
+            ),
+            category=(
+                row["category"]
+                if "category" in keys and row["category"]
+                else None
             ),
         )
 
@@ -1258,7 +1284,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- decomposed card. NULL means ordinary dependency semantics.
     family_root_id       TEXT,
     family_order         INTEGER,
-    child_role           TEXT NOT NULL DEFAULT 'work'
+    child_role           TEXT NOT NULL DEFAULT 'work',
+    -- Column-dwell clock: epoch seconds of the last real status transition
+    -- ("in dieser Spalte seit"). Set on INSERT (= created_at) and bumped on
+    -- every status change by the ``stamp_status_changed_at_*`` triggers and the
+    -- family-root trigger. Distinct from ``created_at`` (card age) — a card that
+    -- has waited 3 days in the inbox is more urgent than one moved there today.
+    status_changed_at    INTEGER,
+    -- Escalation category (one of VALID_CATEGORIES) or NULL. What a human/inbox
+    -- card wants from Till (Frage/Entscheidung/Abnahme/Blocker/GO nötig), set at
+    -- escalation time so the inbox can show a colour pill for batching.
+    category             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2110,6 +2146,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "child_role", "child_role TEXT NOT NULL DEFAULT 'work'"
         )
 
+    if "status_changed_at" not in cols:
+        added = _add_column_if_missing(
+            conn, "tasks", "status_changed_at", "status_changed_at INTEGER"
+        )
+        # Seed the column-dwell clock for legacy rows. The best available proxy
+        # for "entered current column" is ``created_at`` (there is no
+        # ``updated_at`` column, and it would jitter anyway). Without this
+        # backfill every pre-migration card would render "gerade eben". Guarded
+        # on ``created_at`` because migration-isolation callers can pass a
+        # partial ``tasks`` shape that omits it (see #21708 harness).
+        have_created_at = any(
+            row["name"] == "created_at"
+            for row in conn.execute("PRAGMA table_info(tasks)")
+        )
+        if added and have_created_at:
+            conn.execute(
+                "UPDATE tasks SET status_changed_at = created_at "
+                "WHERE status_changed_at IS NULL"
+            )
+
+    if "category" not in cols:
+        # Escalation category (VALID_CATEGORIES) or NULL for legacy/un-typed
+        # cards. Existing rows get NULL = un-categorised, correct for anything
+        # created before the inbox pills existed.
+        _add_column_if_missing(conn, "tasks", "category", "category TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2339,9 +2401,17 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
 
 
 def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
-    """Mirror the active work child's state onto a decomposed family root."""
-    state_sql = """
-        UPDATE tasks SET status = CASE
+    """Mirror the active work child's state onto a decomposed family root.
+
+    Also (re)installs the ``stamp_status_changed_at_*`` triggers that maintain
+    the column-dwell clock (``status_changed_at``). Both trigger families are
+    dropped and recreated on every ``init_db`` so a schema edit here reaches
+    every existing board on its next connect.
+    """
+    # The root-status CASE is used twice: once to assign ``status`` and once to
+    # decide whether ``status_changed_at`` should be bumped. Build it once so the
+    # two can never drift out of sync.
+    status_case = """CASE
           WHEN NOT EXISTS (SELECT 1 FROM tasks AS member
             WHERE member.family_root_id = NEW.family_root_id
               AND member.id != NEW.family_root_id AND member.child_role = 'work'
@@ -2374,12 +2444,24 @@ def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
             WHERE member.family_root_id = NEW.family_root_id
               AND member.id != NEW.family_root_id AND member.child_role = 'work'
               AND member.status = 'triage') THEN 'triage'
-          ELSE 'todo' END,
+          ELSE 'todo' END"""
+    # ``recursive_triggers`` is OFF (SQLite default), so this root-status UPDATE
+    # does NOT fire the generic ``stamp_status_changed_at_update`` trigger — the
+    # family-root path must stamp the clock itself. The bump is GUARDED: it only
+    # advances when the recomputed root status actually differs from the current
+    # one, so a member move that leaves the root's aggregate status unchanged
+    # does not reset the root's dwell clock (that would reintroduce the exact
+    # updated_at-style jitter we are avoiding).
+    state_sql = f"""
+        UPDATE tasks SET status = {status_case},
           completed_at = CASE WHEN NOT EXISTS (SELECT 1 FROM tasks AS member
             WHERE member.family_root_id = NEW.family_root_id
               AND member.id != NEW.family_root_id AND member.child_role = 'work'
               AND member.status != 'done') THEN CAST(strftime('%s', 'now') AS INTEGER)
-            ELSE NULL END
+            ELSE NULL END,
+          status_changed_at = CASE WHEN ({status_case}) IS NOT status
+            THEN CAST(strftime('%s', 'now') AS INTEGER)
+            ELSE status_changed_at END
         WHERE id = NEW.family_root_id;
     """
     conn.execute("DROP TRIGGER IF EXISTS sync_family_root_after_insert")
@@ -2392,6 +2474,28 @@ def _install_family_state_triggers(conn: sqlite3.Connection) -> None:
         "AFTER UPDATE OF status, child_role, family_root_id ON tasks "
         "WHEN NEW.family_root_id IS NOT NULL AND NEW.id != NEW.family_root_id BEGIN "
         + state_sql + " END;"
+    )
+
+    # Column-dwell clock (``status_changed_at``). Two DB-level stamps so NO code
+    # path — present or future, Python UPDATE or SQL trigger — can forget it:
+    #   * INSERT: seed the clock to ``created_at`` (the moment the card entered
+    #     its first column). Guarded on IS NULL so an explicit value survives.
+    #   * UPDATE OF status: bump to now whenever ``status`` actually changes.
+    # The inner UPDATE touches only ``status_changed_at`` (never ``status``), so
+    # it cannot re-fire the AFTER-UPDATE-OF-status trigger — no recursion even if
+    # ``recursive_triggers`` were ON.
+    conn.execute("DROP TRIGGER IF EXISTS stamp_status_changed_at_insert")
+    conn.execute("DROP TRIGGER IF EXISTS stamp_status_changed_at_update")
+    conn.executescript(
+        "CREATE TRIGGER stamp_status_changed_at_insert AFTER INSERT ON tasks "
+        "WHEN NEW.status_changed_at IS NULL BEGIN "
+        "UPDATE tasks SET status_changed_at = "
+        "COALESCE(NEW.created_at, CAST(strftime('%s','now') AS INTEGER)) "
+        "WHERE id = NEW.id; END;"
+        "CREATE TRIGGER stamp_status_changed_at_update AFTER UPDATE OF status ON tasks "
+        "WHEN NEW.status IS NOT OLD.status BEGIN "
+        "UPDATE tasks SET status_changed_at = CAST(strftime('%s','now') AS INTEGER) "
+        "WHERE id = NEW.id; END;"
     )
 
 
@@ -3095,6 +3199,7 @@ def create_human_card(
     created_by: Optional[str] = None,
     board: Optional[str] = None,
     tenant: Optional[str] = None,
+    category: Optional[str] = None,
 ) -> str:
     """Create a card in the ``human`` status — a task only a person (Till) resolves.
 
@@ -3125,6 +3230,10 @@ def create_human_card(
             f"kurzbeschreibung too long: {len(kurzbeschreibung)} > "
             f"{HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
             "(formulate a shorter description — it is not truncated)"
+        )
+    if category is not None and category not in VALID_CATEGORIES:
+        raise ValueError(
+            f"category must be one of {sorted(VALID_CATEGORIES)} or None"
         )
 
     # Born ``blocked`` (never a transient ``ready`` the dispatcher could grab),
@@ -3157,9 +3266,17 @@ def create_human_card(
                 "UPDATE tasks SET status = 'human' WHERE id = ?",
                 (task_id,),
             )
+        if category is not None:
+            # Category-only UPDATE — status is already 'human', so this does not
+            # re-fire the status stamp trigger.
+            conn.execute(
+                "UPDATE tasks SET category = ? WHERE id = ?",
+                (category, task_id),
+            )
         _append_event(
             conn, task_id, "human",
-            {"reason": "human card created", "family_root_id": family_root_id},
+            {"reason": "human card created", "family_root_id": family_root_id,
+             "category": category},
         )
     return task_id
 
@@ -3170,6 +3287,7 @@ def move_to_human(
     *,
     title: Optional[str] = None,
     kurzbeschreibung: Optional[str] = None,
+    category: Optional[str] = None,
     actor: Optional[str] = None,
 ) -> str:
     """Flip an EXISTING card's status to ``human`` — "Till must act on this".
@@ -3215,6 +3333,10 @@ def move_to_human(
             f"{HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
             "(formulate a shorter description — it is not truncated)"
         )
+    if category is not None and category not in VALID_CATEGORIES:
+        raise ValueError(
+            f"category must be one of {sorted(VALID_CATEGORIES)} or None"
+        )
 
     now = int(time.time())
     with write_txn(conn):
@@ -3252,13 +3374,17 @@ def move_to_human(
         if kurzbeschreibung is not None:
             sets.append("body = ?")
             params.append(kurzbeschreibung)
+        if category is not None:
+            sets.append("category = ?")
+            params.append(category)
         params.append(task_id)
         conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
         )
         _append_event(
             conn, task_id, "human",
-            {"reason": "escalated to human", "from": status, "actor": actor},
+            {"reason": "escalated to human", "from": status,
+             "category": category, "actor": actor},
         )
     return "moved"
 
@@ -9979,7 +10105,8 @@ def _dispatch_once_locked(
                     # to 'till' — the GO is the human re-assign + unblock.
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = 'till', "
-                        "status = 'blocked', block_kind = 'needs_input' "
+                        "status = 'blocked', block_kind = 'needs_input', "
+                        "category = 'go_noetig' "
                         "WHERE id = ? AND status = 'ready'",
                         (row["id"],),
                     )

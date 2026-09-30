@@ -33,7 +33,8 @@ _LEGACY_BOARD_CARD_KEYS = (
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id",
     "workflow_template_id", "current_step_key", "skills", "model_override",
     "max_retries", "goal_mode", "goal_max_turns", "session_id", "block_kind",
-    "block_recurrences", "parent_id", "initiative_id", "age", "latest_summary",
+    "block_recurrences", "parent_id", "initiative_id", "status_changed_at",
+    "category", "age", "latest_summary",
     "link_counts", "comment_count", "progress",
 )
 
