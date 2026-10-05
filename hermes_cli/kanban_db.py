@@ -3348,6 +3348,24 @@ def move_to_human(
             return "notfound"
         status = row["status"]
         if status == "human":
+            # S1 (2026-10, Inbox-Konzept): eine bereits wartende Karte bekommt
+            # ihre Kategorie nachgetragen, wenn eine andere uebergeben wird —
+            # sonst konnte der Manager Altkarten nie einordnen (alles "Offen").
+            # Ohne/mit gleicher Kategorie bleibt es ein reiner No-op.
+            if category is not None:
+                cur = conn.execute(
+                    "SELECT category FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()["category"]
+                if cur != category:
+                    conn.execute(
+                        "UPDATE tasks SET category = ? WHERE id = ?",
+                        (category, task_id),
+                    )
+                    _append_event(
+                        conn, task_id, "categorized",
+                        {"from": cur, "category": category, "actor": actor},
+                    )
+                    return "categorized"
             return "noop"
         if status in ("done", "archived"):
             return "terminal"
@@ -3387,6 +3405,105 @@ def move_to_human(
              "category": category, "actor": actor},
         )
     return "moved"
+
+
+def plan_human_step(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    after: Iterable[str],
+    category: Optional[str] = None,
+    title: Optional[str] = None,
+    kurzbeschreibung: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> str:
+    """Make a card a PLANNED Till step ("spaeter"): it waits on Till, but only
+    once its predecessors (``after``) are finished.
+
+    Inbox-Konzept (Till 2026-10): "Human-in-the-Loop" is not "needs Till NOW".
+    A planned step sits in ``todo`` with ``child_role='human_check'`` and
+    ``task_links`` to its predecessors; :func:`recompute_ready` turns it into
+    ``human`` (never ``ready`` — no agent is ever spawned for it) as soon as all
+    predecessors are ``done``/``archived``. If every predecessor is already
+    finished (or ``after`` is empty after filtering), the card is escalated to
+    ``human`` right away via :func:`move_to_human`.
+
+    Returns ``"planned"`` (deferred), or the :func:`move_to_human` outcome
+    (``"moved"``/``"noop"``/``"categorized"``), ``"notfound"``, ``"terminal"``,
+    ``"busy"`` (a worker currently runs the card — never yank it), or
+    ``"unknown_parent"`` (an ``after`` id does not exist; nothing written).
+    """
+    if category is not None and category not in VALID_CATEGORIES:
+        raise ValueError(
+            f"category must be one of {sorted(VALID_CATEGORIES)} or None"
+        )
+    if title is not None and (not title.strip() or len(title) > HUMAN_CARD_TITLE_MAX):
+        raise ValueError(
+            f"title must be 1..{HUMAN_CARD_TITLE_MAX} chars (not truncated)"
+        )
+    if kurzbeschreibung is not None and len(kurzbeschreibung) > HUMAN_CARD_KURZBESCHREIBUNG_MAX:
+        raise ValueError(
+            f"kurzbeschreibung too long: > {HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
+            "(not truncated)"
+        )
+    vorgaenger = [a for a in dict.fromkeys(str(x).strip() for x in after) if a and a != task_id]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return "notfound"
+        status = row["status"]
+        if status in ("done", "archived"):
+            return "terminal"
+        if status == "running":
+            return "busy"
+        offen = []
+        for pid in vorgaenger:
+            prow = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (pid,)
+            ).fetchone()
+            if prow is None:
+                return "unknown_parent"
+            if prow["status"] not in ("done", "archived"):
+                offen.append(pid)
+        if offen:
+            for pid in vorgaenger:
+                exists = conn.execute(
+                    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (pid, task_id),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (pid, task_id),
+                    )
+            sets = ["status = 'todo'", "child_role = 'human_check'"]
+            params: list = []
+            if category is not None:
+                sets.append("category = ?")
+                params.append(category)
+            if title is not None:
+                sets.append("title = ?")
+                params.append(title)
+            if kurzbeschreibung is not None:
+                sets.append("body = ?")
+                params.append(kurzbeschreibung)
+            params.append(task_id)
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
+            )
+            _append_event(
+                conn, task_id, "human_planned",
+                {"from": status, "after": offen, "category": category,
+                 "actor": actor},
+            )
+            return "planned"
+    # Nothing open to wait for -> Till is needed now.
+    return move_to_human(
+        conn, task_id, title=title, kurzbeschreibung=kurzbeschreibung,
+        category=category, actor=actor,
+    )
 
 
 def relabel_task(
@@ -4248,7 +4365,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, child_role "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4273,6 +4390,22 @@ def recompute_ready(
             # parents are already terminal. ``backlog`` is deliberately not
             # in ``todo_rows`` above, so no dispatcher sweep can activate it.
             if all(p["status"] in ("done", "archived") for p in parents):
+                if row["child_role"] == "human_check" and cur_status == "todo":
+                    # S1: a planned Till step whose predecessors are finished
+                    # is now due — it becomes ``human`` (Till's inbox), NEVER
+                    # ``ready`` (no worker may ever be spawned for it).
+                    conn.execute(
+                        "UPDATE tasks SET status = 'human' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (task_id,),
+                    )
+                    _append_event(
+                        conn, task_id, "human",
+                        {"reason": "geplanter Till-Schritt ist dran",
+                         "from": "todo"},
+                    )
+                    promoted += 1
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
