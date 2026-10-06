@@ -162,7 +162,9 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from tests.support.kanban_routing import seed_canonical
     kb._INITIALIZED_PATHS.clear()
+    seed_canonical(home)
     kb.init_db()
     conn = kb.connect()
     try:
