@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.support.kanban_routing import seed_canonical
 
 
 @pytest.fixture
@@ -25,6 +26,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Repo routing is operator config now; seed the canonical set so review
+    # handoffs route as before (see tests/support/kanban_routing).
+    seed_canonical(home)
     kb.init_db()
     return home
 

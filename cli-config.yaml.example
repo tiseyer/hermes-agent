@@ -1504,3 +1504,46 @@ updates:
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
 #     override_existing: true                       # resolved values win over existing env
+
+# =============================================================================
+# Kanban Repository Routing (multi-instance isolation)
+# =============================================================================
+# The orchestrator routes a card's coder/reviewer and its git integration
+# targets (base ref, merge target, PUSH TARGET) from a registry of repository
+# profiles. This registry is OPERATOR CONFIGURATION, declared here per instance.
+#
+# CRITICAL — fresh instances inherit NOTHING. With no ``kanban.repository_profiles``
+# block (the default, as shipped — this section is commented out), the registry
+# is EMPTY: the orchestrator resolves no profile, so a card can never be routed
+# or pushed to a git remote this instance was never told about. Each deployment
+# declares EXACTLY its own repositories. This is what keeps one codebase serving
+# many customer instances without leaking push targets across them — do NOT
+# paste another instance's profiles in unless they are genuinely this
+# instance's remotes.
+#
+# Every field under a profile is REQUIRED. A profile missing base_ref,
+# merge_target or push_target is a fail-closed error at resolution time (the
+# card is parked at needs_input), never a silent fallback to a local remote.
+#
+#   base_ref:     "<git-remote>/<branch>" the worker branches from (needs a "/")
+#   merge_target: "<branch>" the reviewer/merger integrates into
+#   push_target:  "<git-remote>" workers push branches to
+#   coder/reviewer: role-profile names (must exist as installed profiles)
+#   signatures:   optional aliases matched (case-insensitively, as substrings)
+#                 against a card's "Repository:/Repo:/Project:/Profile:" line.
+#                 A longer/more-specific alias always wins over a shorter one
+#                 it contains (e.g. "voicera-website" beats "voicera").
+#
+# kanban:
+#   repository_profiles:
+#     my-app:
+#       coder: my-app-coder
+#       reviewer: my-app-reviewer
+#       base_ref: origin/main
+#       merge_target: main
+#       push_target: origin
+#       signatures: ["my-app", "my_app"]
+#   # Tenant → reviewer fallback when a card has no explicit declaration and no
+#   # repository profile prefix matches its tenant. Optional; empty by default.
+#   tenant_reviewers:
+#     my-tenant: my-app-reviewer
