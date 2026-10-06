@@ -194,6 +194,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # Tills stehende Präferenzen (positive Weg-Defaults) — one shared file from
+    # the Hermes root, injected as its own slot directly after the role SOUL so
+    # every role sees the same standing values (quality over cost, follow-up
+    # cards = yes, pre-work = yes, four-eyes between agents not Till, reversible
+    # tech choices belong to the factory). Gated on the same condition as SOUL
+    # so cron/persona modes that carry an identity also carry the preferences.
+    if agent.load_soul_identity or not agent.skip_context_files:
+        _pref_content = _r.load_preferences_md(_ctx_len)
+        if _pref_content:
+            stable_parts.append(_pref_content)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
