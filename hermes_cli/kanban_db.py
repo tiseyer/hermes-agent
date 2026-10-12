@@ -10974,6 +10974,41 @@ def _dispatch_once_locked(
             continue
         try:
             repository_profile = resolve_task_repository_profile(conn, claimed.id)
+            # F18 backstop: last dispatcher-scope gate before done. A review
+            # card that is STILL 'scratch' means the coder-side worktree
+            # upgrade never recorded a branch on it — the handoff-tool upgrade
+            # runs in a worker whose scoped HERMES_HOME can't see
+            # tenant_workdirs (see F14 note above), and the coder-claim upgrade
+            # (F17) can itself be missed (worker-scope config, a stale import,
+            # a respawn). The implementation nonetheless lives on the coder's
+            # conventional branch wt/<id>, pushed to the profile remote — the
+            # coder's review-block note names it, and _resolve_review_worktree_
+            # workspace already defaults to wt/<id>. Record it HERE, in the
+            # dispatcher (root config, so _tenant_workdir_map is populated),
+            # which every coder card crosses on its way to the reviewer. This
+            # gives the card branch_name for the Done-Abnahme (Beobachter
+            # Regel-a / branch) and anchors the reviewer worktree at the pushed
+            # branch instead of the untouched base_ref ("done ohne vollständige
+            # Abnahme"). Gated on a configured tenant checkout (operator opt-in,
+            # exactly the repo-coder tenants that push a branch); absent → card
+            # stays scratch (legacy, no branch expected). If the branch was not
+            # actually pushed, the review-worktree fetch below fails loudly and
+            # the card blocks honestly — no fake-green.
+            if claimed.workspace_kind == "scratch":
+                _rv_workdir = _tenant_workdir_map().get(
+                    (claimed.tenant or "").strip().lower()
+                )
+                if _rv_workdir:
+                    set_workspace_kind(conn, claimed.id, "worktree")
+                    if not (claimed.workspace_path or "").strip():
+                        set_workspace_path(conn, claimed.id, _rv_workdir)
+                    set_branch_name(
+                        conn, claimed.id,
+                        (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                    )
+                    _reloaded = get_task(conn, claimed.id)
+                    if _reloaded is not None:
+                        claimed = _reloaded
             if claimed.workspace_kind == "worktree":
                 # Reviewer isolation: NEVER reuse the coder's worktree.
                 # Materialize a separate  <repo>/.worktrees/<id>-review
