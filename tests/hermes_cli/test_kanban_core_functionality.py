@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
+from tests.support.kanban_routing import seed_canonical
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,9 @@ def kanban_home(tmp_path, monkeypatch):
     # written against. The grace-period itself is covered by dedicated
     # tests in tests/hermes_cli/test_kanban_db.py.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # Repo routing is operator config now; seed the canonical set so the
+    # structured-repository CLI test resolves as before.
+    seed_canonical(home)
     kb.init_db()
     return home
 

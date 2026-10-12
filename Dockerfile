@@ -135,8 +135,14 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
+# Playwright is NOT a declared dependency (it comes in via the browser
+# tooling at runtime), so a bare `npx playwright install` would download
+# whatever version is latest on npm at build time — two builds could ship
+# different Chromium shells. Pin the version explicitly here so the image is
+# reproducible. Bump this single literal to upgrade Playwright/Chromium.
+ARG PLAYWRIGHT_VERSION=1.63.0
 RUN npm install --prefer-offline --no-audit && \
-    npx playwright install --with-deps chromium --only-shell && \
+    npx playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium --only-shell && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------

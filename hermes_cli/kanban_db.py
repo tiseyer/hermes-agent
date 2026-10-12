@@ -2863,7 +2863,7 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     if repository is not None:
         repository = str(repository).strip().lower()
-        if repository not in _REPOSITORY_PROFILES:
+        if repository not in _repository_profiles():
             repository = _repository_profile_prefix(f"Repository: {repository}", None)
         if repository is None:
             raise ValueError("repository must name a configured repository profile")
@@ -3348,6 +3348,24 @@ def move_to_human(
             return "notfound"
         status = row["status"]
         if status == "human":
+            # S1 (2026-10, Inbox-Konzept): eine bereits wartende Karte bekommt
+            # ihre Kategorie nachgetragen, wenn eine andere uebergeben wird —
+            # sonst konnte der Manager Altkarten nie einordnen (alles "Offen").
+            # Ohne/mit gleicher Kategorie bleibt es ein reiner No-op.
+            if category is not None:
+                cur = conn.execute(
+                    "SELECT category FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()["category"]
+                if cur != category:
+                    conn.execute(
+                        "UPDATE tasks SET category = ? WHERE id = ?",
+                        (category, task_id),
+                    )
+                    _append_event(
+                        conn, task_id, "categorized",
+                        {"from": cur, "category": category, "actor": actor},
+                    )
+                    return "categorized"
             return "noop"
         if status in ("done", "archived"):
             return "terminal"
@@ -3387,6 +3405,105 @@ def move_to_human(
              "category": category, "actor": actor},
         )
     return "moved"
+
+
+def plan_human_step(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    after: Iterable[str],
+    category: Optional[str] = None,
+    title: Optional[str] = None,
+    kurzbeschreibung: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> str:
+    """Make a card a PLANNED Till step ("spaeter"): it waits on Till, but only
+    once its predecessors (``after``) are finished.
+
+    Inbox-Konzept (Till 2026-10): "Human-in-the-Loop" is not "needs Till NOW".
+    A planned step sits in ``todo`` with ``child_role='human_check'`` and
+    ``task_links`` to its predecessors; :func:`recompute_ready` turns it into
+    ``human`` (never ``ready`` — no agent is ever spawned for it) as soon as all
+    predecessors are ``done``/``archived``. If every predecessor is already
+    finished (or ``after`` is empty after filtering), the card is escalated to
+    ``human`` right away via :func:`move_to_human`.
+
+    Returns ``"planned"`` (deferred), or the :func:`move_to_human` outcome
+    (``"moved"``/``"noop"``/``"categorized"``), ``"notfound"``, ``"terminal"``,
+    ``"busy"`` (a worker currently runs the card — never yank it), or
+    ``"unknown_parent"`` (an ``after`` id does not exist; nothing written).
+    """
+    if category is not None and category not in VALID_CATEGORIES:
+        raise ValueError(
+            f"category must be one of {sorted(VALID_CATEGORIES)} or None"
+        )
+    if title is not None and (not title.strip() or len(title) > HUMAN_CARD_TITLE_MAX):
+        raise ValueError(
+            f"title must be 1..{HUMAN_CARD_TITLE_MAX} chars (not truncated)"
+        )
+    if kurzbeschreibung is not None and len(kurzbeschreibung) > HUMAN_CARD_KURZBESCHREIBUNG_MAX:
+        raise ValueError(
+            f"kurzbeschreibung too long: > {HUMAN_CARD_KURZBESCHREIBUNG_MAX} chars "
+            "(not truncated)"
+        )
+    vorgaenger = [a for a in dict.fromkeys(str(x).strip() for x in after) if a and a != task_id]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return "notfound"
+        status = row["status"]
+        if status in ("done", "archived"):
+            return "terminal"
+        if status == "running":
+            return "busy"
+        offen = []
+        for pid in vorgaenger:
+            prow = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (pid,)
+            ).fetchone()
+            if prow is None:
+                return "unknown_parent"
+            if prow["status"] not in ("done", "archived"):
+                offen.append(pid)
+        if offen:
+            for pid in vorgaenger:
+                exists = conn.execute(
+                    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (pid, task_id),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (pid, task_id),
+                    )
+            sets = ["status = 'todo'", "child_role = 'human_check'"]
+            params: list = []
+            if category is not None:
+                sets.append("category = ?")
+                params.append(category)
+            if title is not None:
+                sets.append("title = ?")
+                params.append(title)
+            if kurzbeschreibung is not None:
+                sets.append("body = ?")
+                params.append(kurzbeschreibung)
+            params.append(task_id)
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
+            )
+            _append_event(
+                conn, task_id, "human_planned",
+                {"from": status, "after": offen, "category": category,
+                 "actor": actor},
+            )
+            return "planned"
+    # Nothing open to wait for -> Till is needed now.
+    return move_to_human(
+        conn, task_id, title=title, kurzbeschreibung=kurzbeschreibung,
+        category=category, actor=actor,
+    )
 
 
 def relabel_task(
@@ -4248,7 +4365,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, child_role "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4273,6 +4390,22 @@ def recompute_ready(
             # parents are already terminal. ``backlog`` is deliberately not
             # in ``todo_rows`` above, so no dispatcher sweep can activate it.
             if all(p["status"] in ("done", "archived") for p in parents):
+                if row["child_role"] == "human_check" and cur_status == "todo":
+                    # S1: a planned Till step whose predecessors are finished
+                    # is now due — it becomes ``human`` (Till's inbox), NEVER
+                    # ``ready`` (no worker may ever be spawned for it).
+                    conn.execute(
+                        "UPDATE tasks SET status = 'human' "
+                        "WHERE id = ? AND status = 'todo'",
+                        (task_id,),
+                    )
+                    _append_event(
+                        conn, task_id, "human",
+                        {"reason": "geplanter Till-Schritt ist dran",
+                         "from": "todo"},
+                    )
+                    promoted += 1
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -6320,7 +6453,7 @@ def block_task(
             _pair = resolve_task_repo_profiles(conn, task_id)
             reviewer = (
                 _pair[1] if _pair
-                else _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+                else _tenant_reviewer_map().get(task_tenant, "reviewer")
             )
             cur_assignee = (
                 cur_row["assignee"] if "assignee" in cur_row.keys() else None
@@ -9282,12 +9415,12 @@ def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "unblocked"
 
 
-# Tenant → reviewer profile routing. Used by the review block path and
-# the loop-detection diagnosis routing so both always agree.
-_TENANT_REVIEWER_MAP = {
-    "goya": "goya-reviewer",
-    "voicera": "voicera-reviewer",
-}
+# Tenant → reviewer profile routing and the repository profile registry are
+# OPERATOR CONFIGURATION, not code. They are loaded from the ``kanban:`` block
+# of config.yaml via _load_routing_config() (defined below, after the
+# RepositoryProfile dataclass). A fresh instance with no such config inherits
+# an EMPTY registry and therefore cannot route or push any card to a foreign
+# git remote (fail-closed). See the loader for the full rationale.
 
 # ---------------------------------------------------------------------------
 # Repo → role-profile resolution (goal decompose-repo-routing, Aug 2026)
@@ -9322,98 +9455,153 @@ class RepositoryProfileError(ValueError):
     """A declared repository card cannot be safely integrated as configured."""
 
 
-# Repository profiles are the single source for both role routing and git
-# integration.  A task declaration is intentionally resolved to one of these
-# profiles rather than inferring base/target branches from its local clone.
-_REPOSITORY_PROFILES = {
-    "hermes": RepositoryProfile(
-        name="hermes",
-        coder="hermes-coder",
-        reviewer="hermes-reviewer",
-        base_ref="fork/main",
-        merge_target="main",
-        # upstream (origin) is NousResearch, read-only; workers push to the
-        # personal fork (tiseyer/hermes-agent). See fork-push rule 3be97e69f5.
-        push_target="fork",
-    ),
-    "goya": RepositoryProfile(
-        name="goya",
-        coder="goya-coder",
-        reviewer="goya-reviewer",
-        base_ref="origin/develop",
-        merge_target="develop",
-        push_target="origin",
-    ),
-    "voicera": RepositoryProfile(
-        name="voicera",
-        coder="voicera-coder",
-        reviewer="voicera-reviewer",
-        base_ref="origin/develop",
-        merge_target="develop",
-        push_target="origin",
-    ),
-    # ams-erp: main-based, no develop branch (verified via ls-remote against
-    # git@github-ams-erp:tiseyer/ams-erp.git, 2026-09-24 — only main + feature
-    # branches exist). Values confirmed by Till.
-    "ams-erp": RepositoryProfile(
-        name="ams-erp",
-        coder="ams-erp-coder",
-        reviewer="ams-erp-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-    # voicera-website: production website, main-based, no develop branch
-    # (verified via ls-remote against tiseyer/voicera-website, 2026-09-24 —
-    # only main + feature/wartungsseite exist). main IS production; confirmed
-    # by Till. NOTE: site is currently behind a Wartungsseite — merges to
-    # main happen ONLY with an explicit per-card Till GO, and this profile
-    # must be re-checked before the public launch.
-    "voicera-website": RepositoryProfile(
-        name="voicera-website",
-        coder="voicera-website-coder",
-        reviewer="voicera-website-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-    # life-os: Vercel-hosted, main = production, feature branches = preview
-    # (Till, 2026-09-24). ls-remote git@github-life-os:tiseyer/life-os.git
-    # shows main + develop; the main-based Vercel flow is the chosen model
-    # (develop exists but is intentionally not the integration target here).
-    "life-os": RepositoryProfile(
-        name="life-os",
-        coder="life-os-coder",
-        reviewer="life-os-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-}
+# Repository profiles + the tenant→reviewer map are the single source for role
+# routing and git integration, but they are OPERATOR CONFIGURATION, not code.
+# They are read from the ``kanban:`` block of config.yaml so that:
+#   * a fresh instance (no kanban config) inherits NOTHING — resolve_* returns
+#     no profile, the card keeps its caller's legacy fallback, and no card can
+#     be routed or pushed to a remote this instance was never told about
+#     (DSGVO multi-instance isolation — see cli-config.yaml.example);
+#   * one codebase serves many customer instances, each declaring exactly its
+#     own repositories, without ever leaking push targets across them.
+#
+# Schema (every profile field is required; omitting one is a fail-closed error
+# surfaced by _validated_repository_profile at resolution time, NOT a silent
+# fallback to the local clone's origin/HEAD):
+#
+#   kanban:
+#     repository_profiles:
+#       <name>:
+#         coder: <role-profile>
+#         reviewer: <role-profile>
+#         base_ref: <remote>/<branch>
+#         merge_target: <branch>
+#         push_target: <remote>
+#         signatures: ["alias-1", "alias-2", ...]   # optional, matched in card text
+#     tenant_reviewers:
+#       <tenant>: <reviewer-profile>
 
-# Known role-profile prefixes for tenant defaults (v1, extendable).
-_REPO_PROFILE_PREFIXES = tuple(_REPOSITORY_PROFILES)
 
-# Signature → profile prefix, matched (case-insensitively) against the VALUE
-# of an explicit declaration line. Ordered longest-first so "hermes-agent"
-# style signatures win over any shorter overlap.
-_REPO_SIGNATURE_MAP = (
-    ("hermes-agent-framework", "hermes"),
-    (".hermes/hermes-agent", "hermes"),
-    ("hermes-agent", "hermes"),
-    ("hermes_agent", "hermes"),
-    ("ams-erp", "ams-erp"),
-    ("ams_erp", "ams-erp"),
-    ("life-os", "life-os"),
-    ("life_os", "life-os"),
-    # voicera-website MUST precede the bare "voicera" signature so a website
-    # declaration does not collapse into the voicera-os profile.
-    ("voicera-website", "voicera-website"),
-    ("voicera-os", "voicera"),
-    ("voicera", "voicera"),
-    ("goya-v2", "goya"),
-    ("goya", "goya"),
-)
+@dataclass(frozen=True)
+class _RoutingConfig:
+    """Resolved routing tables derived from one instance's config.yaml."""
+
+    profiles: dict[str, RepositoryProfile]
+    tenant_reviewers: dict[str, str]
+    signature_map: tuple[tuple[str, str], ...]
+    prefixes: tuple[str, ...]
+
+
+# Memoized per config path. load_config() is itself mtime-cached, but rebuilding
+# the dataclasses + signature ordering on every resolve would still show up in
+# the dispatch hot loop, so the derived tables are cached here. Keyed on the
+# config path (not a bare singleton) so a profile switch — which repoints
+# get_config_path() at profiles/<name>/config.yaml — serves that profile's
+# routing and never another's. _reset_routing_config_cache() drops the cache
+# for tests (and any caller) that rewrite config.yaml in place.
+_ROUTING_CONFIG_CACHE: dict[str, _RoutingConfig] = {}
+
+
+def _load_routing_config() -> _RoutingConfig:
+    """Build (and memoize) the repository/tenant routing tables from config.yaml.
+
+    Default when the ``kanban:`` block (or the whole config) is absent or
+    unreadable: EMPTY tables. An instance that was never configured routes
+    nothing — the non-negotiable fail-closed default for multi-instance
+    isolation.
+    """
+    from hermes_cli.config import get_config_path, load_config
+
+    try:
+        cache_key = str(get_config_path())
+    except Exception:
+        cache_key = ""
+    cached = _ROUTING_CONFIG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban") or {}
+
+    raw_profiles = kanban_cfg.get("repository_profiles") or {}
+    profiles: dict[str, RepositoryProfile] = {}
+    signatures: list[tuple[str, str]] = []
+    if isinstance(raw_profiles, dict):
+        for raw_name, spec in raw_profiles.items():
+            if not isinstance(spec, dict):
+                continue
+            name = str(raw_name).strip().lower()
+            if not name:
+                continue
+            profiles[name] = RepositoryProfile(
+                name=name,
+                coder=str(spec.get("coder", "") or "").strip(),
+                reviewer=str(spec.get("reviewer", "") or "").strip(),
+                base_ref=str(spec.get("base_ref", "") or "").strip(),
+                merge_target=str(spec.get("merge_target", "") or "").strip(),
+                push_target=str(spec.get("push_target", "") or "").strip(),
+            )
+            raw_sigs = spec.get("signatures") or []
+            if isinstance(raw_sigs, str):
+                raw_sigs = [raw_sigs]
+            if isinstance(raw_sigs, (list, tuple)):
+                for sig in raw_sigs:
+                    sig_norm = str(sig).strip().lower()
+                    if sig_norm:
+                        signatures.append((sig_norm, name))
+
+    # Longest-first precedence: a specific alias ("voicera-website") must be
+    # matched before a shorter substring ("voicera"). Any string that CONTAINS
+    # another is strictly longer than it, so ordering by descending length
+    # reproduces the hand-tuned precedence of the legacy map exactly; the
+    # secondary key keeps the order deterministic across equal lengths.
+    signatures.sort(key=lambda item: (-len(item[0]), item[0]))
+
+    raw_reviewers = kanban_cfg.get("tenant_reviewers") or {}
+    tenant_reviewers: dict[str, str] = {}
+    if isinstance(raw_reviewers, dict):
+        for raw_t, raw_r in raw_reviewers.items():
+            tenant = str(raw_t).strip().lower()
+            reviewer = str(raw_r).strip()
+            if tenant and reviewer:
+                tenant_reviewers[tenant] = reviewer
+
+    result = _RoutingConfig(
+        profiles=profiles,
+        tenant_reviewers=tenant_reviewers,
+        signature_map=tuple(signatures),
+        prefixes=tuple(profiles),
+    )
+    _ROUTING_CONFIG_CACHE[cache_key] = result
+    return result
+
+
+def _reset_routing_config_cache() -> None:
+    """Drop the memoized routing tables (test hook / post-config-edit)."""
+    _ROUTING_CONFIG_CACHE.clear()
+
+
+def _repository_profiles() -> dict[str, RepositoryProfile]:
+    """Repository profile registry for the active instance (empty if unset)."""
+    return _load_routing_config().profiles
+
+
+def _tenant_reviewer_map() -> dict[str, str]:
+    """Tenant → reviewer-profile map for the active instance (empty if unset)."""
+    return _load_routing_config().tenant_reviewers
+
+
+def _repo_signature_map() -> tuple[tuple[str, str], ...]:
+    """Signature → profile prefix pairs, longest-first (empty if unset)."""
+    return _load_routing_config().signature_map
+
+
+def _repo_profile_prefixes() -> tuple[str, ...]:
+    """Known profile prefixes for tenant defaults (empty if unset)."""
+    return _load_routing_config().prefixes
 
 # Declaration lines. Leading markdown litter ("- ", "> ", "* ") is allowed;
 # the keyword must start the line so prose mentions ("wir sollten das repo
@@ -9447,16 +9635,16 @@ def _declared_repository_profile(text: Optional[str]) -> Optional[RepositoryProf
         if role_hit:
             prefix = role_hit.group(1)
         else:
-            for sig, sig_prefix in _REPO_SIGNATURE_MAP:
+            for sig, sig_prefix in _repo_signature_map():
                 if sig in low:
                     prefix = sig_prefix
                     break
-        if prefix is None or prefix not in _REPOSITORY_PROFILES:
+        if prefix is None or prefix not in _repository_profiles():
             raise RepositoryProfileError(
                 f"explicit repository declaration {val.strip()!r} does not name "
                 "a configured repository profile"
             )
-        resolved = _validated_repository_profile(_REPOSITORY_PROFILES[prefix])
+        resolved = _validated_repository_profile(_repository_profiles()[prefix])
         if declared is not None and declared.name != resolved.name:
             raise RepositoryProfileError(
                 "conflicting explicit repository declarations: "
@@ -9471,7 +9659,7 @@ def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Op
     declared = _declared_repository_profile(text)
     if declared is not None:
         return declared.name
-    return tenant if tenant in _REPOSITORY_PROFILES else None
+    return tenant if tenant in _repository_profiles() else None
 
 
 def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfile:
@@ -9493,7 +9681,7 @@ def _repository_profile_from_name(name: Optional[str]) -> Optional[RepositoryPro
     """Resolve a stored canonical repository name without tenant fallback."""
     if not name:
         return None
-    profile = _REPOSITORY_PROFILES.get(name)
+    profile = _repository_profiles().get(name)
     if profile is None:
         return None
     return _validated_repository_profile(profile)
@@ -9511,7 +9699,7 @@ def resolve_repository_profile(
     prefix = _repository_profile_prefix(text, tenant)
     if prefix is None:
         return None
-    profile = _REPOSITORY_PROFILES.get(prefix)
+    profile = _repository_profiles().get(prefix)
     if profile is None:
         return None
     return _validated_repository_profile(profile)
@@ -9583,7 +9771,7 @@ def resolve_repo_profiles(
                 f"{pair[0]!r} and {pair[1]!r}"
             )
         return (pair[0], pair[1], "declared")
-    if tenant and tenant in _REPO_PROFILE_PREFIXES:
+    if tenant and tenant in _repo_profile_prefixes():
         return (f"{tenant}-coder", f"{tenant}-reviewer", "tenant")
     return None
 
@@ -10381,7 +10569,7 @@ def _dispatch_once_locked(
                     continue
                 reviewer = (
                     _pair[1] if _pair
-                    else _TENANT_REVIEWER_MAP.get(
+                    else _tenant_reviewer_map().get(
                         _loop_task.tenant if _loop_task else None, "reviewer",
                     )
                 )

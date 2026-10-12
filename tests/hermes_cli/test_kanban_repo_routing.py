@@ -15,6 +15,12 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.support.kanban_routing import (
+    CANONICAL_TENANT_REVIEWERS,
+    profiles_with_override as _profiles_with_override,
+    seed_canonical,
+    write_kanban_routing_config as _write_kanban_config,
+)
 
 
 @pytest.fixture
@@ -23,6 +29,11 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Routing is operator config now; seed the canonical six so the behavioral
+    # assertions below exercise exactly what the hardcoded registry used to
+    # provide. The fail-closed empty default lives in
+    # test_kanban_repo_profiles_isolation.py.
+    seed_canonical(home)
     kb.init_db()
     return home
 
@@ -196,21 +207,13 @@ def test_ams_erp_uses_main_never_develop(kanban_home):
 
 
 def test_repository_profile_missing_push_target_fails_closed(
-    kanban_home, role_profiles_exist, monkeypatch,
+    kanban_home, role_profiles_exist,
 ):
     """An empty push_target is a fail-closed config error, like base_ref."""
-    profile = kb._REPOSITORY_PROFILES["hermes"]
-    monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
-        "hermes",
-        kb.RepositoryProfile(
-            name=profile.name,
-            coder=profile.coder,
-            reviewer=profile.reviewer,
-            base_ref=profile.base_ref,
-            merge_target=profile.merge_target,
-            push_target="",
-        ),
+    _write_kanban_config(
+        kanban_home,
+        _profiles_with_override("hermes", push_target=""),
+        CANONICAL_TENANT_REVIEWERS,
     )
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -225,26 +228,20 @@ def test_repository_profile_missing_push_target_fails_closed(
 
 
 def test_all_registered_profiles_have_push_target(kanban_home):
-    """Every profile in the registry carries a non-empty push_target."""
-    for name, profile in kb._REPOSITORY_PROFILES.items():
+    """Every profile in the configured registry carries a push_target."""
+    profiles = kb._repository_profiles()
+    assert profiles, "canonical profiles should be configured in this fixture"
+    for name, profile in profiles.items():
         assert profile.push_target.strip(), f"{name} missing push_target"
 
 
 def test_repository_profile_missing_required_field_fails_closed(
-    kanban_home, role_profiles_exist, monkeypatch,
+    kanban_home, role_profiles_exist,
 ):
-    profile = kb._REPOSITORY_PROFILES["hermes"]
-    monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
-        "hermes",
-        kb.RepositoryProfile(
-            name=profile.name,
-            coder=profile.coder,
-            reviewer=profile.reviewer,
-            base_ref="",
-            merge_target=profile.merge_target,
-            push_target=profile.push_target,
-        ),
+    _write_kanban_config(
+        kanban_home,
+        _profiles_with_override("hermes", base_ref=""),
+        CANONICAL_TENANT_REVIEWERS,
     )
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -263,21 +260,13 @@ def test_repository_profile_missing_required_field_fails_closed(
 
 
 def test_dispatch_blocks_for_missing_repository_profile_field(
-    kanban_home, role_profiles_exist, monkeypatch, tmp_path,
+    kanban_home, role_profiles_exist, tmp_path,
 ):
     """A malformed declared profile is needs_input, never a retry/default."""
-    profile = kb._REPOSITORY_PROFILES["hermes"]
-    monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
-        "hermes",
-        kb.RepositoryProfile(
-            name=profile.name,
-            coder=profile.coder,
-            reviewer=profile.reviewer,
-            base_ref=profile.base_ref,
-            merge_target="",
-            push_target=profile.push_target,
-        ),
+    _write_kanban_config(
+        kanban_home,
+        _profiles_with_override("hermes", merge_target=""),
+        CANONICAL_TENANT_REVIEWERS,
     )
     with kb.connect() as conn:
         task_id = kb.create_task(

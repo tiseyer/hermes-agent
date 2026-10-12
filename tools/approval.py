@@ -616,7 +616,7 @@ DANGEROUS_PATTERNS = [
     (r'\bmkfs\b', "format filesystem"),
     (r'\bdd\s+.*if=', "disk copy"),
     (r'>\s*/dev/sd', "write to block device"),
-    (r'\bDROP\s+(TABLE|DATABASE)\b', "SQL DROP"),
+    (r'\bDROP\s+(TABLE|DATABASE|SCHEMA)\b', "SQL DROP"),
     # Use [^\n]* instead of .* so DOTALL mode does not cause a WHERE clause on the
     # *next* line to satisfy the negative lookahead, silently allowing DELETE without WHERE.
     (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
@@ -814,6 +814,39 @@ DANGEROUS_PATTERNS = [
     # into a single -X token. Catches the same threat class.
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
+    # =====================================================================
+    # Prod-Wand (2026-09-29): the three irreversible actions that must sit
+    # behind a hard wall no matter which agent triggers them via which path
+    # (hermes_chat tunnel included). These are DETECTION patterns; the
+    # _ALWAYS_ESCALATE_DESCRIPTIONS set below ensures they can never be
+    # silently auto-approved by the smart aux LLM (which treats "git
+    # operations" as inherently safe) — they always reach a real human
+    # prompt. Still approvable (NOT a hardline block).
+    # =====================================================================
+    # 1. Merge to main — every route: gh pr merge, gh api merge, push to
+    #    a protected branch. Force-push is already gated above (763/764);
+    #    this adds the NON-force push whose destination ref is
+    #    main/master/develop. Feature-branch pushes do NOT match (the
+    #    lookahead requires the protected name as a full destination token,
+    #    so `develop-ui`, `mainline`, `feature/develop-fix` stay open).
+    (r'\bgh\s+pr\s+merge\b', "gh pr merge (PR-Merge in Basis-Branch)"),
+    (r'\bgh\s+api\b[^;|&\n]*(?:pulls/\S+/merge|/merges\b|mergepullrequest)',
+     "gh api PR/Branch-Merge (REST/GraphQL)"),
+    (r'\bgit\s+push\b[^;|&\n]*?[\s:](?:main|master|develop)(?=[\s;|&\'"`)]|$)',
+     "git push nach main/master/develop (Merge in geteilten Branch)"),
+    # 2. Deploy to prod — docker compose up/build. Scoped to PROD by
+    #    EXCLUDING the staging/preview compose projects (voicera-staging*,
+    #    voicera-preview*, preview-*), NOT by an ssh-prefix — because the
+    #    terminal tool can run compose on prod through an ssh backend with
+    #    no `ssh voiceraos` prefix in the command string. The legitimate
+    #    staging/preview deploys go through staging.sh/preview.sh wrappers,
+    #    which never expose a literal `docker compose up` in the command.
+    (r'\bdocker\s+compose\b(?![^;|&\n]*(?:voicera-staging|voicera-preview|preview-))[^;|&\n]*\b(?:up|build)\b',
+     "docker compose up/build (Prod-Deploy; Staging/Preview ausgenommen)"),
+    # 3. Destructive on prod — SQL DROP is gated above (DROP TABLE/DATABASE/
+    #    SCHEMA); this adds the dropdb CLI wrapper. rm/force-push/compose
+    #    down|stop|kill are already gated above and match ssh-wrapped too.
+    (r'\bdropdb\b', "dropdb (Postgres-DB-Drop CLI)"),
 ]
 
 
@@ -822,6 +855,23 @@ DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
 ]
+
+
+# Prod-Wand (2026-09-29): descriptions of the irreversible actions that must
+# ALWAYS reach a human — never silently auto-approved by the smart-approval
+# aux LLM. Keyed on the DANGEROUS_PATTERNS description string (== pattern_key
+# for these entries). When any matched warning is in this set, the smart
+# assessment is skipped and the command falls through to the real approval
+# prompt. This is deliberately a gate-to-human, NOT a hardline block: Till can
+# still approve at the prompt. No per-agent exceptions — the wall applies to
+# every agent (the merger included) regardless of the path it came through.
+_ALWAYS_ESCALATE_DESCRIPTIONS = {
+    "gh pr merge (PR-Merge in Basis-Branch)",
+    "gh api PR/Branch-Merge (REST/GraphQL)",
+    "git push nach main/master/develop (Merge in geteilten Branch)",
+    "docker compose up/build (Prod-Deploy; Staging/Preview ausgenommen)",
+    "dropdb (Postgres-DB-Drop CLI)",
+}
 
 
 def _legacy_pattern_key(pattern: str) -> str:
@@ -2998,6 +3048,28 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
+        # Prod-Wand (2026-09-29): the three irreversible actions must NEVER run
+        # without a human — no matter the process topology or EXEC_ASK state. In
+        # a non-interactive context there is nobody to approve, so fail CLOSED
+        # rather than the historical fail-open below. This binds the guarantee to
+        # the ACTION, not the deployment context (Stufe 2 of the prod wall).
+        _pw_is_d, _pw_pk, _pw_desc = detect_dangerous_command(command)
+        if _pw_is_d and _pw_desc in _ALWAYS_ESCALATE_DESCRIPTIONS:
+            logger.warning(
+                "Prod-Wand: BLOCKED (fail-closed) irreversible action with no "
+                "human present: %s (%s)", _pw_desc, command[:120],
+            )
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED (Prod-Wand): {_pw_desc}. This irreversible action "
+                    "requires explicit human approval, but no interactive user, "
+                    "gateway, or ask-context is present to grant it. Do NOT retry "
+                    "or rephrase — run it from a session where the owner can approve."
+                ),
+                "pattern_key": _pw_pk,
+                "description": _pw_desc,
+            }
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -3142,7 +3214,14 @@ def check_all_command_guards(command: str, env_type: str,
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    # Prod-Wand (2026-09-29): the three irreversible actions must always reach
+    # a human. Skip the smart aux-LLM assessment for them (it would treat merge
+    # /push as safe "git operations" and silently auto-approve) so control falls
+    # through to the real approval prompt in Phase 3. Still approvable.
+    force_human_escalation = any(
+        desc in _ALWAYS_ESCALATE_DESCRIPTIONS for _, desc, _ in warnings
+    )
+    if approval_mode == "smart" and not force_human_escalation:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -3445,6 +3524,30 @@ def check_execute_code_guard(code: str, env_type: str,
     #     prompt would fire on every execute_code call.
     #   * Local non-interactive non-gateway: documented limitation above.
     if not is_gateway and not is_ask:
+        # Prod-Wand (2026-09-29): even here, never let the three irreversible
+        # actions run via raw execute_code without a human. Best-effort scan of
+        # the script text (catches contiguous command forms like
+        # os.system("gh pr merge ...") / subprocess.run("git push origin main",
+        # shell=True)); tokenized list-form args are still caught per-call by the
+        # terminal() RPC guard in gateway/ask contexts. Fail CLOSED, not open.
+        _pw_is_d, _pw_pk, _pw_desc = detect_dangerous_command(code)
+        if _pw_is_d and _pw_desc in _ALWAYS_ESCALATE_DESCRIPTIONS:
+            logger.warning(
+                "Prod-Wand: BLOCKED (fail-closed) execute_code irreversible "
+                "action with no human present: %s", _pw_desc,
+            )
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED (Prod-Wand): execute_code contains an irreversible "
+                    f"action ({_pw_desc}) and no human is present to approve it. "
+                    "Do NOT retry — run it from a session where the owner can approve."
+                ),
+                "pattern_key": _pw_pk,
+                "description": _pw_desc,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()

@@ -13,7 +13,7 @@ import contextvars
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import get_hermes_home, get_default_hermes_root, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
@@ -1965,6 +1965,39 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        return None
+
+
+def load_preferences_md(context_length: Optional[int] = None) -> Optional[str]:
+    """Load PRAEFERENZEN.md from the Hermes ROOT home and return it, or None.
+
+    Tills stehende Präferenzen (positive Weg-Defaults): a single shared file
+    that is injected into EVERY role's system prompt as its own slot, directly
+    after the role SOUL. Unlike SOUL.md (which lives in the profile-scoped
+    ``$HERMES_HOME`` so each role gets its own), this reads from the Hermes
+    *root* (``get_default_hermes_root()`` → ``~/.hermes`` even in profile mode),
+    so one source of truth reaches every current and future profile. Missing
+    file ⇒ None (feature is simply off until the file exists).
+    """
+    try:
+        pref_path = get_default_hermes_root() / "PRAEFERENZEN.md"
+    except Exception as e:
+        logger.debug("Could not resolve Hermes root for PRAEFERENZEN.md: %s", e)
+        return None
+    if not pref_path.exists():
+        return None
+    try:
+        content = pref_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "PRAEFERENZEN.md")
+        content = _truncate_content(
+            content, "PRAEFERENZEN.md", context_length=context_length,
+            read_path=str(pref_path),
+        )
+        return content
+    except Exception as e:
+        logger.debug("Could not read PRAEFERENZEN.md from %s: %s", pref_path, e)
         return None
 
 

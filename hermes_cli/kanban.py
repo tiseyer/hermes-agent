@@ -670,6 +670,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_human.add_argument(
+        "--after", nargs="+", default=None, metavar="TASK_ID",
+        help=(
+            "Plan this as a LATER Till step: it stays a planned step "
+            "(todo, human_check) until these predecessor cards are done, then "
+            "becomes 'human' on its own. With all predecessors already done it "
+            "escalates now."
+        ),
+    )
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -2180,17 +2190,27 @@ def _cmd_human(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
+    after = getattr(args, "after", None)
     try:
         with kb.connect_closing() as conn:
-            outcome = kb.move_to_human(
-                conn, args.task_id,
-                title=getattr(args, "title", None),
-                kurzbeschreibung=getattr(args, "kurzbeschreibung", None),
-                category=getattr(args, "category", None),
-                actor=actor,
-            )
+            if after:
+                outcome = kb.plan_human_step(
+                    conn, args.task_id, after=after,
+                    title=getattr(args, "title", None),
+                    kurzbeschreibung=getattr(args, "kurzbeschreibung", None),
+                    category=getattr(args, "category", None),
+                    actor=actor,
+                )
+            else:
+                outcome = kb.move_to_human(
+                    conn, args.task_id,
+                    title=getattr(args, "title", None),
+                    kurzbeschreibung=getattr(args, "kurzbeschreibung", None),
+                    category=getattr(args, "category", None),
+                    actor=actor,
+                )
             # Comment only on the actual move — keeps a repeat call a pure no-op.
-            if outcome == "moved" and reason:
+            if outcome in ("moved", "planned") and reason:
                 kb.add_comment(conn, args.task_id, actor, f"HUMAN: {reason}")
     except ValueError as exc:
         print(f"kanban: human: {exc}", file=sys.stderr)
@@ -2207,6 +2227,18 @@ def _cmd_human(args: argparse.Namespace) -> int:
     if outcome == "noop":
         print(f"{args.task_id} already human (no-op)")
         return 0
+    if outcome == "categorized":
+        print(f"{args.task_id} already human — category set to {args.category}")
+        return 0
+    if outcome == "planned":
+        print(f"Planned {args.task_id} as later Till step (after {', '.join(after)})")
+        return 0
+    if outcome == "busy":
+        print(f"cannot plan {args.task_id} (a worker is running it)", file=sys.stderr)
+        return 1
+    if outcome == "unknown_parent":
+        print(f"cannot plan {args.task_id} (unknown --after id)", file=sys.stderr)
+        return 1
     print(f"Escalated {args.task_id} → human" + (f": {reason}" if reason else ""))
     return 0
 
