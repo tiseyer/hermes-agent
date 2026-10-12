@@ -433,6 +433,163 @@ def test_complete_allowed_for_orchestrator_non_repo_card(monkeypatch, worker_env
     assert d["task_id"] == tid
 
 
+def test_block_rejected_for_orchestrator_repo_work_card(monkeypatch, worker_env):
+    """F22, sibling of the F21 complete gate: the orchestrator must not escalate
+    a fresh repo work card into the human blocked bucket. A card with a
+    repository but no branch (no coder pushed) and no work children (never
+    decomposed) was never built — a kanban_block(kind='needs_input') on it is a
+    coordination decision (e.g. a perceived duplicate), not a Zielfrage. Guards
+    against live probe card t_e8b0ae64 (repository voicera), which the
+    orchestrator blocked with a 'DUPLICATE TASK DETECTED' note carrying no
+    question → beobachter 'rot-technische-rueckfrage'."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "DUPLICATE TASK DETECTED", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "must not block a repo work card" in d["error"]
+    assert "kanban_handoff" in d["error"]
+    # The card must stay in-flight (still running), not slip to blocked.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_orchestrator_untyped_repo_work_card(monkeypatch, worker_env):
+    """The gate covers the whole human bucket, including an un-typed block
+    (kind=None, a 'generic human blocker') — so the orchestrator cannot drop
+    the kind to escape the needs_input gate."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="entschaerfe die gdpr-Zeile",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "this is a duplicate, superseded"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "must not block a repo work card" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_orchestrator_decomposition_root(monkeypatch, worker_env):
+    """The block gate must not trap a genuine decomposition root: a repo card
+    that carries a work child ran the pipeline through that child, so the
+    orchestrator may still block it on a real external blocker."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn, title="voicera cleanup initiative",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.create_task(
+            conn, title="child work card", assignee="voicera-coder",
+            repository="voicera", parent_task_id=root,
+        )
+        kb.claim_task(conn, root)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", root)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a real decision", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_block_allowed_for_orchestrator_dependency_kind(monkeypatch, worker_env):
+    """`dependency` is machine routing (→ todo), not a human escalation — the
+    SOUL's file-conflict block relies on it. It stays ungated even on a fresh
+    repo work card."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="touches overlapping files",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "file-conflict with running t_x", "kind": "dependency"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_orchestrator_non_repo_card(monkeypatch, worker_env):
+    """The block gate is scoped to repo work cards: a pure coordination card
+    (no repository) still blocks normally."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coordinate the sweep", assignee="orchestrator",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need Till's call", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_block_allowed_for_non_orchestrator_repo_work_card(monkeypatch, worker_env):
+    """The gate is scoped to the orchestrator profile: a coder/reviewer on the
+    same card shape keeps its own block path (it may hit a genuine wall)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coder hit a wall",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a decision from Till", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt

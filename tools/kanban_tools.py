@@ -200,6 +200,13 @@ def _connect(board: Optional[str] = None):
 # into direct kanban_complete, bypassing review entirely (live t_05914cf9).
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "review"})
 
+# Block kinds that escalate a card into the human ``blocked`` bucket (a person
+# must read it): ``needs_input`` / ``capability`` and un-typed (``None``, a
+# "generic human blocker"). ``dependency`` routes to ``todo`` and
+# ``transient``/``review`` route elsewhere — none of those wait on a human — so
+# they are excluded. The orchestrator block gate (F22) only fires for this set.
+_HUMAN_BLOCK_KINDS = frozenset({None, "needs_input", "capability"})
+
 
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
@@ -834,6 +841,63 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        # Orchestrator block gate (F22, sibling of the F21 complete gate). The
+        # orchestrator coordinates a fresh repo work card by decomposing it and
+        # handing it to the specifier — it never escalates one to a human
+        # before anything was built. Live probe card t_e8b0ae64 (repository
+        # voicera, child_role work, no branch) showed the orchestrator
+        # kanban_block(kind='needs_input') it with a "DUPLICATE TASK DETECTED"
+        # note — a pure coordination decision, NOT a question for Till. The
+        # Beobachter extracts no question from the comment (no "?"), so the
+        # three Zielfrage gates are all NO → "rot-technische-rueckfrage: Frage
+        # haette die Fabrik selbst loesen muessen" (F22). A perceived duplicate
+        # (especially against an ARCHIVED card, which is not even on the board)
+        # is the fabric's own problem to resolve, not a human blocker. Enforce
+        # the invariant in code — a prompt rule is not load-bearing (cf. F01):
+        # the orchestrator must not land a repo work card that has neither a
+        # branch (no coder pushed) nor work children (never decomposed) in the
+        # human blocked bucket. Point it back at kanban_handoff. Restricted to
+        # the human-escalation kinds so genuine machine routing (``dependency``
+        # → todo, incl. the SOUL's file-conflict block) stays untouched; the
+        # whole human bucket is gated together so the orchestrator cannot
+        # kind-shop (needs_input→capability) to escape. Runs in the
+        # orchestrator's own short-lived worker (re-imported per spawn), so it
+        # survives the gateway-restart gap that defeats dispatcher-side fixes
+        # (cf. F19).
+        if (
+            task
+            and _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            == "orchestrator"
+            and kind in _HUMAN_BLOCK_KINDS
+            and (task.repository or "").strip()
+            and not (task.branch_name or "").strip()
+        ):
+            work_children = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id != ? "
+                "AND child_role = 'work' AND status != 'archived' "
+                "AND (parent_id = ? OR family_root_id = ?)",
+                (tid, tid, tid),
+            ).fetchone()[0]
+            if not work_children:
+                conn.close()
+                return tool_error(
+                    "the orchestrator must not block a repo work card for a "
+                    "human — your job is to coordinate it forward, not to "
+                    "escalate it. This card has no branch (no coder pushed "
+                    "anything) and no work children (it was never decomposed), "
+                    "so nothing was built; a human block here is not a "
+                    "legitimate Zielfrage. If this looks like a duplicate "
+                    "(especially of an archived card — those are off the "
+                    "board) or any other coordination/technical matter, resolve "
+                    "it yourself and proceed. Keep it ONE card: post your "
+                    "orchestration note, then call "
+                    "kanban_handoff(to=\"specifier\"). The specifier lays down "
+                    "the ABNAHMEKRITERIUM and hands off to the repo coder "
+                    "(e.g. voicera-coder); the coder pushes wt/<id> and hands "
+                    "off to the reviewer, who completes the card. Only block "
+                    "for a genuine business decision that is Till's to make — "
+                    "and the specifier/coder raises that when they hit it."
+                )
         try:
             ok = kb.block_task(
                 conn, tid,
