@@ -5502,6 +5502,15 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # F20: capture the review-flow signal BEFORE the UPDATE nulls
+        # block_kind. A reviewer who completes a review card carries its
+        # verdict in the completion summary; the Done-Abnahme (Regel a) reads
+        # the reviewer verdict from task_comments, so we mirror it there below.
+        _pre = conn.execute(
+            "SELECT assignee, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        _pre_assignee = ((_pre["assignee"] if _pre else None) or "")
+        _pre_block_kind = ((_pre["block_kind"] if _pre else None) or "")
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5568,6 +5577,48 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        # F20: a review-flow card can reach 'done' with the reviewer's
+        # verdict living ONLY on the completion summary (run row + completed
+        # event) and never in task_comments. The Beobachter's Done-Abnahme
+        # (Regel a, _review_von_anderem) reads the reviewer verdict from
+        # task_comments; a reviewer who completes with a summary but no
+        # explicit kanban_comment therefore shows up as "reviewer=None" →
+        # "done ohne vollständige Abnahme", even though a real, substantive
+        # review happened (live t_3fc0aae3: the summary documented the
+        # Abnahmekriterium check, grep/py_compile, Negativ-Kontrolle,
+        # Regressionsblick and the Smoke-Karte). Mirror the reviewer's OWN
+        # completion verdict verbatim into a reviewer-authored comment so the
+        # real judgment is persisted where every downstream consumer — the
+        # Beobachter included — reads it. Faithful, not a façade: the text is
+        # the reviewer's own summary, authored by the completing reviewer,
+        # only on review-flow completions (block_kind=='review' + reviewer
+        # assignee), and only when no reviewer comment exists yet (idempotent;
+        # never duplicates a verdict the reviewer did post). Runs in the
+        # reviewer's own short-lived worker (kanban_db re-imported on every
+        # spawn), so it survives the gateway-restart gap that defeated the
+        # dispatcher-side fixes (cf. F19).
+        _verdict = ((summary if summary is not None else result) or "").strip()
+        if (
+            _pre_block_kind == "review"
+            and "review" in _pre_assignee.lower()
+            and _verdict
+        ):
+            _has_reviewer_comment = any(
+                "review" in (c.author or "").lower()
+                and "coder" not in (c.author or "").lower()
+                for c in list_comments(conn, task_id)
+            )
+            if not _has_reviewer_comment:
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, _pre_assignee, _verdict, now),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": _pre_assignee, "len": len(_verdict),
+                     "source": "review-verdict-mirror"},
+                )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
