@@ -672,6 +672,58 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+            # The orchestrator coordinates a work card, it never finishes one:
+            # only the reviewer completes a repo-bound work card, at the end of
+            # specifier → coder → reviewer. The orchestrator SOUL already says
+            # this ("Dein letzter Schritt auf dieser Karte ist der
+            # kanban_handoff an den Specifier — NICHT kanban_complete"; "rufe
+            # [kanban_complete] NIE für eine Karte, die noch gebaut/geprüft
+            # werden muss"), but — as F01 proved for the specifier — a prompt
+            # rule is not load-bearing. Live probe card t_46a39038 (repository
+            # voicera, child_role work) showed the orchestrator drive the card
+            # straight to `done` itself: branch=None, workspace scratch, no
+            # coder and no reviewer ever ran, and the implementation was spun
+            # off onto an unrelated recon card (t_f54f8e8d). The Beobachter's
+            # Done-Abnahme (Regel a) then surfaces branch=False, reviewer=None
+            # → "done ohne vollständige Abnahme" (F21). Enforce the invariant
+            # in code: the orchestrator must not complete a repo work card that
+            # has neither a branch (a coder pushed nothing) nor work children
+            # (it was never decomposed) — point it back at kanban_handoff. A
+            # genuine decomposition root keeps its path: it carries work
+            # children that ran the pipeline, so the children-count check lets
+            # it through. Non-repo coordination cards (no repository) are
+            # untouched. This runs in the orchestrator's own short-lived worker
+            # (kanban_db/kanban_tools re-imported per spawn), so it survives the
+            # gateway-restart gap that defeats dispatcher-side fixes (cf. F19).
+            if (
+                task
+                and _normalize_profile(os.environ.get("HERMES_PROFILE"))
+                == "orchestrator"
+                and (task.repository or "").strip()
+                and not (task.branch_name or "").strip()
+            ):
+                work_children = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE id != ? "
+                    "AND child_role = 'work' AND status != 'archived' "
+                    "AND (parent_id = ? OR family_root_id = ?)",
+                    (tid, tid, tid),
+                ).fetchone()[0]
+                if not work_children:
+                    return tool_error(
+                        "the orchestrator must not complete a repo work card — "
+                        "your job ends by handing it forward, not by finishing "
+                        "it. This card has no branch (no coder pushed anything) "
+                        "and no work children (it was never decomposed), so "
+                        "nothing was built or reviewed; only the reviewer "
+                        "completes a work card. Keep it ONE card: post your "
+                        "orchestration note, then call "
+                        "kanban_handoff(to=\"specifier\"). The specifier lays "
+                        "down the ABNAHMEKRITERIUM and hands off to the repo "
+                        "coder (e.g. voicera-coder); the coder pushes wt/<id> "
+                        "and hands off to the reviewer, who completes the card. "
+                        "Do NOT spin the work onto a separate card."
+                    )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,

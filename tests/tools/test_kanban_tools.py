@@ -349,6 +349,90 @@ def test_complete_allowed_for_non_specifier_profile(monkeypatch, worker_env):
     assert d["task_id"] == worker_env
 
 
+def test_complete_rejected_for_orchestrator_repo_work_card(monkeypatch, worker_env):
+    """The orchestrator coordinates a repo work card, it never finishes one:
+    only the reviewer completes a work card, at the end of
+    specifier→coder→reviewer. A card with a repository but no branch (no coder
+    pushed anything) and no work children (never decomposed) was neither built
+    nor reviewed. Guards against the live failure where the orchestrator drove
+    probe card t_46a39038 (repository voicera) straight to `done` — branch=None,
+    no coder, no reviewer — surfacing as beobachter F21 'done ohne vollständige
+    Abnahme'."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "looks done to me"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "must not complete" in d["error"]
+    assert "kanban_handoff" in d["error"]
+    # The card must stay in-flight (still running), not slip to done.
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_allowed_for_orchestrator_decomposition_root(monkeypatch, worker_env):
+    """The orchestrator guard must not block a genuine decomposition root: a
+    repo card that carries a work child ran the pipeline through that child, so
+    the orchestrator may close it out."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn, title="voicera cleanup initiative",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.create_task(
+            conn, title="child work card", assignee="voicera-coder",
+            repository="voicera", parent_task_id=root,
+        )
+        kb.claim_task(conn, root)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", root)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "children shipped and reviewed"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == root
+
+
+def test_complete_allowed_for_orchestrator_non_repo_card(monkeypatch, worker_env):
+    """The orchestrator guard is scoped to repo work cards: a pure
+    coordination card (no repository) completes normally."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coordinate the sweep", assignee="orchestrator",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "routing done"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == tid
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
