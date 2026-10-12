@@ -749,6 +749,109 @@ def test_block_allowed_for_specifier_question_in_prior_comment(monkeypatch, work
     assert d.get("ok") is True
 
 
+def test_handoff_rejected_for_specifier_to_recon(monkeypatch, worker_env):
+    """F25: the specifier's forward handoff must go to a write-capable
+    ``<repo>-coder``; recon is read-only and cannot build, so routing a build
+    card there strands it. Guards against live probe card t_37376e6a ('CLAUDE.md
+    gdpr-delete-Zeile entschaerfen', erwartung=done): an orchestrator note
+    mislabeled 'Coder-Ziel: recon (read-write)', the specifier handed off to
+    recon, recon reported a role-mismatch and blocked needs_input with no '?' →
+    beobachter 'rot-technische-rueckfrage'. The error must point at the real
+    repo coder."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="specifier", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_handoff({"to": "recon", "note": "bitte die Zeile anpassen"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "read-only" in d["error"]
+    assert "voicera-coder" in d["error"]
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        # Card stays with the specifier (running), not routed to recon.
+        assert t.status == "running"
+        assert t.assignee == "specifier"
+    finally:
+        conn.close()
+
+
+def test_handoff_rejected_for_specifier_to_brain_reader(monkeypatch, worker_env):
+    """The gate covers the other read-only delegation role too, so the specifier
+    cannot role-shop (recon→brain-reader) to escape."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Doku-Zeile entschaerfen", assignee="specifier",
+            repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_handoff({"to": "brain-reader"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "read-only" in d["error"]
+
+
+def test_handoff_allowed_for_specifier_to_coder(monkeypatch, worker_env):
+    """The happy path: the specifier hands the build card to the repo coder —
+    the F24-resolved route that greens this card."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="specifier", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_handoff({"to": "voicera-coder", "note": "ABNAHMEKRITERIUM steht"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("assignee") == "voicera-coder"
+
+
+def test_handoff_to_recon_allowed_for_orchestrator(monkeypatch, worker_env):
+    """The gate is scoped to the specifier: an orchestrator dispatching a genuine
+    read-only recon/verification card to recon stays free."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Verify CLAUDE.md state", assignee="orchestrator",
+            repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_handoff({"to": "recon", "note": "nur lesen und melden"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("assignee") == "recon"
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt

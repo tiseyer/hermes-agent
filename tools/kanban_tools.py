@@ -220,6 +220,15 @@ _SPECIFIER_TECH_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Read-only helper roles the specifier SPAWNS as delegation subagents for facts
+# (recon = code-state, brain-reader = Brain knowledge). They own no write access
+# ("kein Write, kein Edit, keine Commits" — recon SOUL) and are NEVER a valid
+# forward kanban-handoff target for a build card: handing a card that expects a
+# write there strands it, because the role cannot build. The specifier's forward
+# handoff always goes to ``<repo>-coder`` (specifier SOUL). The handoff gate (F25)
+# only fires for this set.
+_READ_ONLY_HANDOFF_ROLES = frozenset({"recon", "brain-reader"})
+
 
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
@@ -1063,6 +1072,52 @@ def _handle_handoff(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Specifier forward-handoff gate (F25, sibling of the F22/F23/F24
+            # block gates). The specifier is the pre-build gatekeeper: after it
+            # writes the ABNAHMEKRITERIUM its ONLY forward move is
+            # kanban_handoff(to="<repo>-coder") — a role that can actually build
+            # (specifier SOUL). recon / brain-reader are read-only helper roles
+            # the specifier SPAWNS as delegation subagents for facts ("kein
+            # Write, kein Edit, keine Commits" — recon SOUL); they are never
+            # kanban card owners in the build chain. Live probe card t_37376e6a
+            # ('CLAUDE.md gdpr-delete-Zeile entschaerfen', erwartung=done) died
+            # here: an orchestrator note mislabeled "Coder-Ziel: recon
+            # (documentation-only, read-write file access)" — a FALSE capability —
+            # and the specifier SOUL honours the orchestrator's "Coder-Ziel"
+            # override, so the specifier handed the write card to recon. recon
+            # correctly reported a role-mismatch (read-only, but the card expects
+            # a write) and blocked kind=needs_input with no "?" — a pure
+            # coordination block, no business Zielfrage → the Beobachter sees a
+            # done-card blocked without a legitimate question →
+            # "rot-technische-rueckfrage: Frage haette die Fabrik selbst loesen
+            # muessen" (F25). The same card greens the moment it is routed to
+            # voicera-coder instead (the F24 happy path). Enforce the specifier's
+            # own contract in code (a prompt rule is not load-bearing, cf. F01):
+            # a read-only role is NEVER a valid forward handoff target — point
+            # the specifier at the real <repo>-coder and ignore any upstream
+            # "Coder-Ziel: recon" label. Scoped to the specifier so an
+            # orchestrator dispatching a genuine read-only verification/recon
+            # card to recon stays free. Runs in the specifier's own short-lived
+            # worker (re-imported per spawn), live on the next specifier spawn
+            # without a gateway restart (cf. F19).
+            if author == "specifier" and to_profile in _READ_ONLY_HANDOFF_ROLES:
+                htask = kb.get_task(conn, tid)
+                repo = ((htask.repository if htask else None) or "").strip()
+                coder = f"{repo}-coder" if repo else "<repo>-coder"
+                conn.close()
+                return tool_error(
+                    f"the specifier must not hand a build card to {to_profile!r} "
+                    f"— that role is read-only (no write, no edit, no commits) "
+                    f"and cannot build, so the card would strand there. recon / "
+                    f"brain-reader are delegation subagents you SPAWN for facts, "
+                    f"never kanban-handoff targets. After the ABNAHMEKRITERIUM "
+                    f"comment, hand off to the repo coder: "
+                    f"kanban_handoff(to=\"{coder}\"). Ignore any upstream "
+                    f"\"Coder-Ziel: recon\" note — recon is not write-capable; "
+                    f"the real build role is {coder!r}. The coder redoes the edit "
+                    f"cleanly on wt/<id> and hands off to the reviewer, who "
+                    f"completes the card."
+                )
             if ws_kind is None and to_profile and to_profile.endswith("-coder"):
                 row = conn.execute(
                     "SELECT tenant FROM tasks WHERE id = ?", (tid,),
