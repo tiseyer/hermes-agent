@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -206,6 +207,18 @@ _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "review
 # ``transient``/``review`` route elsewhere — none of those wait on a human — so
 # they are excluded. The orchestrator block gate (F22) only fires for this set.
 _HUMAN_BLOCK_KINDS = frozenset({None, "needs_input", "capability"})
+
+# Mirror of the Beobachter's TECH_REGEX (checks/beobachter.py): a technical term
+# in a would-be Zielfrage forces the observer's ``zielfrage`` gate to False and
+# the LLM richter CANNOT override it, so such a "question" can never be green.
+# Kept byte-for-byte in sync with the observer so the specifier block gate (F24)
+# rejects exactly what the observer would reject, never more. Not a facade — it
+# enforces the observer's own necessary condition at the worker.
+_SPECIFIER_TECH_REGEX = re.compile(
+    r"\b(rebase|port|library|bibliothek|dependency|abh[äa]ngigkeit|pfad|path|"
+    r"version|framework)\b",
+    re.IGNORECASE,
+)
 
 
 def _goal_judge_available() -> bool:
@@ -898,60 +911,90 @@ def _handle_block(args: dict, **kw) -> str:
                     "for a genuine business decision that is Till's to make — "
                     "and the specifier/coder raises that when they hit it."
                 )
-        # Specifier block gate (F23, sibling of the F22 orchestrator gate). The
-        # specifier is the pre-build gatekeeper: when it cannot pass a card to
-        # the coder it blocks "wartet auf Till" — but ONLY for a genuine
-        # Zielfrage, which its SOUL mandates it phrase AS A QUESTION ("brauche
-        # Klaerung: …?"). Live probe card t_b4335c9c ("CLAUDE.md
-        # gdpr-delete-Zeile entschaerfen", erwartung done) died
-        # rot-technische-rueckfrage: the specifier blocked with a "which
-        # endpoint/line is meant" clarification carrying NO question — a
-        # scope/recon ambiguity it must resolve itself (dispatch recon to grep
-        # the named file for the named anchor), NOT a decision for Till. The
-        # Beobachter's _letzte_frage extracts no "?" from any comment → frage
-        # empty → all three Zielfrage gates NO → "Frage haette die Fabrik selbst
-        # loesen muessen" (F23). Enforce the specifier's own contract in code (a
-        # prompt rule is not load-bearing, cf. F01): a human-escalation block
-        # whose reason AND existing comments contain no question mark is
-        # definitionally not a Zielfrage — reject it and point the specifier
-        # back at recon + kanban_handoff. Scoped to the specifier +
-        # human-escalation kinds so the coder's genuine-wall block path and
-        # machine routing (dependency → todo) stay free. Runs in the specifier's
-        # own short-lived worker (re-imported per spawn), so it is live on the
-        # next specifier spawn without a gateway restart (cf. F19).
+        # Specifier block gate (F23 + F24, sibling of the F22 orchestrator
+        # gate). The specifier is the pre-build gatekeeper: when it cannot pass
+        # a card to the coder it blocks "wartet auf Till" — but ONLY for a
+        # genuine Zielfrage, which its SOUL mandates it phrase AS A QUESTION
+        # ("brauche Klaerung: …?"). The gate mirrors the Beobachter's OWN two
+        # mechanical necessary conditions for a blocked done-card to go green,
+        # so it rejects exactly what the observer would reject — never more
+        # (not a facade; the LLM business-judgment TOR1/2/3 stays the
+        # observer's):
+        #
+        #   1. _letzte_frage reads the Zielfrage ONLY from task COMMENTS (the
+        #      last comment whose body holds a "?"), NEVER from the block
+        #      reason. A question that lives only in the block `reason` is
+        #      invisible to the observer → frage="" → all three Zielfrage-Tore
+        #      NO → rot-technische-rueckfrage. So require the "?" in a COMMENT,
+        #      posted BEFORE the block (the observer may snapshot at any moment).
+        #   2. TECH_REGEX forces zielfrage=False and the richter cannot override
+        #      it — a technical-term "question" can never be green.
+        #
+        # Two live probe cards, same title, drove this:
+        #   • t_b4335c9c (F23): blocked with a "which endpoint/line is meant"
+        #     clarification — a scope/recon task the specifier must resolve
+        #     itself (recon greps the named file for the named anchor).
+        #   • t_664772aa (F24): blocked needs_input with the question only in
+        #     the block REASON — "…apply changes from worktree or re-edit from
+        #     scratch?" — an internal implementation/coordination decision
+        #     (reuse prior uncommitted worktree work, or redo) that is the
+        #     fabric's own to make, never Till's, and that the observer never
+        #     saw (reason-only, no comment) → frage="" → rot.
+        #
+        # Enforce the specifier's own contract in code (a prompt rule is not
+        # load-bearing, cf. F01). Scoped to the specifier + human-escalation
+        # kinds so the coder's genuine-wall block path and machine routing
+        # (dependency → todo) stay free. Runs in the specifier's own short-lived
+        # worker (re-imported per spawn), so it is live on the next specifier
+        # spawn without a gateway restart (cf. F19).
         if (
             task
             and _normalize_profile(os.environ.get("HERMES_PROFILE"))
             == "specifier"
             and kind in _HUMAN_BLOCK_KINDS
         ):
-            has_question = "?" in reason
-            if not has_question:
-                try:
-                    has_question = any(
-                        "?" in (c.body or "")
-                        for c in kb.list_comments(conn, tid)
-                    )
-                except Exception:
-                    has_question = False
-            if not has_question:
+            # Compute `frage` EXACTLY like the Beobachter's _letzte_frage: the
+            # last comment (insertion order) whose body contains a "?". Block
+            # reasons are NOT comments and are deliberately ignored here.
+            frage = ""
+            try:
+                for c in kb.list_comments(conn, tid):
+                    if "?" in (c.body or ""):
+                        frage = c.body or ""
+            except Exception:
+                frage = ""
+            tech = bool(_SPECIFIER_TECH_REGEX.search(frage)) if frage else False
+            if not frage or tech:
                 conn.close()
                 return tool_error(
                     "the specifier blocks only for a genuine Zielfrage — and "
                     "your SOUL requires you phrase it AS A QUESTION (\"brauche "
-                    "Klaerung: …?\"). This block carries no question, so it is "
-                    "not a legitimate Zielfrage; a \"which line/endpoint/file "
-                    "is meant\" ambiguity is a scope/recon task, not a decision "
-                    "for Till. Dispatch recon to grep the named file for the "
-                    "named anchor (the card names a concrete file + text, e.g. "
-                    "\"CLAUDE.md gdpr-delete-Zeile\") BEFORE concluding the "
-                    "anchor is missing — do NOT trust a narrowed line-range "
-                    "from an upstream note, which may point at an unrelated or "
-                    "archived card. Once the real line is found, write the "
-                    "ABNAHMEKRITERIUM: comment and call "
-                    "kanban_handoff(to=\"<repo>-coder\"). Only block for a "
-                    "business decision that is Till's to make, stated as a "
-                    "question."
+                    "Klaerung: …?\") and POST IT AS A KANBAN COMMENT (that is "
+                    "the only place Till reads it; a question left only in the "
+                    "block reason is invisible and can never clear). "
+                    + (
+                        "This question carries a technical term, so it is a "
+                        "method/scope question, not a business Zielfrage — "
+                        "resolve it yourself. "
+                        if tech else
+                        "No comment on this card carries a question, so this "
+                        "block is not a legitimate Zielfrage. "
+                    )
+                    + "An internal implementation/coordination decision — "
+                    "\"which line/endpoint/file is meant\", \"reuse the prior "
+                    "uncommitted work from an old worktree or redo it from "
+                    "scratch\", \"which approach\" — is NEVER a Zielfrage: you "
+                    "resolve it yourself. A card whose body already states "
+                    "exactly what to produce (e.g. \"CLAUDE.md gdpr-delete-"
+                    "Zeile entschaerfen\": reword so the endpoint only deletes "
+                    "after confirmation and only the own tenant) is baureif — "
+                    "ignore any stale/archived prior worktree, write the "
+                    "ABNAHMEKRITERIUM: comment, and call "
+                    "kanban_handoff(to=\"<repo>-coder\") (the coder redoes the "
+                    "edit cleanly on wt/<id> and hands off to the reviewer, who "
+                    "completes the card). Only block for a business/Freigabe "
+                    "decision that is Till's to make, stated as a question in a "
+                    "comment."
                 )
         try:
             ok = kb.block_task(

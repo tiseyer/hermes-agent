@@ -618,7 +618,7 @@ def test_block_rejected_for_specifier_without_question(monkeypatch, worker_env):
     d = json.loads(out)
     assert "error" in d
     assert "genuine Zielfrage" in d["error"]
-    assert "recon" in d["error"]
+    assert "kanban_handoff" in d["error"]
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "running"
@@ -652,15 +652,20 @@ def test_block_rejected_for_specifier_untyped_without_question(monkeypatch, work
         conn.close()
 
 
-def test_block_allowed_for_specifier_with_question(monkeypatch, worker_env):
-    """A specifier block that DOES carry a real question (its SOUL-mandated
-    Zielfrage form) passes the gate — the beobachter's richter then judges
-    whether it is a legitimate business Zielfrage."""
+def test_block_rejected_for_specifier_question_only_in_reason(monkeypatch, worker_env):
+    """F24: the Beobachter's _letzte_frage reads the Zielfrage ONLY from task
+    COMMENTS, never from the block reason. A question that lives only in the
+    block reason is invisible to the observer → frage="" → rot. The gate must
+    reject it even though the reason carries a '?'. This is the exact signature
+    of live probe card t_664772aa, which the specifier blocked needs_input with
+    the question only in the reason ('…apply changes from worktree or re-edit
+    from scratch?') → beobachter 'rot-technische-rueckfrage'."""
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="Loeschweg fuer Nutzerdaten", assignee="specifier",
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="specifier", repository="voicera",
         )
         kb.claim_task(conn, tid)
     finally:
@@ -669,17 +674,60 @@ def test_block_allowed_for_specifier_with_question(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_PROFILE", "specifier")
     from tools import kanban_tools as kt
     out = kt._handle_block({
-        "reason": "brauche Klaerung: soll die Loeschung endgueltig sein oder "
-                  "nur anonymisiert?",
+        "reason": "Verification complete: main CLAUDE.md missing both safety "
+                  "constraints. Old worktree contains correct version but "
+                  "uncommitted. Parent agent needs to decide: apply changes "
+                  "from worktree or re-edit from scratch?",
         "kind": "needs_input",
     })
     d = json.loads(out)
-    assert d.get("ok") is True
+    assert "error" in d
+    assert "genuine Zielfrage" in d["error"]
+    assert "COMMENT" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_specifier_technical_question_comment(monkeypatch, worker_env):
+    """F24: the gate mirrors the Beobachter's TECH_REGEX vorfilter — a question
+    carrying a technical term (which forces the observer's zielfrage=False and
+    cannot be overridden) can never be green, so it is rejected even when posted
+    as a proper comment."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Loeschweg fuer Nutzerdaten", assignee="specifier",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body="brauche Klaerung: welche version der library soll ich nehmen?",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "genuine Zielfrage" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
 
 
 def test_block_allowed_for_specifier_question_in_prior_comment(monkeypatch, worker_env):
-    """The question may live in an earlier comment, not the block reason — the
-    gate scans existing comments too (mirrors the beobachter's _letzte_frage)."""
+    """A specifier block whose genuine business Zielfrage is posted AS A COMMENT
+    (where the beobachter's _letzte_frage reads it) and carries no technical
+    term passes the gate — the beobachter's richter then judges whether it is a
+    legitimate business Zielfrage."""
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
