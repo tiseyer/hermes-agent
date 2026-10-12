@@ -8055,6 +8055,21 @@ def set_workspace_path(
         )
 
 
+def set_workspace_kind(
+    conn: sqlite3.Connection, task_id: str, kind: str
+) -> None:
+    if kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {kind!r}"
+        )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = ? WHERE id = ?",
+            (kind, task_id),
+        )
+
+
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
@@ -10732,6 +10747,32 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             repository_profile = resolve_task_repository_profile(conn, claimed.id)
+            # Central worktree upgrade for repo coders (F17). A *-coder card
+            # MUST run in a git worktree so branch_name is recorded (Beobachter
+            # Regel-a / Done-Abnahme) and its commits land on a branch the
+            # acceptance checks run against. kanban_handoff upgrades on the tool
+            # path, but a card can reach a coder other ways — specifier
+            # completes and the orchestrator re-routes, a respawn, a CLI
+            # handoff — and stay scratch; it then reaches 'done' with
+            # branch=False while the shell check runs against the untouched
+            # base_ref ("done ohne vollständige Abnahme"). Upgrading HERE, at
+            # the single spawn choke point, makes every coder card a worktree
+            # whenever the tenant has a configured checkout. No configured
+            # workdir → unchanged (legacy scratch behaviour).
+            if (
+                claimed.workspace_kind == "scratch"
+                and (claimed.assignee or "").strip().lower().endswith("-coder")
+            ):
+                _coder_workdir = _tenant_workdir_map().get(
+                    (claimed.tenant or "").strip().lower()
+                )
+                if _coder_workdir:
+                    set_workspace_kind(conn, claimed.id, "worktree")
+                    if not (claimed.workspace_path or "").strip():
+                        set_workspace_path(conn, claimed.id, _coder_workdir)
+                    _reloaded = get_task(conn, claimed.id)
+                    if _reloaded is not None:
+                        claimed = _reloaded
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
                     claimed, board=board, repository_profile=repository_profile,
