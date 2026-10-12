@@ -4964,6 +4964,8 @@ def handoff_task(
     note: Optional[str] = None,
     author: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
 ) -> bool:
     """Hand the SAME card forward to the next role in the pipeline.
 
@@ -5015,6 +5017,24 @@ def handoff_task(
         )
         if cur.rowcount != 1:
             return False
+        # Optional workspace upgrade: a coder needs an isolated git worktree so
+        # the dispatcher records branch_name on the task (Regel a / review-
+        # worktree resolution both read it). The orchestrator→specifier→coder
+        # chain hands a scratch card forward; without this the card stays
+        # scratch and its branch is never recorded. Only applied when a valid
+        # kind is given — legacy handoffs (no args) are unchanged.
+        wk = (workspace_kind or "").strip().lower()
+        if wk in ("worktree", "scratch"):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = ? WHERE id = ?",
+                (wk, task_id),
+            )
+            wp = (workspace_path or "").strip()
+            if wp:
+                conn.execute(
+                    "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+                    (wp, task_id),
+                )
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
@@ -9488,6 +9508,7 @@ class _RoutingConfig:
 
     profiles: dict[str, RepositoryProfile]
     tenant_reviewers: dict[str, str]
+    tenant_workdirs: dict[str, str]
     signature_map: tuple[tuple[str, str], ...]
     prefixes: tuple[str, ...]
 
@@ -9569,9 +9590,25 @@ def _load_routing_config() -> _RoutingConfig:
             if tenant and reviewer:
                 tenant_reviewers[tenant] = reviewer
 
+    # tenant → local repo checkout for coder worktrees. OPERATOR CONFIG, like
+    # the reviewer map: an instance that declares a tenant's checkout path lets
+    # the orchestrator→specifier→coder handoff upgrade the coder's card to a
+    # git worktree (recording branch_name), instead of leaving it a scratch
+    # card whose branch is never recorded on the task. Absent → no upgrade
+    # (card stays scratch, legacy behavior); fail-open, never guesses a path.
+    raw_workdirs = kanban_cfg.get("tenant_workdirs") or {}
+    tenant_workdirs: dict[str, str] = {}
+    if isinstance(raw_workdirs, dict):
+        for raw_t, raw_w in raw_workdirs.items():
+            tenant = str(raw_t).strip().lower()
+            workdir = str(raw_w).strip()
+            if tenant and workdir:
+                tenant_workdirs[tenant] = workdir
+
     result = _RoutingConfig(
         profiles=profiles,
         tenant_reviewers=tenant_reviewers,
+        tenant_workdirs=tenant_workdirs,
         signature_map=tuple(signatures),
         prefixes=tuple(profiles),
     )
@@ -9592,6 +9629,11 @@ def _repository_profiles() -> dict[str, RepositoryProfile]:
 def _tenant_reviewer_map() -> dict[str, str]:
     """Tenant → reviewer-profile map for the active instance (empty if unset)."""
     return _load_routing_config().tenant_reviewers
+
+
+def _tenant_workdir_map() -> dict[str, str]:
+    """Tenant → local repo checkout for coder worktrees (empty if unset)."""
+    return _load_routing_config().tenant_workdirs
 
 
 def _repo_signature_map() -> tuple[tuple[str, str], ...]:

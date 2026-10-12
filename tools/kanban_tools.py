@@ -815,13 +815,32 @@ def _handle_handoff(args: dict, **kw) -> str:
         note = redact_sensitive_text(str(note), force=True)
     board = args.get("board")
     author = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+    # Explicit workspace overrides (optional); otherwise auto-upgrade a
+    # coder-target handoff to a git worktree so the dispatcher records
+    # branch_name on the card (Regel-a abnahme + review-worktree resolution
+    # both depend on it). The checkout path comes from the operator-configured
+    # tenant_workdirs map — absent → no upgrade (card stays scratch).
+    ws_kind = args.get("workspace_kind")
+    ws_path = args.get("workspace_path")
     try:
         kb, conn = _connect(board=board)
         try:
+            if ws_kind is None and to_profile and to_profile.endswith("-coder"):
+                row = conn.execute(
+                    "SELECT tenant FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                tenant = (row[0] if row else None) or ""
+                workdir = kb._tenant_workdir_map().get(tenant.strip().lower())
+                if workdir:
+                    ws_kind = "worktree"
+                    if ws_path is None:
+                        ws_path = workdir
             ok = kb.handoff_task(
                 conn, tid, to_profile,
                 note=note, author=author,
                 expected_run_id=_worker_run_id(tid),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
             )
             if not ok:
                 return tool_error(
@@ -1718,6 +1737,25 @@ KANBAN_HANDOFF_SCHEMA = {
                     "Comment for the next role, signed by you. The specifier "
                     "puts its 'ABNAHMEKRITERIUM: <one verifiable sentence>' "
                     "here so it is recorded before any coder beitrag."
+                ),
+            },
+            "workspace_kind": {
+                "type": "string",
+                "enum": ["scratch", "worktree"],
+                "description": (
+                    "Optional. Workspace the next role runs in. Usually omit: "
+                    "a handoff to a repo coder auto-upgrades to 'worktree' "
+                    "(so the coder's branch is recorded on the card) when the "
+                    "tenant has a configured checkout. Set explicitly only to "
+                    "override that default."
+                ),
+            },
+            "workspace_path": {
+                "type": "string",
+                "description": (
+                    "Optional absolute path to the repo checkout for a "
+                    "'worktree' handoff. Omit to use the tenant's configured "
+                    "checkout."
                 ),
             },
             "board": _board_schema_prop(),
