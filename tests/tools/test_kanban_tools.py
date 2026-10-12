@@ -316,6 +316,39 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejected_for_specifier_profile(monkeypatch, worker_env):
+    """A specifier must hand off, never complete — only the reviewer finishes
+    a work card. Guards against the live failure where a specifier called
+    kanban_complete, froze the card at `done` with no coder/branch/reviewer,
+    and broke the specifier→coder→reviewer chain (beobachter F01/F15/F16)."""
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "spec looks fine"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "must not complete" in d["error"]
+    assert "kanban_handoff" in d["error"]
+    # The card must stay in-flight (still running), not slip to done.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_allowed_for_non_specifier_profile(monkeypatch, worker_env):
+    """The specifier guard must not leak to other roles: a coder/reviewer
+    worker completes its card normally."""
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "review green"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == worker_env
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt

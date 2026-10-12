@@ -536,6 +536,30 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    # A specifier's contract is to hand the card forward to the coder, never
+    # to finish it — only the reviewer completes a work card. The specifier
+    # SOUL already says this ("rufst NIEMALS kanban_complete"), but a prompt
+    # rule is not load-bearing: live card t_cdb72949 showed a specifier call
+    # kanban_complete with a verification summary, driving the card straight
+    # to `done` (no coder, no branch, no reviewer) and freezing the
+    # specifier→coder→reviewer chain (beobachter F01 ordering never greens;
+    # verdict lands as F15/F16 "done ohne vollständige Abnahme"). After the
+    # premature complete the card is terminal, so the follow-up handoff/block
+    # calls all fail ("already terminal" / "not in running/ready") and the
+    # specifier strands the card. Enforce the invariant in code and point the
+    # specifier back at kanban_handoff. Scoped to the specifier profile so
+    # coder/reviewer/orchestrator and read-only helper roles (recon,
+    # brain-reader) keep their own completion paths untouched.
+    if _normalize_profile(os.environ.get("HERMES_PROFILE")) == "specifier":
+        return tool_error(
+            "the specifier must not complete a card — your job ends by "
+            "handing it forward, not by finishing it. Post your "
+            "ABNAHMEKRITERIUM: comment (if it isn't on the card yet), then "
+            "call kanban_handoff(to=\"<repo>-coder\") — e.g. "
+            "kanban_handoff(to=\"voicera-coder\") for a voicera card. The "
+            "dispatcher spawns the coder on the SAME card; only the reviewer "
+            "completes a work card."
+        )
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
