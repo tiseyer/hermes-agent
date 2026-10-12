@@ -6420,7 +6420,8 @@ def block_task(
             reason = f"repository routing configuration required: {exc}"
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, tenant, assignee "
+            "SELECT status, block_kind, block_recurrences, tenant, assignee, "
+            "branch_name "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6636,6 +6637,40 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            # F19: stamp the coder's conventional branch (wt/<id>) on the card
+            # at THIS review-request handoff when none is recorded yet. The
+            # Beobachter's Done-Abnahme (Regel a) uses branch_name as the ref
+            # its shell checks run against; a scratch coder card that never
+            # recorded a branch sends those checks against the untouched
+            # base_ref — the fix lives on wt/<id>, so the check reports "done
+            # ohne vollständige Abnahme" even though the work is correct.
+            # F17/F18 recorded the branch in the LONG-running dispatcher
+            # (coder-claim / review-claim); both are missed whenever the
+            # gateway serves pre-fix code from memory (it only re-imports on a
+            # restart, and the restart kept racing the source write). THIS runs
+            # in the coder's own short-lived worker, which imports the current
+            # code on every spawn — so it survives the deploy/restart gap that
+            # defeated the dispatcher-side fixes. Gated on the implementer being
+            # a repo coder (the role that works on a pushed wt/<id> branch) and
+            # on no branch already recorded — it never overrides an explicit
+            # branch. If the branch was never actually pushed, the Beobachter's
+            # worktree checkout of wt/<id> fails and the card stays honestly
+            # non-green — no façade. branch_name alone is enough for the
+            # Regel-a gate; the reviewer-worktree upgrade stays the dispatcher's
+            # job (F18 backstop), which no longer gates the Abnahme.
+            if (cur_assignee or "").endswith("-coder") and not (
+                (cur_row["branch_name"] or "").strip()
+                if "branch_name" in cur_row.keys() else False
+            ):
+                conn.execute(
+                    "UPDATE tasks SET branch_name = ? WHERE id = ?",
+                    (f"wt/{task_id}", task_id),
+                )
+                _append_event(
+                    conn, task_id, "branch_recorded",
+                    {"branch": f"wt/{task_id}", "source": "review-handoff",
+                     "implementer": cur_assignee},
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
