@@ -4823,6 +4823,95 @@ def reassign_task(
         return False
 
 
+def handoff_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    to_profile: str,
+    *,
+    note: Optional[str] = None,
+    author: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Hand the SAME card forward to the next role in the pipeline.
+
+    This is the *forward-flow* sibling of the review handoff (``block_task``
+    with ``kind='review'``). A review block routes a finished implementation
+    to the reviewer; a handoff routes an *unfinished* card to the next role
+    BEFORE it is finished — orchestrator → specifier → coder — so the whole
+    chain (acceptance criterion, implementation, review verdict) accrues on
+    ONE card instead of being scattered across decomposed children or lost
+    to a premature ``kanban_complete``.
+
+    Mechanics mirror the review-reject requeue: end the current run, clear
+    the claim, set ``assignee = to_profile`` and ``status = 'ready'`` so the
+    dispatcher re-spawns the next role on this card. A ``handoff`` event is
+    recorded, and ``note`` (when given) is stored as a comment authored by
+    the handing-off worker — that is how the specifier's ``ABNAHMEKRITERIUM:``
+    lands on the card, signed by the specifier, before any coder beitrag.
+
+    Returns True on success, False when the card was not in a handoffable
+    state (``running``/``ready``) or ``to_profile`` did not resolve.
+    """
+    to_profile = (to_profile or "").strip()
+    if not to_profile:
+        raise ValueError("handoff target profile is required")
+    with write_txn(conn):
+        cur_row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if cur_row is None:
+            return False
+        prev_assignee = (
+            cur_row["assignee"] if "assignee" in cur_row.keys() else None
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'ready',
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = NULL
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (to_profile, task_id) if expected_run_id is None
+            else (to_profile, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="blocked", status="blocked",
+            summary=f"handoff {prev_assignee or '?'} → {to_profile}",
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked",
+                summary=f"handoff → {to_profile}",
+            )
+        _append_event(
+            conn, task_id, "handoff",
+            {"from": prev_assignee, "to": to_profile, "note": note},
+            run_id=run_id,
+        )
+        if note and str(note).strip():
+            conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    author or prev_assignee or "orchestrator",
+                    str(note),
+                    int(time.time()),
+                ),
+            )
+    return True
+
+
 def _verify_created_cards(
     conn: sqlite3.Connection,
     completing_task_id: str,

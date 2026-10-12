@@ -789,6 +789,60 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_handoff(args: dict, **kw) -> str:
+    """Hand the SAME card forward to the next role (orchestrator → specifier
+    → coder) without finishing it. The forward-flow sibling of the review
+    handoff: the card goes back to ``ready`` assigned to ``to`` and the
+    dispatcher re-spawns the next role on it."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    to_profile = _normalize_profile(
+        args.get("to") or args.get("to_profile") or args.get("assignee")
+    )
+    if not to_profile:
+        return tool_error(
+            "to is required — name the profile that takes the card next "
+            "(e.g. 'specifier', then the repo coder like 'hermes-coder')"
+        )
+    note = args.get("note") or args.get("comment")
+    if note:
+        note = redact_sensitive_text(str(note), force=True)
+    board = args.get("board")
+    author = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.handoff_task(
+                conn, tid, to_profile,
+                note=note, author=author,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not hand off {tid} (unknown id or not in "
+                    f"running/ready)"
+                )
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                status=landed.status if landed else "ready",
+                assignee=to_profile,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_handoff: {e}")
+    except Exception as e:
+        logger.exception("kanban_handoff failed")
+        return tool_error(f"kanban_handoff: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1627,6 +1681,51 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+
+KANBAN_HANDOFF_SCHEMA = {
+    "name": "kanban_handoff",
+    "description": (
+        "Pass THIS card forward to the next role in the pipeline without "
+        "finishing it — use this instead of kanban_complete when your job is "
+        "to prepare the card, not to close it. The card returns to 'ready' "
+        "assigned to ``to`` and the dispatcher spawns that role on the SAME "
+        "card, so the specifier's acceptance criterion, the coder's work and "
+        "the reviewer's verdict all land in one card's history. Flow: "
+        "orchestrator → 'specifier' → the repo coder (e.g. 'hermes-coder'); "
+        "the coder then hands to the reviewer via kanban_block(kind='review'). "
+        "Put the message for the next role (the specifier's "
+        "'ABNAHMEKRITERIUM: …' line, or the coder brief) in ``note`` — it is "
+        "stored as a comment signed by you. This is your FINAL action for the "
+        "card this run; do not also call kanban_complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "to": {
+                "type": "string",
+                "description": (
+                    "Profile that should take the card next, e.g. "
+                    "'specifier' or the repo coder 'hermes-coder'."
+                ),
+            },
+            "note": {
+                "type": "string",
+                "description": (
+                    "Comment for the next role, signed by you. The specifier "
+                    "puts its 'ABNAHMEKRITERIUM: <one verifiable sentence>' "
+                    "here so it is recorded before any coder beitrag."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["to"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2040,6 +2139,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_handoff",
+    toolset="kanban",
+    schema=KANBAN_HANDOFF_SCHEMA,
+    handler=_handle_handoff,
+    check_fn=_check_kanban_mode,
+    emoji="➡",
 )
 
 registry.register(
