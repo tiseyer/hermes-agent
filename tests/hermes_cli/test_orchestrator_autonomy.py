@@ -174,6 +174,29 @@ def test_done_verification_accepts_pushed_branch_with_evidence(
         assert kb.get_task(conn, tid).status == "done"
 
 
+def test_done_verification_accepts_evidence_in_reviewer_comment(
+    kanban_home, repo_with_remote,
+):
+    """A review-green whose reproduced checks live in the reviewer comment
+    (not the terse completion summary) is NOT bounced for 'no test evidence'.
+    Otherwise the reviewer escalates a mechanical check to a human (blocked)."""
+    with kb.connect() as conn:
+        tid, wt = _make_review_claimed_worktree_task(conn, repo_with_remote)
+        _commit(wt, "work.txt", "the work")
+        _run(["git", "push", "-u", "origin", "wt/test-branch"], wt)
+        kb.add_comment(
+            conn, tid, "voicera-reviewer",
+            "REVIEW GRÜN. ruff check --select E712 → 0 Treffer; "
+            "py_compile erfolgreich. Abnahmekriterium erfüllt.",
+        )
+        # Completion summary itself carries NO test keyword.
+        ok = kb.complete_task(
+            conn, tid, result="approved", summary="Review grün, Branch gepusht.",
+        )
+        assert ok
+        assert kb.get_task(conn, tid).status == "done"
+
+
 def test_done_verification_env_off_switch(kanban_home, repo_with_remote, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_VERIFY_DONE", "0")
     with kb.connect() as conn:

@@ -5220,6 +5220,13 @@ class DoneVerificationError(ValueError):
 
 _DONE_VERIFY_TEST_EVIDENCE_RE = re.compile(
     r"(?i)(pytest|unittest|vitest|jest|npm test|cargo test|go test"
+    # Static-analysis / lint / compile runs ARE valid verification for
+    # lint/idiom/type changes whose acceptance (`fertig_heisst.shell`) is a
+    # checker, not a test suite — don't force a heavyweight pytest/Docker run
+    # (and a human escalation) onto a three-line idiom fix.
+    r"|ruff|mypy|pyright|flake8|eslint|tsc\b|vulture|py_compile|compileall"
+    r"|checks?\s+pass(ed)?|all\s+checks\s+pass(ed)?"
+    r"|0\s+(treffer|findings|errors|fehler|verst(ö|oe)(ß|ss)e)"
     r"|tests?\s+(pass(ed)?|green|bestanden|gr(ü|u)n)"
     r"|\btests?:\s"           # a documented "Tests: ..." section
     r"|\bpass(ed)?\b|\bbestanden\b"
@@ -5349,6 +5356,22 @@ def _verify_done_evidence(
         scan = " ".join(filter(None, [summary, result]))
         if _DONE_VERIFY_TEST_EVIDENCE_RE.search(scan):
             tests_documented = True
+    if not tests_documented:
+        # The reviewer/coder reproduce and document their acceptance checks in
+        # the card comments (e.g. "ruff E712: 0 Treffer", "All checks passed",
+        # "pytest 12 passed"), not always in the terse completion summary.
+        # Honour that documented evidence too — otherwise a genuine review-green
+        # bounces for "no test evidence" and the reviewer escalates to a human
+        # (blocked), which is exactly the technical-question anti-pattern.
+        try:
+            for c in list_comments(conn, task_id):
+                author = (c.author or "").lower()
+                if ("coder" in author or "review" in author) and \
+                        _DONE_VERIFY_TEST_EVIDENCE_RE.search(c.body or ""):
+                    tests_documented = True
+                    break
+        except Exception:
+            pass
     if not tests_documented:
         findings.append(
             "no test evidence documented (metadata.tests_run empty and no "
