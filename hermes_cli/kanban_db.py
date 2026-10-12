@@ -6475,6 +6475,25 @@ def block_task(
                 _pair[1] if _pair
                 else _tenant_reviewer_map().get(task_tenant, "reviewer")
             )
+            # Spawnability guard (F14 "Reviewer haengt"). A worker runs with
+            # HERMES_HOME scoped to its OWN profile dir, whose config.yaml
+            # carries no kanban routing — repository_profiles / tenant_reviewers
+            # live only in the ROOT config. Under that scope resolution degrades
+            # to the bare ``"reviewer"`` sentinel, which no tenant installs, so
+            # the dispatcher can never spawn it and the card sits in ``review``
+            # forever (silent hang). Recover via the tenant naming convention
+            # ({tenant}-reviewer) — but only when that profile really exists, so
+            # genuinely unknown tenants keep their legacy behaviour and tests
+            # are unaffected. profile_exists reads the SHARED ~/.hermes/profiles
+            # dir, hence reliable regardless of the scoped HERMES_HOME.
+            if reviewer == "reviewer" and task_tenant:
+                try:
+                    from hermes_cli.profiles import profile_exists
+                    _convention = f"{task_tenant}-reviewer"
+                    if profile_exists(_convention):
+                        reviewer = _convention
+                except Exception:
+                    pass
             cur_assignee = (
                 cur_row["assignee"] if "assignee" in cur_row.keys() else None
             )
