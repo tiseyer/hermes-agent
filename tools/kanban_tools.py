@@ -898,6 +898,61 @@ def _handle_block(args: dict, **kw) -> str:
                     "for a genuine business decision that is Till's to make — "
                     "and the specifier/coder raises that when they hit it."
                 )
+        # Specifier block gate (F23, sibling of the F22 orchestrator gate). The
+        # specifier is the pre-build gatekeeper: when it cannot pass a card to
+        # the coder it blocks "wartet auf Till" — but ONLY for a genuine
+        # Zielfrage, which its SOUL mandates it phrase AS A QUESTION ("brauche
+        # Klaerung: …?"). Live probe card t_b4335c9c ("CLAUDE.md
+        # gdpr-delete-Zeile entschaerfen", erwartung done) died
+        # rot-technische-rueckfrage: the specifier blocked with a "which
+        # endpoint/line is meant" clarification carrying NO question — a
+        # scope/recon ambiguity it must resolve itself (dispatch recon to grep
+        # the named file for the named anchor), NOT a decision for Till. The
+        # Beobachter's _letzte_frage extracts no "?" from any comment → frage
+        # empty → all three Zielfrage gates NO → "Frage haette die Fabrik selbst
+        # loesen muessen" (F23). Enforce the specifier's own contract in code (a
+        # prompt rule is not load-bearing, cf. F01): a human-escalation block
+        # whose reason AND existing comments contain no question mark is
+        # definitionally not a Zielfrage — reject it and point the specifier
+        # back at recon + kanban_handoff. Scoped to the specifier +
+        # human-escalation kinds so the coder's genuine-wall block path and
+        # machine routing (dependency → todo) stay free. Runs in the specifier's
+        # own short-lived worker (re-imported per spawn), so it is live on the
+        # next specifier spawn without a gateway restart (cf. F19).
+        if (
+            task
+            and _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            == "specifier"
+            and kind in _HUMAN_BLOCK_KINDS
+        ):
+            has_question = "?" in reason
+            if not has_question:
+                try:
+                    has_question = any(
+                        "?" in (c.body or "")
+                        for c in kb.list_comments(conn, tid)
+                    )
+                except Exception:
+                    has_question = False
+            if not has_question:
+                conn.close()
+                return tool_error(
+                    "the specifier blocks only for a genuine Zielfrage — and "
+                    "your SOUL requires you phrase it AS A QUESTION (\"brauche "
+                    "Klaerung: …?\"). This block carries no question, so it is "
+                    "not a legitimate Zielfrage; a \"which line/endpoint/file "
+                    "is meant\" ambiguity is a scope/recon task, not a decision "
+                    "for Till. Dispatch recon to grep the named file for the "
+                    "named anchor (the card names a concrete file + text, e.g. "
+                    "\"CLAUDE.md gdpr-delete-Zeile\") BEFORE concluding the "
+                    "anchor is missing — do NOT trust a narrowed line-range "
+                    "from an upstream note, which may point at an unrelated or "
+                    "archived card. Once the real line is found, write the "
+                    "ABNAHMEKRITERIUM: comment and call "
+                    "kanban_handoff(to=\"<repo>-coder\"). Only block for a "
+                    "business decision that is Till's to make, stated as a "
+                    "question."
+                )
         try:
             ok = kb.block_task(
                 conn, tid,

@@ -590,6 +590,117 @@ def test_block_allowed_for_non_orchestrator_repo_work_card(monkeypatch, worker_e
     assert d.get("ok") is True
 
 
+def test_block_rejected_for_specifier_without_question(monkeypatch, worker_env):
+    """F23: the specifier may block only for a genuine Zielfrage, which its SOUL
+    requires it phrase AS A QUESTION. A human-escalation block whose reason (and
+    comments) carry no '?' is a scope/recon ambiguity the fabric must resolve
+    itself — not a decision for Till. Guards against live probe card t_b4335c9c
+    ('CLAUDE.md gdpr-delete-Zeile entschaerfen'), which the specifier blocked
+    with a 'which endpoint/line is meant' clarification and no question →
+    beobachter 'rot-technische-rueckfrage'."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="CLAUDE.md gdpr-delete-Zeile entschaerfen",
+            assignee="specifier", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "Blockiere fuer Klaerung, welche Zeile gemeint ist.",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "genuine Zielfrage" in d["error"]
+    assert "recon" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_specifier_untyped_without_question(monkeypatch, worker_env):
+    """The gate covers the whole human bucket, incl. an un-typed block
+    (kind=None), so the specifier cannot drop the kind to escape."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="entschaerfe die gdpr-Zeile", assignee="specifier",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "Anker nicht gefunden, breche ab."})
+    d = json.loads(out)
+    assert "error" in d
+    assert "genuine Zielfrage" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_specifier_with_question(monkeypatch, worker_env):
+    """A specifier block that DOES carry a real question (its SOUL-mandated
+    Zielfrage form) passes the gate — the beobachter's richter then judges
+    whether it is a legitimate business Zielfrage."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Loeschweg fuer Nutzerdaten", assignee="specifier",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "brauche Klaerung: soll die Loeschung endgueltig sein oder "
+                  "nur anonymisiert?",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_block_allowed_for_specifier_question_in_prior_comment(monkeypatch, worker_env):
+    """The question may live in an earlier comment, not the block reason — the
+    gate scans existing comments too (mirrors the beobachter's _letzte_frage)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Sichtbarkeit der Domain", assignee="specifier",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body="brauche Klaerung: soll die Domain oeffentlich sein?",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
