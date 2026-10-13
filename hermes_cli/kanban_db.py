@@ -9269,6 +9269,62 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+# Circuit-breaker trips are ALWAYS driven by an infrastructure outcome: the
+# worker process died (``crashed``), ran out of wall-clock (``timed_out``) or
+# could not be started (``spawn_failed``). A worker's deliberate business
+# handoff never flows through ``_record_task_failure`` — it goes through
+# ``block_task`` — so a breaker ``blocked`` is by construction a question-less
+# infra park, NOT a human Zielfrage. The Beobachter reads a question-less
+# ``blocked`` erwartung=done card as ``rot-technische-rueckfrage`` ("Frage
+# haette die Fabrik selbst loesen muessen", F33) — rightly: repeated worker
+# deaths are the factory's own problem, not a decision for Till. So on a trip
+# we route the card to the reviewer for a diagnosis check — the exact brake
+# the loop detector already uses (``loop_detected`` → ``review``) — instead of
+# the human ``blocked`` lane. ``review`` is a factory-internal state the
+# observer treats as in-progress (OFFEN within the Frist), never an escalation.
+_INFRA_TRIP_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
+
+
+def _resolve_diagnosis_reviewer(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a spawnable reviewer profile for ``task_id`` or ``None``.
+
+    Reuses the ``loop_detected`` brake's resolution: a structured/declared
+    repository profile wins, else the tenant's configured reviewer. Returns
+    ``None`` when no reviewer is configured OR the resolved reviewer profile
+    is not spawnable — the caller then falls back to the plain circuit-breaker
+    ``blocked``, so bare-DB unit tests (no configured profiles) keep their
+    existing behavior and only real configured repo-work cards get the
+    diagnosis reroute.
+    """
+    reviewer: Optional[str] = None
+    try:
+        pair = resolve_task_repo_profiles(conn, task_id)
+    except RepositoryProfileError:
+        pair = None
+    if pair:
+        reviewer = pair[1]
+    else:
+        trow = conn.execute(
+            "SELECT tenant FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        tenant = trow["tenant"] if trow else None
+        reviewer = _tenant_reviewer_map().get(tenant) if tenant else None
+    if not reviewer:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    try:
+        if not profile_exists(reviewer):
+            return None
+    except Exception:
+        return None
+    return reviewer
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9350,8 +9406,49 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
+            # Trip the breaker. Every trip here is infra-driven (see
+            # ``_INFRA_TRIP_OUTCOMES``), so prefer the reviewer-diagnosis
+            # reroute over the question-less human ``blocked`` lane (F33).
+            reviewer_for_diag = (
+                _resolve_diagnosis_reviewer(conn, task_id)
+                if outcome in _INFRA_TRIP_OUTCOMES
+                else None
+            )
+            if reviewer_for_diag is not None:
+                # Infra failure (worker died / couldn't spawn / timed out)
+                # after repeated attempts — the factory's own problem, not a
+                # Zielfrage. Route to the reviewer for a diagnosis check, the
+                # same brake as ``loop_detected``. Reset the failure budget:
+                # the diagnosis + a freshly phrased attempt is a new approach
+                # and must get its own runway, not inherit the exhausted one.
+                conn.execute(
+                    "UPDATE tasks SET status = 'review', assignee = ?, "
+                    "block_kind = 'review', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "consecutive_failures = 0, last_failure_error = ? "
+                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    (reviewer_for_diag, error[:500], task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Infrastruktur-Fehler (Worker gestorben / nicht "
+                        "startbar / Timeout) nach wiederholten Versuchen — "
+                        f"Ausloeser: {outcome}. Das ist Sache der Fabrik, "
+                        "keine Rueckfrage an Till. DIAGNOSE-AUFTRAG an den "
+                        "Reviewer: Pruefe, ob die Fehlerdiagnose der letzten "
+                        "Runs stimmt (Infrastruktur vs. echter Fehler) — "
+                        "NICHT den naechsten Fix bauen. Ergebnis als Kommentar "
+                        "dokumentieren; danach wird ein neu formulierter "
+                        "Coder-Auftrag erstellt.",
+                        int(time.time()),
+                    ),
+                )
+            elif release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
@@ -9382,6 +9479,7 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "routed_to_diagnosis": reviewer_for_diag,
                     },
                 )
             payload = {
@@ -9396,6 +9494,14 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if reviewer_for_diag is not None:
+                _append_event(
+                    conn, task_id, "infra_failure_diagnosis",
+                    {"trigger_outcome": outcome,
+                     "routed_to": reviewer_for_diag,
+                     "failures": failures},
+                    run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.

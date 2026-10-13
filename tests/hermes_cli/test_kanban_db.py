@@ -1251,6 +1251,84 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         assert task.consecutive_failures == 0
 
 
+def test_infra_trip_routes_to_reviewer_diagnosis_not_blocked(
+    kanban_home, monkeypatch,
+):
+    """F33: a circuit-breaker trip is always infra-driven (crashed /
+    timed_out / spawn_failed), never a worker business block. On a repo-work
+    card with a configured, spawnable reviewer, the trip must route to the
+    reviewer for a DIAGNOSE check (``review``) — NOT the question-less human
+    ``blocked`` lane the Beobachter reads as ``rot-technische-rueckfrage``.
+    The failure budget resets so the diagnosis + a fresh attempt gets its own
+    runway, and no Zielfrage is faked.
+    """
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        kb, "resolve_task_repo_profiles",
+        lambda conn, tid: ("x-coder", "x-reviewer", "structured"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="trivial lint", assignee="x-coder")
+        kb.claim_task(conn, t)
+        # Two sporadic worker deaths hit the default limit (2).
+        kb._record_task_failure(
+            conn, t, error="pid 111 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        kb._record_task_failure(
+            conn, t, error="pid 222 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "x-reviewer"
+        assert task.block_kind == "review"
+        # Fresh budget for the diagnosis + re-dispatched attempt.
+        assert task.consecutive_failures == 0
+        # A diagnosis instruction was posted (no faked Zielfrage).
+        comments = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?", (t,),
+        ).fetchall()
+        assert any("DIAGNOSE-AUFTRAG" in c["body"] for c in comments)
+        assert not any("?" in c["body"] for c in comments)
+        # Audit event for the reroute.
+        ev = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'infra_failure_diagnosis'",
+            (t,),
+        ).fetchone()
+        assert ev is not None
+
+
+def test_infra_trip_without_reviewer_falls_back_to_blocked(
+    kanban_home, monkeypatch,
+):
+    """F33 containment: when no spawnable reviewer can be resolved (bare-DB
+    card, unknown profile), the trip keeps its existing circuit-breaker
+    ``blocked`` behavior — the reroute is opt-in on configured repo cards."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="task", assignee="a")
+        kb.claim_task(conn, t)
+        kb._record_task_failure(
+            conn, t, error="pid 111 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        kb._record_task_failure(
+            conn, t, error="pid 222 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        assert task.consecutive_failures >= 2
+
+
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""
