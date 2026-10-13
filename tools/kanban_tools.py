@@ -304,6 +304,41 @@ _RUNTIME_ENV_GATED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# F32: an import-hygiene edit to the importable backend ``app`` package. Changing
+# an import line (remove unused / F401, fix undefined names / F821, repair a
+# missing import) can change whether the package imports AT ALL — a removed
+# import may carry a side effect or a re-export — so such a card's acceptance
+# almost always smoke-imports the app (``cd backend && python -c 'import
+# app.main'``). The Beobachter re-runs that in a throwaway ``/tmp`` worktree
+# where the backend package is not installed (``ModuleNotFoundError: No module
+# named 'app.main'``), a pure env gap exactly like F31 — so a reviewer ``done``
+# is "done ohne vollständige Abnahme" (shell=rot) and must terminate at the
+# MERGER instead. Unlike the F31 markers, this one must NOT depend on the
+# specifier quoting the import command: the ``python -c 'import app…'`` smoke
+# check lives only in the card's ``fertig_heisst.shell`` (Beobachter-side) and
+# never reaches the factory. The Beobachter DOES write the backend ``app/…``
+# module paths and the ``ungenutzte Importe``/``F401`` nature straight into the
+# card BODY, so keying the two signals off the body makes the gate fire even
+# when the specifier's criterion only names ``ruff`` (live probe Karte 8
+# 't_e5e71e1a', erwartung=done: branch=True, shell=rot(`import app.main`:
+# ModuleNotFound in the check-worktree), reviewer=voicera-reviewer,
+# ergebnis_passt=True → ROT a). Both signals are required so a generic backend
+# card that merely touches ``app/…`` (adds an endpoint, edits logic) with a
+# static ruff/pytest acceptance keeps the honest Regel-a ``done`` path.
+_APP_PACKAGE_PATH_RE = re.compile(
+    r"(?:^|[\s/`'\"(])(?:backend/)?app/"
+    r"(?:models|main|api|services|tasks|core|db|database"
+    r"|routers?|workers?|cli|config|schemas)\b",
+    re.IGNORECASE,
+)
+_IMPORT_HYGIENE_RE = re.compile(
+    r"(?:\bF401\b|\bF811\b|\bF821\b"
+    r"|ungenutzte?\s+import|unbenutzte?\s+import|unused\s+import"
+    r"|undefinierte?\s+name|undefined\s+name"
+    r"|fehlende?\s+import|missing\s+import)",
+    re.IGNORECASE,
+)
+
 
 def _is_reviewer_profile(profile: Optional[str]) -> bool:
     """True when the current worker profile is a code reviewer.
@@ -329,7 +364,16 @@ def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bo
     static backend card (``ruff``/``py_compile``/``vulture`` over ``*.py``)
     matches none of it and stays on the honest ``done`` path."""
     blob = "\n".join([title or "", body or "", *(comment_bodies or [])])
-    return bool(_BUILD_GATED_RE.search(blob) or _RUNTIME_ENV_GATED_RE.search(blob))
+    if _BUILD_GATED_RE.search(blob) or _RUNTIME_ENV_GATED_RE.search(blob):
+        return True
+    # F32: import-hygiene edit to the importable backend ``app`` package. Its
+    # app-import acceptance cannot green in the env-less check-worktree, so route
+    # to the merger like F31 — fired off the card body, independent of whether
+    # the specifier quoted the import command (which lives only in the
+    # Beobachter-side ``fertig_heisst.shell`` and never reaches the factory).
+    if _APP_PACKAGE_PATH_RE.search(blob) and _IMPORT_HYGIENE_RE.search(blob):
+        return True
+    return False
 
 
 def _goal_judge_available() -> bool:
