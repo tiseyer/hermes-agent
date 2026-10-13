@@ -590,6 +590,114 @@ def test_loop_brake_without_declaration_uses_tenant(
 
 
 # ---------------------------------------------------------------------------
+# Condition 4b (F34): an INFRA-driven review loop (clean-exit protocol
+# violation recorded as 'crashed', crash, or timeout) hands the work BACK to
+# the coder lane for a fresh attempt instead of escalating a question-less
+# human block the Beobachter rejects as rot-technische-rueckfrage. A reviewer
+# that deliberately keeps failing (gave_up) may be a real wall → still
+# blocked@till.
+# ---------------------------------------------------------------------------
+
+
+def _ended_run(conn, tid, profile, outcome, error):
+    now = int(__import__("time").time())
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, error, "
+        "started_at, ended_at) VALUES (?, ?, 'ended', ?, ?, ?, ?)",
+        (tid, profile, outcome, error, now - 60, now - 30),
+    )
+
+
+_VIOLATION_SIG = (
+    "worker exited cleanly (rc=0) without calling kanban_complete or "
+    "kanban_block — protocol violation."
+)
+
+
+def test_review_loop_infra_routes_to_coder(kanban_home, role_profiles_exist):
+    """Two identical clean-exit protocol-violation reviewer runs route the
+    card back to the declared coder with a reset budget — no human block."""
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Ungenutzte lokale Variablen in drei Routern",
+            assignee="voicera-reviewer", tenant="voicera",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', consecutive_failures=2 "
+            "WHERE id=?",
+            (tid,),
+        )
+        _ended_run(conn, tid, "voicera-reviewer", "crashed", _VIOLATION_SIG)
+        _ended_run(conn, tid, "voicera-reviewer", "crashed", _VIOLATION_SIG)
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda t, w, **k: spawns.append((t.id, t.assignee)),
+        )
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "review_loop_detected"]
+        comments = kb.list_comments(conn, tid)
+    assert spawns == [], "no third identical review run"
+    assert task.status == "ready", "infra review loop stays in the factory"
+    assert task.assignee == "voicera-coder", "handed back to the declared coder"
+    assert task.consecutive_failures == 0, "coder gets a fresh failure budget"
+    assert ("review_loop_detected" in [r[1] for r in res.respawn_guarded])
+    assert events and events[-1].payload.get("disposition") == "coder_reattempt"
+    assert events[-1].payload.get("routed_to") == "voicera-coder"
+    # No human escalation, no faked Zielfrage.
+    assert not any(c.author == "till" for c in comments)
+    assert all(
+        "?" not in (c.body or "")
+        for c in comments if c.author == "orchestrator"
+    )
+
+
+def test_review_loop_noninfra_still_escalates_to_till(
+    kanban_home, role_profiles_exist,
+):
+    """A reviewer that deliberately gave_up twice is a possible real wall —
+    even with a resolvable coder it parks at the human, not an infra trip."""
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="review me", assignee="voicera-reviewer",
+            tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        _ended_run(conn, tid, "voicera-reviewer", "gave_up", "stalled at X")
+        _ended_run(conn, tid, "voicera-reviewer", "gave_up", "stalled at X")
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawns.append(t.id))
+        task = kb.get_task(conn, tid)
+    assert spawns == []
+    assert task.status == "blocked"
+    assert task.assignee == "till"
+
+
+def test_ready_loop_detect_scoped_to_assignee(
+    kanban_home, role_profiles_exist,
+):
+    """A ready card is only 'looping' when its OWN assignee failed twice: a
+    prior owner's crashes (e.g. after the review-loop hand-back) do not count,
+    so the reassigned coder actually respawns instead of flapping (F34)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix", assignee="voicera-coder", tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        # Two crashes by the REVIEWER; the card is now owned by the coder.
+        _ended_run(conn, tid, "voicera-reviewer", "crashed", _VIOLATION_SIG)
+        _ended_run(conn, tid, "voicera-reviewer", "crashed", _VIOLATION_SIG)
+        assert kb.check_respawn_guard(conn, tid) is None, (
+            "the reviewer's crashes are not the coder's loop"
+        )
+        # The SAME two crashes by the coder itself → a genuine loop.
+        conn.execute("DELETE FROM task_runs WHERE task_id=?", (tid,))
+        _ended_run(conn, tid, "voicera-coder", "crashed", _VIOLATION_SIG)
+        _ended_run(conn, tid, "voicera-coder", "crashed", _VIOLATION_SIG)
+        assert kb.check_respawn_guard(conn, tid) == "loop_detected"
+
+
+# ---------------------------------------------------------------------------
 # Negative case: an explicit, unknown declaration is an integration boundary,
 # not a hint. It must never fall through to the tenant default.
 # ---------------------------------------------------------------------------

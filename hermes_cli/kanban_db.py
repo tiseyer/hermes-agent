@@ -9325,6 +9325,41 @@ def _resolve_diagnosis_reviewer(
     return reviewer
 
 
+def _resolve_diagnosis_coder(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a spawnable coder profile for ``task_id`` or ``None``.
+
+    Mirror of :func:`_resolve_diagnosis_reviewer` for the review-loop brake
+    (F34). When the REVIEWER itself loops on an infra failure (a clean-exit
+    protocol violation recorded as ``crashed``, a crash, or a timeout) there
+    is no "route to the reviewer for diagnosis" move — this IS the reviewer —
+    so the brake hands the work BACK to the coder lane for a fresh attempt
+    instead of escalating a question-less human block. Resolution reuses the
+    central repo→profile pair (a declared repository wins, else the tenant
+    default). Returns ``None`` when no coder resolves OR the resolved coder is
+    not spawnable, so the caller falls back to the plain ``blocked@till``
+    escalation and bare-DB unit tests keep their existing behavior.
+    """
+    try:
+        pair = resolve_task_repo_profiles(conn, task_id)
+    except RepositoryProfileError:
+        pair = None
+    coder = pair[0] if pair else None
+    if not coder:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    try:
+        if not profile_exists(coder):
+            return None
+    except Exception:
+        return None
+    return coder
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10231,7 +10266,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -10285,7 +10320,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #     dispatcher routes the task to the reviewer for a diagnosis
     #     check instead (see the loop_detected handling in
     #     ``_dispatch_once_locked``).
-    if check_failure_loop(conn, task_id) is not None:
+    #
+    #     Scoped to the card's CURRENT assignee (F34): a loop is one worker
+    #     repeating itself, so a prior owner's failures don't count against a
+    #     profile the card was just reassigned to. Without this, the review-
+    #     loop brake's hand-back to the coder (path-2) would immediately
+    #     re-trip here on the reviewer's trailing crashes and flap the card
+    #     review↔ready forever without spawning. A card that failed twice in
+    #     a row under its own assignee still trips (profile matches), so every
+    #     genuine coder loop keeps routing to the reviewer unchanged.
+    if check_failure_loop(
+        conn, task_id, profile=row["assignee"],
+    ) is not None:
         return "loop_detected"
 
     # 3. Completed run within guard window — proof of recent success.
@@ -10836,7 +10882,9 @@ def _dispatch_once_locked(
                 # fix). Only after a confirmed diagnosis should a newly
                 # phrased coder task continue the work (goal
                 # "orchestrator-autonomy" §4).
-                loop_info = check_failure_loop(conn, row["id"]) or {}
+                loop_info = check_failure_loop(
+                    conn, row["id"], profile=row_assignee,
+                ) or {}
                 _loop_task = get_task(conn, row["id"])
                 # Same central repo→profile resolution as the review block
                 # path — a repo declaration on the card beats the tenant
@@ -11090,11 +11138,7 @@ def _dispatch_once_locked(
             continue
         # Loop brake for review runs: a reviewer that failed twice in a
         # row at the same thing must not get a third identical attempt
-        # (themeColor card burned 5 runs this way). Unlike the ready
-        # path we cannot route "to the reviewer for diagnosis" — this IS
-        # the reviewer — so park the card at the human with the loop
-        # signature. blocked@till is a terminal state per the board
-        # invariant; review-with-no-progress is not.
+        # (themeColor card burned 5 runs this way).
         # Scope: only the reviewer's OWN ended runs (profile filter) and
         # only real run outcomes — spawn_failed stays with the existing
         # consecutive_failures circuit breaker (gave_up → auto_block).
@@ -11106,6 +11150,84 @@ def _dispatch_once_locked(
         if review_loop is not None:
             result.respawn_guarded.append((row["id"], "review_loop_detected"))
             if not dry_run:
+                # F34: an INFRA-driven review loop — the reviewer exited
+                # cleanly without a terminal kanban call (protocol violation,
+                # recorded as 'crashed'), crashed, or timed out twice at the
+                # same thing — is BY CONSTRUCTION question-less: the reviewer
+                # never reached a verdict, let alone a business Zielfrage (a
+                # worker's genuine human wall goes through block_task, never
+                # this brake). Parking such a card at blocked@till
+                # (needs_input) produces a human block with no decision
+                # content, which the Beobachter rightly rejects as
+                # 'rot-technische-rueckfrage' ("Frage haette die Fabrik selbst
+                # loesen muessen" — the F33 class). We cannot "route to the
+                # reviewer for diagnosis" (this IS the reviewer), so keep the
+                # card in the factory's court the other way: hand the work
+                # BACK to the coder lane for a fresh attempt (reset failure
+                # budget), mirroring the ready-path brake that routes a looping
+                # coder to the reviewer. check_respawn_guard's loop_detected is
+                # scoped to the card's own assignee (see above), so the coder
+                # is NOT blamed for the reviewer's trailing crashes and
+                # actually respawns. Fall back to the human block only when the
+                # loop is NOT purely infra-driven (a reviewer that deliberately
+                # 'gave_up' / 'failed' / 'blocked' twice may carry a genuine
+                # decision) OR no coder profile resolves (bare-DB card).
+                infra_review_loop = check_failure_loop(
+                    conn, row["id"],
+                    profile=row["assignee"],
+                    outcomes=_INFRA_TRIP_OUTCOMES,
+                )
+                diag_coder = (
+                    _resolve_diagnosis_coder(conn, row["id"])
+                    if infra_review_loop is not None else None
+                )
+                if diag_coder is not None:
+                    with write_txn(conn):
+                        cur = conn.execute(
+                            """
+                            UPDATE tasks
+                               SET status               = 'ready',
+                                   assignee             = ?,
+                                   block_kind           = NULL,
+                                   consecutive_failures = 0
+                             WHERE id = ? AND status = 'review'
+                               AND claim_lock IS NULL
+                            """,
+                            (diag_coder, row["id"]),
+                        )
+                        if cur.rowcount == 1:
+                            conn.execute(
+                                "INSERT INTO task_comments "
+                                "(task_id, author, body, created_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    row["id"],
+                                    "orchestrator",
+                                    "Review-Loop erkannt: zwei "
+                                    "aufeinanderfolgende Reviewer-Runs endeten "
+                                    "ohne Urteil (Infra-/Protokollabbruch, "
+                                    "Signatur "
+                                    f"{review_loop.get('signature')!r}). Kein "
+                                    "drittes identisches Review; die Karte geht "
+                                    "zurück an den Coder für einen frischen "
+                                    "Versuch (Fehlerbudget zurückgesetzt). Kein "
+                                    "menschlicher Block — es liegt keine "
+                                    "Zielfrage vor.",
+                                    int(time.time()),
+                                ),
+                            )
+                            _append_event(
+                                conn, row["id"], "review_loop_detected",
+                                {"signature": review_loop.get("signature"),
+                                 "runs": review_loop.get("runs"),
+                                 "routed_to": diag_coder,
+                                 "disposition": "coder_reattempt"},
+                            )
+                    continue
+                # Non-infra loop or no coder resolves: the reviewer kept
+                # deliberately failing (gave_up/failed/blocked) — may be a real
+                # wall — so park at the human. blocked@till is a terminal state
+                # per the board invariant; review-with-no-progress is not.
                 with write_txn(conn):
                     cur = conn.execute(
                         """
