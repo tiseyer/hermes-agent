@@ -244,6 +244,50 @@ _CODER_INTERNAL_TRIAGE_REGEX = re.compile(
 # only fires for this set.
 _READ_ONLY_HANDOFF_ROLES = frozenset({"recon", "brain-reader"})
 
+# A reviewer is a read-only role (no node toolchain, no build env — see the
+# reviewer SOULs: "Read-only gegen Code. … Kein Live-DB-Zugang"). For a
+# backend change its verdict rests on checks that run anywhere (ruff/pytest),
+# so completing to ``done`` is honest. For a FRONTEND / build-gated change the
+# final acceptance is a node build (``npx tsc``/``vitest``/``npm``/``next
+# build``) that the reviewer CANNOT run read-only AND that the Beobachter's
+# throwaway check-worktree cannot run either (no ``node_modules`` there). A
+# ``done`` on such a card is therefore "done ohne vollständige Abnahme" (the
+# exact F16/F27/F29/F30 befund): the Regel-a shell re-run goes ROT on the
+# unverifiable build. The honest terminal is the MERGER — it runs in the real
+# checkout (``/home/till/work/<repo>`` WITH ``node_modules``) and performs the
+# build+typecheck as its own gate before the merge-Freigabe. So the reviewer
+# hands a build-gated card to the merger (``ready @ merger``) instead of
+# self-completing it. See _maybe_route_build_gated_to_merger below.
+_BUILD_GATED_RE = re.compile(
+    r"(?:\bnpx\b|\bnpm\b|\bpnpm\b|\byarn\b|\bvitest\b|\btsc\b"
+    r"|next\s+build|\bvite\b|(?:^|[\s/`'\"(])frontend/|\.tsx?\b|\.vue\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_reviewer_profile(profile: Optional[str]) -> bool:
+    """True when the current worker profile is a code reviewer.
+
+    Reviewers are tenant-scoped (``voicera-reviewer``, ``goya-reviewer`` …);
+    a bare ``reviewer`` is accepted for a future untenanted variant. The
+    orchestrator/specifier/coder profiles are deliberately excluded — they
+    have their own completion guards above.
+    """
+    p = (profile or "").strip().lower()
+    return p == "reviewer" or p.endswith("-reviewer")
+
+
+def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bool:
+    """True when the card's acceptance needs a node build the reviewer/Beobachter
+    cannot run (frontend / TypeScript). The signal is scanned across the card
+    title, body and the full comment thread — the specifier's
+    ``ABNAHMEKRITERIUM`` and the coder's handoff both quote the build commands
+    (``npx tsc``, ``vitest`` …) and name the ``frontend/…`` files, so by the
+    time the reviewer completes, the thread carries the signal reliably. A
+    pure backend card (ruff/pytest over ``*.py``) matches none of it."""
+    blob = "\n".join([title or "", body or "", *(comment_bodies or [])])
+    return bool(_BUILD_GATED_RE.search(blob))
+
 
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
@@ -767,6 +811,105 @@ def _handle_complete(args: dict, **kw) -> str:
                         "and hands off to the reviewer, who completes the card. "
                         "Do NOT spin the work onto a separate card."
                     )
+
+            # Build-gated reviewer completion → route to the merger, don't
+            # self-complete to `done` (F30, sibling of the F21 orchestrator and
+            # F01 specifier completion guards). The reviewer is read-only and
+            # cannot run a node build; the Beobachter re-runs the card's
+            # acceptance shell in a throwaway worktree that has no
+            # `node_modules`, so a FRONTEND card's `npx tsc`/`vitest`/`npm`
+            # acceptance can NEVER go green there. A `done` is then literally
+            # "done ohne vollständige Abnahme": branch=True, reviewer=ok, but
+            # shell=ROT on the unverifiable build → Regel a stays red every
+            # re-check (live probe Karte 5 'leereTexte entfernen', t_cbc5b67e:
+            # branch=True, shell=rot(`npx tsc`: no TS in the check-worktree),
+            # reviewer=voicera-reviewer, ergebnis_passt=True → ROT a). The
+            # honest terminal for a build-gated, reviewed change is the MERGER:
+            # it runs in the real checkout (tenant_workdir, WITH node_modules),
+            # does the typecheck/build as its own pre-merge gate, and the
+            # product-repo merge is a Freigabe that is Till's GO to give. So the
+            # reviewer hands the card to `ready @ merger` with an explicit
+            # merge-Freigabe question. The Beobachter greens it either as Regel
+            # c (`ready @ merger`, read before the dispatcher's GO-gate parks
+            # it) or — once the GO-gate flips it to `blocked @ till` — as Regel
+            # b (the merge-GO is a legitimate Freigabe-Zielfrage; the note is a
+            # `?`-comment and carries no TECH_REGEX term). A backend card is
+            # untouched: its ruff/pytest acceptance runs in the Beobachter venv,
+            # so its `done` is honest and Regel a greens it. Runs in the
+            # reviewer's own short-lived worker (re-imported per spawn), so it
+            # survives the gateway-restart gap that defeats dispatcher-side
+            # fixes (cf. F19). Only fires for a repo-bound card that carries a
+            # branch (a real build artifact the merger can act on).
+            if (
+                task
+                and _is_reviewer_profile(os.environ.get("HERMES_PROFILE"))
+                and (task.repository or task.tenant or "").strip()
+                and (task.branch_name or "").strip()
+            ):
+                comment_bodies = [
+                    (r[0] or "")
+                    for r in conn.execute(
+                        "SELECT body FROM task_comments WHERE task_id = ? "
+                        "ORDER BY created_at",
+                        (tid,),
+                    ).fetchall()
+                ]
+                if _card_is_build_gated(task.title, task.body or "", comment_bodies):
+                    repo_key = (
+                        (task.repository or task.tenant or "").strip().lower()
+                    )
+                    merge_target = "das Merge-Ziel des Repository-Profils"
+                    try:
+                        profiles = (
+                            (load_config().get("kanban", {}) or {})
+                            .get("repository_profiles", {})
+                            or {}
+                        )
+                        prof = profiles.get(repo_key) or {}
+                        mt = (prof.get("merge_target") or "").strip()
+                        if mt:
+                            merge_target = mt
+                    except Exception:  # noqa: BLE001 — config best-effort only
+                        pass
+                    branch = (task.branch_name or "").strip()
+                    go_note = (
+                        f"FREIGABE nötig (Merge-GO): Branch `{branch}` ist "
+                        f"review-grün — das Abnahmekriterium ist erfüllt, aber "
+                        f"die Abnahme ist build-/typecheck-gated (Frontend) und "
+                        f"lässt sich read-only nicht abschliessend verifizieren. "
+                        f"Der Merger baut im echten Checkout (mit node_modules), "
+                        f"führt Typecheck/Build aus und merged nach "
+                        f"`{merge_target}`. Soll dieser Merge freigegeben werden "
+                        f"(GO)?"
+                    )
+                    handed = kb.handoff_task(
+                        conn, tid, "merger",
+                        note=go_note,
+                        author=_normalize_profile(
+                            os.environ.get("HERMES_PROFILE")
+                        ),
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                    if handed:
+                        return _ok(
+                            task_id=tid,
+                            status="ready",
+                            assignee="merger",
+                            note=(
+                                "build-gated change → handed to the merger as a "
+                                "merge-Freigabe (ready @ merger) instead of "
+                                "done. A frontend acceptance (npx tsc / vitest / "
+                                "npm) cannot be verified read-only nor in the "
+                                "Beobachter's node_modules-less check-worktree, "
+                                "so a self-`done` would be 'done ohne "
+                                "vollständige Abnahme'. The merger builds in the "
+                                "real checkout and performs the merge after "
+                                "Till's GO."
+                            ),
+                        )
+                    # Handoff failed (card not in running/ready, or lost the
+                    # claim race). Fall through to the normal completion path
+                    # rather than wedging the reviewer.
 
             try:
                 ok = kb.complete_task(
