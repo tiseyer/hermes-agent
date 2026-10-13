@@ -9284,6 +9284,75 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 # observer treats as in-progress (OFFEN within the Frist), never an escalation.
 _INFRA_TRIP_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
 
+# F36 convergence ceiling. The F33 diagnosis reroute resets the failure
+# budget (``consecutive_failures = 0``) on EVERY infra trip, so a card whose
+# infra defect never clears — e.g. a coder workspace that was never
+# materialized as a git worktree, so the task branch never reaches ``origin``
+# and the reviewer can NEVER spawn — ping-pongs reviewer-diagnosis forever and
+# is never released to a terminal state. The live t_3535c341 burned 24
+# ``infra_failure_diagnosis`` cycles and sat in ``running`` past 1.0h, which
+# the Beobachter rightly flagged as 'rot-running' ("Karte zu lange in
+# progress"). After this many diagnosis→reattempt cycles the self-repair has
+# provably failed to converge and the card is handed to the merger instead of
+# re-diagnosed again (see ``_record_task_failure``).
+_INFRA_DIAGNOSIS_REROUTE_CAP = 3
+
+
+def _infra_selfrepair_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many times ``task_id`` has already been through the F33 infra
+    self-repair reroute.
+
+    Each F33 trip that routes to the reviewer for a diagnosis emits exactly
+    one ``infra_failure_diagnosis`` event, so the row count is the number of
+    diagnosis→reattempt cycles the card has already burned. Drives the F36
+    convergence ceiling.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'infra_failure_diagnosis'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _resolve_merger(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a spawnable merger profile for ``task_id`` or ``None``.
+
+    The merger is the one role that runs in the real tenant checkout (WITH git
+    remotes and a real ``.env``), so it can materialize a branch / finish an
+    integration that the sandboxed coder/reviewer worker lane could not — the
+    same real-checkout escape hatch F30/F31 use for a build-gated completion.
+    Prefers a tenant-scoped ``<repo>-merger`` (future-proofing
+    :func:`_is_merger_profile`'s ``-merger`` suffix match), else the central
+    ``merger``. Returns ``None`` when no merger profile is spawnable, so the
+    caller falls back to the plain circuit-breaker ``blocked`` lane and
+    bare-DB unit tests (no configured profiles) keep their existing behavior.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    candidates: list[str] = []
+    try:
+        profile = resolve_task_repository_profile(conn, task_id)
+    except RepositoryProfileError:
+        profile = None
+    if profile is not None:
+        coder = profile.coder or ""
+        repo_key = coder[:-6] if coder.endswith("-coder") else ""
+        if repo_key:
+            candidates.append(f"{repo_key}-merger")
+    candidates.append("merger")
+    for cand in candidates:
+        try:
+            if profile_exists(cand):
+                return cand
+        except Exception:
+            continue
+    return None
+
 
 def _resolve_diagnosis_reviewer(
     conn: sqlite3.Connection, task_id: str,
@@ -9444,12 +9513,79 @@ def _record_task_failure(
             # Trip the breaker. Every trip here is infra-driven (see
             # ``_INFRA_TRIP_OUTCOMES``), so prefer the reviewer-diagnosis
             # reroute over the question-less human ``blocked`` lane (F33).
-            reviewer_for_diag = (
-                _resolve_diagnosis_reviewer(conn, task_id)
-                if outcome in _INFRA_TRIP_OUTCOMES
+            infra_outcome = outcome in _INFRA_TRIP_OUTCOMES
+            # F36: once the diagnosis→reattempt self-repair has looped
+            # ``_INFRA_DIAGNOSIS_REROUTE_CAP`` times without the infra defect
+            # clearing, stop re-diagnosing (it never converges — see the
+            # constant's note) and hand the card to the MERGER, which runs in
+            # the real tenant checkout and can finish what the broken worker
+            # lane could not. ``ready @ merger`` is a terminal the Beobachter
+            # greens (Regel c; or Regel b once the dispatcher's GO-gate parks
+            # it to blocked@till with the merge-Freigabe Zielfrage) and keeps
+            # the card in the factory's court — NOT a question-less blocked@till
+            # (which the Beobachter rejects as rot-technische-rueckfrage, the
+            # very failure F33 exists to avoid). Falls back to the plain
+            # diagnosis reroute when no merger profile is spawnable (bare-DB).
+            selfrepair_cycles = (
+                _infra_selfrepair_count(conn, task_id) if infra_outcome else 0
+            )
+            merger_for_route = (
+                _resolve_merger(conn, task_id)
+                if (
+                    infra_outcome
+                    and selfrepair_cycles >= _INFRA_DIAGNOSIS_REROUTE_CAP
+                )
                 else None
             )
-            if reviewer_for_diag is not None:
+            reviewer_for_diag = (
+                _resolve_diagnosis_reviewer(conn, task_id)
+                if infra_outcome and merger_for_route is None
+                else None
+            )
+            if merger_for_route is not None:
+                merge_profile = None
+                try:
+                    merge_profile = resolve_task_repository_profile(
+                        conn, task_id,
+                    )
+                except RepositoryProfileError:
+                    merge_profile = None
+                merge_target = (
+                    (merge_profile.merge_target or "").strip()
+                    if merge_profile else ""
+                ) or "das Merge-Ziel des Repository-Profils"
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', assignee = ?, "
+                    "block_kind = NULL, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "consecutive_failures = 0, last_failure_error = ? "
+                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    (merger_for_route, error[:500], task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Infrastruktur-Fehler nach wiederholten "
+                        "Diagnose-Durchlaeufen nicht selbst behoben — die "
+                        "Fabrik hat die Selbstheilung (Diagnose + neu "
+                        "formulierter Versuch) mehrfach ausgeschoepft, ohne "
+                        "dass der Fehler verschwindet (z. B. Worker-Workspace "
+                        "ist kein Git-Worktree, der Branch erreicht 'origin' "
+                        "nie, der Reviewer kann nicht starten). Keine "
+                        "Rueckfrage an Till. FREIGABE noetig (Merge-GO): Der "
+                        "Merger arbeitet im echten Checkout (mit Git-Remotes "
+                        "und echter .env), materialisiert den Branch und "
+                        "schliesst die Integration nach "
+                        f"`{merge_target}` ab. Soll diese Karte im echten "
+                        "Checkout fertiggestellt und gemerged werden (GO)?",
+                        int(time.time()),
+                    ),
+                )
+            elif reviewer_for_diag is not None:
                 # Infra failure (worker died / couldn't spawn / timed out)
                 # after repeated attempts — the factory's own problem, not a
                 # Zielfrage. Route to the reviewer for a diagnosis check, the
@@ -9515,6 +9651,7 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                         "routed_to_diagnosis": reviewer_for_diag,
+                        "routed_to_merger": merger_for_route,
                     },
                 )
             payload = {
@@ -9535,6 +9672,18 @@ def _record_task_failure(
                     {"trigger_outcome": outcome,
                      "routed_to": reviewer_for_diag,
                      "failures": failures},
+                    run_id=run_id,
+                )
+            elif merger_for_route is not None:
+                # F36: self-repair ceiling reached — card handed to the merger
+                # (real checkout) instead of another budget-resetting diagnosis
+                # reroute. Terminal; Beobachter greens ready @ merger (Regel c).
+                _append_event(
+                    conn, task_id, "infra_selfrepair_exhausted",
+                    {"trigger_outcome": outcome,
+                     "routed_to": merger_for_route,
+                     "failures": failures,
+                     "diagnosis_cycles": selfrepair_cycles},
                     run_id=run_id,
                 )
             blocked = True

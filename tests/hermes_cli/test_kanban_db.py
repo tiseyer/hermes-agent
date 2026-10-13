@@ -1329,6 +1329,116 @@ def test_infra_trip_without_reviewer_falls_back_to_blocked(
         assert task.consecutive_failures >= 2
 
 
+def test_infra_selfrepair_ceiling_routes_to_merger(kanban_home, monkeypatch):
+    """F36: the F33 diagnosis reroute resets the failure budget on every infra
+    trip, so a card whose infra defect never clears (coder workspace is not a
+    worktree → branch never reaches origin → reviewer can never spawn)
+    ping-pongs reviewer-diagnosis forever and is never released — it sits in
+    ``running`` past the Beobachter's frist and trips ``rot-running``. Once the
+    diagnosis→reattempt cycle has looped ``_INFRA_DIAGNOSIS_REROUTE_CAP`` times,
+    the next infra trip must stop re-diagnosing and hand the card to the MERGER
+    (``ready @ merger``) — a terminal the Beobachter greens (Regel c / b), in
+    the factory's court, not a question-less human block.
+    """
+    from types import SimpleNamespace
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        kb, "resolve_task_repo_profiles",
+        lambda conn, tid: ("x-coder", "x-reviewer", "structured"),
+    )
+    monkeypatch.setattr(
+        kb, "resolve_task_repository_profile",
+        lambda conn, tid: SimpleNamespace(coder="x-coder", merge_target="develop"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="trivial lint", assignee="x-coder")
+        kb.claim_task(conn, t)
+        # The factory has already burned the full self-repair budget: CAP
+        # diagnosis reroutes recorded, infra defect never cleared.
+        for _ in range(kb._INFRA_DIAGNOSIS_REROUTE_CAP):
+            kb._append_event(
+                conn, t, "infra_failure_diagnosis",
+                {"trigger_outcome": "crashed", "routed_to": "x-reviewer"},
+            )
+        # The next infra trip (two more crashes at limit 2).
+        kb._record_task_failure(
+            conn, t, error="pid 111 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        kb._record_task_failure(
+            conn, t, error="pid 222 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert "merger" in task.assignee
+        assert task.block_kind is None
+        assert task.consecutive_failures == 0
+        # A merge-Freigabe GO note (a legitimate '?' Zielfrage), NOT another
+        # DIAGNOSE-AUFTRAG.
+        comments = [
+            c["body"] for c in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert any("Merge-GO" in b and "?" in b for b in comments)
+        # Audit event for the exhaustion reroute; no NEW diagnosis event.
+        exhausted = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'infra_selfrepair_exhausted'",
+            (t,),
+        ).fetchone()
+        assert exhausted is not None
+        diag_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'infra_failure_diagnosis'",
+            (t,),
+        ).fetchone()["n"]
+        assert diag_count == kb._INFRA_DIAGNOSIS_REROUTE_CAP
+
+
+def test_infra_trip_below_ceiling_still_diagnoses(kanban_home, monkeypatch):
+    """F36 boundary: with fewer than ``_INFRA_DIAGNOSIS_REROUTE_CAP`` prior
+    diagnosis reroutes the trip keeps the F33 reviewer-diagnosis behavior — the
+    merger escape hatch only fires once self-repair has provably failed."""
+    from types import SimpleNamespace
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        kb, "resolve_task_repo_profiles",
+        lambda conn, tid: ("x-coder", "x-reviewer", "structured"),
+    )
+    monkeypatch.setattr(
+        kb, "resolve_task_repository_profile",
+        lambda conn, tid: SimpleNamespace(coder="x-coder", merge_target="develop"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="trivial lint", assignee="x-coder")
+        kb.claim_task(conn, t)
+        # One short of the ceiling.
+        for _ in range(kb._INFRA_DIAGNOSIS_REROUTE_CAP - 1):
+            kb._append_event(
+                conn, t, "infra_failure_diagnosis",
+                {"trigger_outcome": "crashed", "routed_to": "x-reviewer"},
+            )
+        kb._record_task_failure(
+            conn, t, error="pid 111 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        kb._record_task_failure(
+            conn, t, error="pid 222 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "x-reviewer"
+
+
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""
