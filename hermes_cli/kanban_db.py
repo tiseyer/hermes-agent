@@ -10826,7 +10826,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, title, body, tenant, merge_group FROM tasks "
+        "SELECT id, assignee, title, body, tenant, merge_group, category FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         # Family roots are visible projections of their work children, never
         # workers (get_spawn_rejection_reason -> 'family_root'). Excluding them
@@ -10926,11 +10926,24 @@ def _dispatch_once_locked(
         _title = row["title"] or ""
         _body = row["body"] or ""
         _row_merge_group = row["merge_group"]
+        # F40: a card that was ALREADY GO-gate-parked carries category
+        # 'go_noetig' for life, but parking reset its assignee to 'till' and
+        # (for a merger card) stripped the only vocabulary signal. If such a
+        # card leaks back into 'ready' — e.g. the Beobachter answers a stale
+        # Zielfrage on it (blocked→todo) and recompute_ready promotes
+        # todo→ready@till — the title/body/merger checks no longer fire and
+        # the card strands in ready@till (non-spawnable human assignee, never
+        # re-parked) until a board scan reads it as rot-stuck. The persisted
+        # category is the durable "needs human GO" marker the dispatcher must
+        # honour: re-assert the hold so the card rests in blocked@till, which
+        # is where a waiting-on-Till card belongs.
+        _row_category = (row["category"] or "") if "category" in row.keys() else ""
         _is_terminal_card = (
             bool(_GO_GATE_RE.search(_title))
             or bool(_GO_GATE_BODY_RE.search(_body))
             or _is_merger_profile(row_assignee)
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
+            or _row_category == "go_noetig"
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):
             result.skipped_nonspawnable.append(row["id"])
@@ -10956,6 +10969,16 @@ def _dispatch_once_locked(
                         (row["id"],),
                     )
                     if cur.rowcount == 1:
+                        # F40: has this card ever been go-gate-held before?
+                        # Capture BEFORE we append the new go_gate_held event
+                        # below, so the one-shot explainer comment still posts
+                        # on the first park.
+                        _already_held = conn.execute(
+                            "SELECT 1 FROM task_events "
+                            "WHERE task_id = ? AND kind = 'go_gate_held' "
+                            "LIMIT 1",
+                            (row["id"],),
+                        ).fetchone()
                         _append_event(
                             conn, row["id"], "blocked",
                             {"kind": "needs_input",
@@ -10969,21 +10992,29 @@ def _dispatch_once_locked(
                              "reason": "terminal card requires "
                                        "explicit human GO"},
                         )
-                        conn.execute(
-                            "INSERT INTO task_comments "
-                            "(task_id, author, body, created_at) "
-                            "VALUES (?, ?, ?, ?)",
-                            (
-                                row["id"],
-                                "orchestrator",
-                                "GO-Gate: Diese Karte verlangt eine terminale "
-                                "Aktion (Smoke/Deploy/Live/Merge/Release) und "
-                                "wird nicht automatisch gestartet. Assignee auf "
-                                "'till' gesetzt — für GO einem echten Profil "
-                                "zuweisen und die Karte entblocken.",
-                                int(time.time()),
-                            ),
-                        )
+                        # The GO-Gate explainer comment is posted ONCE. A card
+                        # that keeps leaking back to 'ready' (the Beobachter
+                        # re-answers a stale Zielfrage every tick →
+                        # recompute_ready re-promotes it) would otherwise
+                        # accrue one identical comment per dispatch tick. Skip
+                        # the INSERT if this card was already go-gate-held; the
+                        # status flip + events are enough to re-assert the hold.
+                        if not _already_held:
+                            conn.execute(
+                                "INSERT INTO task_comments "
+                                "(task_id, author, body, created_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    row["id"],
+                                    "orchestrator",
+                                    "GO-Gate: Diese Karte verlangt eine terminale "
+                                    "Aktion (Smoke/Deploy/Live/Merge/Release) und "
+                                    "wird nicht automatisch gestartet. Assignee auf "
+                                    "'till' gesetzt — für GO einem echten Profil "
+                                    "zuweisen und die Karte entblocken.",
+                                    int(time.time()),
+                                ),
+                            )
             continue
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an

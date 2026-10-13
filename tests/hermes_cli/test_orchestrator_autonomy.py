@@ -339,6 +339,60 @@ def test_go_gate_holds_preassigned_terminal_card(
         assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
 
 
+def test_go_gate_reparks_leaked_go_noetig_card_without_comment_spam(
+    kanban_home, all_assignees_spawnable,
+):
+    # F40: a card already GO-gate-parked carries category 'go_noetig' for
+    # life, but parking reset its assignee to 'till' and (for a card whose
+    # title/body never named a terminal step) left no vocabulary signal. If
+    # the Beobachter then answers a stale Zielfrage on it (blocked -> todo)
+    # and recompute_ready promotes todo -> ready@till, the title/body/merger
+    # checks no longer fire, so the pre-F40 gate ignored it and the card
+    # stranded in ready@till (non-spawnable human assignee) until a board
+    # scan flagged it rot-stuck. The persisted 'go_noetig' category must
+    # re-assert the hold: re-park to blocked@till, and post the one-shot
+    # explainer comment only once across repeated leak/re-park cycles.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Tier-System: Ballast aufloesen (VEREINFACHUNGS-FRAGE)",
+            assignee="till",
+        )
+        # Simulate the leaked post-park state the Beobachter produces.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = 'till', "
+            "category = 'go_noetig', block_kind = 'needs_input' WHERE id = ?",
+            (tid,),
+        )
+
+        def _comment_count() -> int:
+            return conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+                "AND body LIKE 'GO-Gate:%'",
+                (tid,),
+            ).fetchone()[0]
+
+        # First leak: re-park + one explainer comment.
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        assert task.block_kind == "needs_input"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+        assert _comment_count() == 1
+
+        # Beobachter answers the stale Zielfrage again: blocked -> ready leak.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "blocked"
+        # Idempotent: the explainer comment is NOT duplicated per cycle.
+        assert _comment_count() == 1
+
+
 def test_go_gate_holds_merger_card_despite_assignee(
     kanban_home, all_assignees_spawnable,
 ):
