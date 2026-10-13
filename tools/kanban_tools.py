@@ -220,6 +220,21 @@ _SPECIFIER_TECH_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Mirror of the Beobachter's richter TOR1/TOR3 for the repo coder's block gate
+# (F28). A human-escalation block whose question is about INTERNAL TASK STATE —
+# task IDs (``t_<hex>``), worktree branches (``wt/...``), or a duplicate/merge
+# triage — is not a business Zielfrage: Till never sees task IDs or wt/ branch
+# names and cannot answer on a business basis, so the observer's richter forces
+# TOR1=NO (reine Arbeitskoordination, keine Geschaefts-Dimension) and TOR3=NO
+# ("verlangt internes Code-/Datenmodell-Verstaendnis: Task-IDs, Branches
+# wt/t_*, Merge-Status") → rot-technische-rueckfrage. Such markers never appear
+# in a genuine business/Freigabe question, so matching them is a safe necessary-
+# condition mirror that leaves the coder's real-wall block path untouched.
+_CODER_INTERNAL_TRIAGE_REGEX = re.compile(
+    r"\bt_[0-9a-f]{6,}\b|\bwt/|\bduplikat|\bduplicate",
+    re.IGNORECASE,
+)
+
 # Read-only helper roles the specifier SPAWNS as delegation subagents for facts
 # (recon = code-state, brain-reader = Brain knowledge). They own no write access
 # ("kein Write, kein Edit, keine Commits" — recon SOUL) and are NEVER a valid
@@ -1004,6 +1019,62 @@ def _handle_block(args: dict, **kw) -> str:
                     "completes the card). Only block for a business/Freigabe "
                     "decision that is Till's to make, stated as a question in a "
                     "comment."
+                )
+        # Coder block gate (F28, sibling of the specifier gate F23/F24). The
+        # repo coder keeps its genuine-wall block path for a real business/
+        # Freigabe decision (there is a test allowing "need a decision from
+        # Till"), but it may NOT escalate INTERNAL ARBEITSKOORDINATION to a
+        # human. Live probe card t_9b6d4067 ('Ungenutzte Funktion leereTexte
+        # entfernen', klein, erwartung=done): the specifier noted the function
+        # was already removed on wt/t_7e8f28b1 (NOT merged to develop); the
+        # coder, finding the function STILL in origin/develop, blocked
+        # needs_input with "Ist t_9b6d4067 ein Duplikat von t_7e8f28b1? Karte
+        # schliessen oder neu bauen?" — a pure task-identity/merge-status triage
+        # aimed at the ORCHESTRATOR, not Till. That question has a "?" and trips
+        # no TECH_REGEX, so the specifier-style checks miss it, but the
+        # Beobachter's richter rejects it: TOR1 NO (internal coordination, no
+        # business dimension), TOR3 NO (needs internal task-ID/branch/merge
+        # knowledge) → rot-technische-rueckfrage. Mirror that necessary
+        # condition in code: a human-escalation block whose question (comment
+        # with "?" — read like the observer's _letzte_frage — or the reason,
+        # which guards against kind-shopping the question into the reason)
+        # references internal task state is the fabric's own to resolve. Scoped
+        # to repo coders (profile ends "-coder"), which excludes the orchestrator
+        # and specifier (their own gates above). Worker-side (re-imported per
+        # spawn), live on the next coder spawn with no gateway restart (cf. F19).
+        if (
+            task
+            and (_normalize_profile(os.environ.get("HERMES_PROFILE")) or "")
+            .endswith("-coder")
+            and kind in _HUMAN_BLOCK_KINDS
+        ):
+            frage = ""
+            try:
+                for c in kb.list_comments(conn, tid):
+                    if "?" in (c.body or ""):
+                        frage = c.body or ""
+            except Exception:
+                frage = ""
+            blob = f"{frage}\n{reason}"
+            if _CODER_INTERNAL_TRIAGE_REGEX.search(blob):
+                conn.close()
+                return tool_error(
+                    "the coder may not escalate internal work-coordination to "
+                    "a human. This block's question is about internal task "
+                    "state — task IDs, wt/ worktree branches, a duplicate or "
+                    "merge-status triage — which Till never sees and cannot "
+                    "answer on a business basis; the Beobachter rejects it as "
+                    "rot-technische-rueckfrage (\"Frage haette die Fabrik "
+                    "selbst loesen muessen\"). Resolve it yourself: a perceived "
+                    "duplicate, or an orphan prior worktree (a change already "
+                    "made on another wt/<id> branch but NOT merged into the "
+                    "base ref), is RECON, never a Rueckfrage. If the target "
+                    "code still exists in the base ref, the work is NOT done — "
+                    "ignore the orphan branch, make the edit cleanly on your "
+                    "own wt/<id> from the base ref, and hand it to the reviewer "
+                    "the normal way. Only block for a genuine business/Freigabe "
+                    "decision that is Till's to make — stated as a question in "
+                    "a comment, free of internal task IDs and branch names."
                 )
         try:
             ok = kb.block_task(

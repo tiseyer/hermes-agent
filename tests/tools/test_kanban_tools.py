@@ -749,6 +749,106 @@ def test_block_allowed_for_specifier_question_in_prior_comment(monkeypatch, work
     assert d.get("ok") is True
 
 
+def test_block_rejected_for_coder_internal_triage_comment(monkeypatch, worker_env):
+    """F28: the repo coder may not escalate internal work-coordination. Live
+    probe card t_9b6d4067 ('Ungenutzte Funktion leereTexte entfernen', klein,
+    erwartung=done): the coder found the function still in develop and blocked
+    needs_input asking the orchestrator whether t_9b6d4067 is a duplicate of
+    t_7e8f28b1 (fn already removed on wt/t_7e8f28b1 but not merged) — close the
+    card or rebuild? That question has a '?' and trips no TECH_REGEX, but it is
+    pure internal task-identity/merge triage (task IDs, wt/ branches) → the
+    beobachter's richter forces TOR1/TOR3 NO → 'rot-technische-rueckfrage'. The
+    gate rejects it; the coder must resolve it itself and build."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Ungenutzte Funktion leereTexte entfernen",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=("## Coder-Befund: Task-Verwechslung\n\nIst t_9b6d4067 ein "
+                  "Duplikat von t_7e8f28b1 (Funktion schon auf wt/t_7e8f28b1 "
+                  "entfernt, aber nicht in develop gemerged)? Karte schliessen "
+                  "oder neu bauen?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "internal work-coordination" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_coder_internal_triage_in_reason(monkeypatch, worker_env):
+    """F28: the gate also scans the block reason, so the coder cannot kind-shop
+    the internal-triage question out of a comment and into the reason to slip
+    past it. A reason naming a wt/ worktree branch is rejected."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Ungenutzte Funktion leereTexte entfernen",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "Arbeit evtl. schon auf wt/t_7e8f28b1 erledigt — Karte "
+                  "schliessen oder neu bauen?",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "internal work-coordination" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_coder_genuine_business_wall(monkeypatch, worker_env):
+    """F28 must not narrow the coder's genuine-wall path: a block whose question
+    is a real business/Freigabe decision for Till — carrying no internal task
+    IDs or wt/ branch names — still passes (the beobachter's richter then judges
+    it). Mirror of test_block_allowed_for_non_orchestrator_repo_work_card."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coder hit a wall",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body="brauche Klaerung: soll ich nach main freigeben?",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a decision from Till", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_handoff_rejected_for_specifier_to_recon(monkeypatch, worker_env):
     """F25: the specifier's forward handoff must go to a write-capable
     ``<repo>-coder``; recon is read-only and cannot build, so routing a build
