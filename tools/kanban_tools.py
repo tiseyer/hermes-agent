@@ -245,22 +245,62 @@ _CODER_INTERNAL_TRIAGE_REGEX = re.compile(
 _READ_ONLY_HANDOFF_ROLES = frozenset({"recon", "brain-reader"})
 
 # A reviewer is a read-only role (no node toolchain, no build env — see the
-# reviewer SOULs: "Read-only gegen Code. … Kein Live-DB-Zugang"). For a
-# backend change its verdict rests on checks that run anywhere (ruff/pytest),
-# so completing to ``done`` is honest. For a FRONTEND / build-gated change the
-# final acceptance is a node build (``npx tsc``/``vitest``/``npm``/``next
-# build``) that the reviewer CANNOT run read-only AND that the Beobachter's
-# throwaway check-worktree cannot run either (no ``node_modules`` there). A
-# ``done`` on such a card is therefore "done ohne vollständige Abnahme" (the
-# exact F16/F27/F29/F30 befund): the Regel-a shell re-run goes ROT on the
-# unverifiable build. The honest terminal is the MERGER — it runs in the real
-# checkout (``/home/till/work/<repo>`` WITH ``node_modules``) and performs the
-# build+typecheck as its own gate before the merge-Freigabe. So the reviewer
-# hands a build-gated card to the merger (``ready @ merger``) instead of
-# self-completing it. See _maybe_route_build_gated_to_merger below.
+# reviewer SOULs: "Read-only gegen Code. … Kein Live-DB-Zugang"). For a purely
+# STATIC backend change its verdict rests on checks that run anywhere (``ruff``,
+# ``py_compile``, ``vulture`` over ``*.py``), so completing to ``done`` is
+# honest — the Beobachter re-runs the same static check in its venv and greens
+# Regel a. Two acceptance shapes break that, and both terminate at the MERGER:
+#
+#   1) FRONTEND / build-gated: the final acceptance is a node build
+#      (``npx tsc``/``vitest``/``npm``/``next build``) that the reviewer CANNOT
+#      run read-only AND that the Beobachter's throwaway check-worktree cannot
+#      run either (no ``node_modules`` there).
+#   2) BACKEND / runtime-env-gated (F31): the acceptance IMPORTS or BOOTS the
+#      application package at runtime (``python -c 'import app.models'``,
+#      ``import app.main``, ``uvicorn``, ``alembic upgrade``). Importing ``app``
+#      instantiates ``Settings()``, which demands runtime secrets
+#      (``ANTHROPIC_API_KEY``, DB URL …). The Beobachter runs this in a fresh
+#      ``git worktree`` under ``/tmp`` that carries only committed files — no
+#      gitignored ``.env`` — so ``Settings()`` raises ``ValidationError`` and
+#      the check goes ROT on a pure env gap, not a code defect (live probe
+#      Karte 7 'Undefinierte Namen …', t_f2d07fdb: ``ruff F821`` green but
+#      ``cd backend && python -c 'import app.models'`` → ``ANTHROPIC_API_KEY
+#      muss gesetzt sein`` → ROT a). A read-only reviewer cannot supply the
+#      secret either.
+#
+# For both, a ``done`` is literally "done ohne vollständige Abnahme" (the exact
+# F16/F27/F29/F30/F31 befund): branch=True, reviewer=ok, but shell=ROT on the
+# unverifiable build/import → Regel a stays red every re-check. The honest
+# terminal is the MERGER — it runs in the real checkout
+# (``/home/till/work/<repo>`` WITH ``node_modules`` AND the real ``.env``),
+# performs the build/typecheck OR the runtime import as its own pre-merge gate,
+# and merges after Till's GO. So the reviewer hands such a card to the merger
+# (``ready @ merger``) instead of self-completing it. See the build-gated block
+# in _handle_complete below.
 _BUILD_GATED_RE = re.compile(
     r"(?:\bnpx\b|\bnpm\b|\bpnpm\b|\byarn\b|\bvitest\b|\btsc\b"
     r"|next\s+build|\bvite\b|(?:^|[\s/`'\"(])frontend/|\.tsx?\b|\.vue\b)",
+    re.IGNORECASE,
+)
+
+# Backend runtime-env gate (F31). Matches an acceptance that must IMPORT or BOOT
+# the live ``app`` package (needs secrets/DB the env-less check-worktree lacks),
+# plus the reviewer's own admission that a part is only verifiable against the
+# running backend. Note ``import\s+app\.`` only fires on a runtime-import
+# command/note ("import app.models") — it deliberately does NOT match a source
+# import like ``from app.models.tenant import Tenant`` (there "import" is
+# followed by the symbol, not "app."), so quoting a TYPE_CHECKING guard in the
+# spec does not by itself trip the gate. ``pytest`` is excluded on purpose: its
+# cards historically green as ``done`` in the Beobachter venv and must keep that
+# path.
+_RUNTIME_ENV_GATED_RE = re.compile(
+    r"(?:python[0-9.]*\s+-c\b[^\n]*\bimport\s+app\b"
+    r"|\bimport\s+app\.(?:models|main|api|services|tasks|core|db|database"
+    r"|routers?|workers?|cli|config|schemas)\b"
+    r"|\buvicorn\b|\bgunicorn\b|\balembic\s+\w"
+    r"|python[0-9.]*\s+-m\s+app\b"
+    r"|live[-\s]?import|laufzeit[-\s]?import|runtime[-\s]?import"
+    r"|import[^\n]*laufenden?\s+backend|laufenden?\s+backend[^\n]*import)",
     re.IGNORECASE,
 )
 
@@ -278,15 +318,18 @@ def _is_reviewer_profile(profile: Optional[str]) -> bool:
 
 
 def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bool:
-    """True when the card's acceptance needs a node build the reviewer/Beobachter
-    cannot run (frontend / TypeScript). The signal is scanned across the card
-    title, body and the full comment thread — the specifier's
-    ``ABNAHMEKRITERIUM`` and the coder's handoff both quote the build commands
-    (``npx tsc``, ``vitest`` …) and name the ``frontend/…`` files, so by the
-    time the reviewer completes, the thread carries the signal reliably. A
-    pure backend card (ruff/pytest over ``*.py``) matches none of it."""
+    """True when the card's acceptance needs an environment the reviewer/Beobachter
+    cannot provide: a node build (frontend / TypeScript) OR a runtime import/boot
+    of the ``app`` package that demands secrets the env-less check-worktree lacks
+    (F31). The signal is scanned across the card title, body and the full comment
+    thread — the specifier's ``ABNAHMEKRITERIUM`` and the coder's handoff both
+    quote the acceptance commands (``npx tsc``, ``vitest`` …, or
+    ``python -c 'import app.models'``) and name the gated files, so by the time
+    the reviewer completes, the thread carries the signal reliably. A purely
+    static backend card (``ruff``/``py_compile``/``vulture`` over ``*.py``)
+    matches none of it and stays on the honest ``done`` path."""
     blob = "\n".join([title or "", body or "", *(comment_bodies or [])])
-    return bool(_BUILD_GATED_RE.search(blob))
+    return bool(_BUILD_GATED_RE.search(blob) or _RUNTIME_ENV_GATED_RE.search(blob))
 
 
 def _goal_judge_available() -> bool:
@@ -875,10 +918,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     go_note = (
                         f"FREIGABE nötig (Merge-GO): Branch `{branch}` ist "
                         f"review-grün — das Abnahmekriterium ist erfüllt, aber "
-                        f"die Abnahme ist build-/typecheck-gated (Frontend) und "
-                        f"lässt sich read-only nicht abschliessend verifizieren. "
-                        f"Der Merger baut im echten Checkout (mit node_modules), "
-                        f"führt Typecheck/Build aus und merged nach "
+                        f"die Abnahme ist build-/laufzeit-gated (Frontend-Build "
+                        f"oder Laufzeit-Import des Backends, der Secrets/DB "
+                        f"braucht) und lässt sich read-only nicht abschliessend "
+                        f"verifizieren. Der Merger baut/importiert im echten "
+                        f"Checkout (mit node_modules UND echter .env), führt "
+                        f"Typecheck/Build bzw. den App-Import aus und merged nach "
                         f"`{merge_target}`. Soll dieser Merge freigegeben werden "
                         f"(GO)?"
                     )
@@ -896,15 +941,17 @@ def _handle_complete(args: dict, **kw) -> str:
                             status="ready",
                             assignee="merger",
                             note=(
-                                "build-gated change → handed to the merger as a "
-                                "merge-Freigabe (ready @ merger) instead of "
-                                "done. A frontend acceptance (npx tsc / vitest / "
-                                "npm) cannot be verified read-only nor in the "
-                                "Beobachter's node_modules-less check-worktree, "
-                                "so a self-`done` would be 'done ohne "
-                                "vollständige Abnahme'. The merger builds in the "
-                                "real checkout and performs the merge after "
-                                "Till's GO."
+                                "build-/runtime-gated change → handed to the "
+                                "merger as a merge-Freigabe (ready @ merger) "
+                                "instead of done. A frontend acceptance (npx tsc "
+                                "/ vitest / npm) or a backend runtime import "
+                                "(python -c 'import app.…', uvicorn — needs the "
+                                "real .env secrets) cannot be verified read-only "
+                                "nor in the Beobachter's node_modules-less / "
+                                "env-less check-worktree, so a self-`done` would "
+                                "be 'done ohne vollständige Abnahme'. The merger "
+                                "builds/imports in the real checkout and performs "
+                                "the merge after Till's GO."
                             ),
                         )
                     # Handoff failed (card not in running/ready, or lost the
