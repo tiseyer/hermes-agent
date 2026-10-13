@@ -376,6 +376,64 @@ def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bo
     return False
 
 
+# F39: a Zielentscheidung card — a genuine business/product decision that is the
+# OWNER's call (fully remove vs. reduce a feature, which secret-store, which price
+# model, which demo strategy …). The Beobachter marks these ``art: zielfrage``,
+# ``erwartung: blocked_zielfrage``: the only green terminal is ``blocked`` with a
+# prepared Zielfrage for Till — a ``done`` is ALWAYS wrong and lands as
+# ``rot-zielentscheid-selbst`` ("Fabrik hat Zielentscheidung selbst getroffen,
+# done statt blocked"). Live probe Karte 44 ('Tier-System: Ballast aufloesen
+# (VEREINFACHUNGS-FRAGE)', erwartung=blocked_zielfrage, branch=None): the specifier
+# correctly read it as "reine Entscheidungs-/Analysekarte, keine Baukarte" but
+# handed it onward for CLOSURE; the orchestrator ran a "Schlussprüfung" and the
+# voicera-reviewer completed it ``done`` with its OWN recommendation ("vollständig,
+# aber gestuft entfernen") → ROT rot-zielentscheid-selbst. The factory may PREPARE
+# the decision (options + consequences + context) but must never DECIDE it; it
+# escalates with the Zielfrage.
+#
+# The Beobachter creates the card with only the plain body — no ``--category`` and
+# no "this is a Zielfrage" marker reaches the factory (see beobachter.backend_create
+# / karte_body_fuer_fabrik) — so detection is content-based, like the F30/F31/F32
+# build-gates. These cards share a tight linguistic shape no build/cleanup card
+# carries: a "(…-FRAGE)" title tag, "present/compare the Varianten/Folgen of a
+# choice", an explicit "zwei Wege/Quellen … oder …" fork, or a naked
+# "Geschäftsentscheidung". Verified against all 50 karten: matches every
+# ``blocked_zielfrage`` card (44/46/47/48/49), zero ``done`` cards. The DB
+# ``category`` is honoured too when the dispatcher did classify it
+# (``entscheidung``) — but it is unreliable (the live card t_ffd8371b carried
+# ``category=None``), so the content signal is the load-bearing one.
+_ZIELENTSCHEID_CARD_RE = re.compile(
+    r"\([^)]*\bfrage\)"                                        # "(…-FRAGE)" title tag
+    r"|\bvarianten\b[^.\n]{0,80}?\b(?:dar(?:stellen|zustellen)|aufzeigen"
+    r"|gegen(?:ueber|über)stell)"
+    r"|\bgegen(?:ueber|über)stellung\b"
+    r"|\bgesch(?:ae|ä)ftsentscheidung(?:en)?\b"
+    r"|\bzwei\s+(?:wege|quellen|varianten|optionen|ans(?:ae|ä)tze"
+    r"|m(?:oe|ö)glichkeiten)\b",
+    re.IGNORECASE,
+)
+# The DB escalation category that denotes an owner-decision card (kanban_db
+# VALID_CATEGORIES). ``entscheidung`` is set when the factory escalates a genuine
+# Zielentscheidung to Till; if such a card reaches kanban_complete it is the same
+# contradiction the content signal catches. The content regex stays load-bearing
+# because the dispatcher does not always tag it (live card t_ffd8371b: None).
+_ZIELENTSCHEID_CATEGORIES = frozenset({"entscheidung"})
+
+
+def _card_is_zielentscheidung(
+    title: str, body: str, category: Optional[str], comment_bodies: list[str]
+) -> bool:
+    """True when the card is a business/product Zielentscheidung the OWNER must
+    make — the factory prepares it and escalates with a Zielfrage (blocked), it
+    never self-decides it (done). Honours the DB ``category`` when the dispatcher
+    tagged it and falls back to the content signal (the load-bearing path, since
+    the Beobachter passes no category marker to the factory)."""
+    if (category or "").strip().lower() in _ZIELENTSCHEID_CATEGORIES:
+        return True
+    blob = "\n".join([title or "", body or "", *(comment_bodies or [])])
+    return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
+
+
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
 
@@ -845,6 +903,64 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"evidence in your summary matching the task's criteria, "
                         f"or (2) create continuation tasks with parents=[{tid}] "
                         f"and keep this task alive."
+                    )
+
+            # Zielentscheidung card → escalate, never self-complete (F39). A
+            # genuine business/product decision that is the OWNER's call (fully
+            # remove vs. reduce a feature, which secret-store, which price model)
+            # has exactly one green terminal: `blocked` with a prepared Zielfrage
+            # for Till. The Beobachter marks these erwartung=blocked_zielfrage, so
+            # a `done` — even a review-grüne one with a well-argued recommendation
+            # — is ALWAYS "Fabrik hat Zielentscheidung selbst getroffen (done statt
+            # blocked)" → rot-zielentscheid-selbst. Live probe Karte 44 ('Tier-
+            # System: Ballast aufloesen (VEREINFACHUNGS-FRAGE)', branch=None): the
+            # specifier read it right ("reine Entscheidungs-/Analysekarte") but
+            # routed it to closure, the orchestrator ran a Schlussprüfung and the
+            # voicera-reviewer completed it `done` with its own recommendation
+            # ("vollständig, aber gestuft entfernen") → ROT. Mirror the Beobachter's
+            # necessary condition in code (a prompt rule is not load-bearing, cf.
+            # F01): a decision card may not be completed; prepare the options +
+            # consequences + context, then kanban_block with the Zielfrage. Scoped
+            # to a card that carries NO branch (a decision card changes no code; a
+            # real build card has a pushed wt/<id>), so the honest done path of
+            # every build/cleanup card is untouched. Fires for whoever reaches
+            # completion (reviewer or orchestrator — the specifier is already gated
+            # out of kanban_complete above). Runs in the worker's own short-lived
+            # process (re-imported per spawn), so it survives the gateway-restart
+            # gap that defeats dispatcher-side fixes (cf. F19).
+            if task and not (task.branch_name or "").strip():
+                ze_comments = [
+                    (r[0] or "")
+                    for r in conn.execute(
+                        "SELECT body FROM task_comments WHERE task_id = ? "
+                        "ORDER BY created_at",
+                        (tid,),
+                    ).fetchall()
+                ]
+                if _card_is_zielentscheidung(
+                    task.title, task.body or "", task.category, ze_comments
+                ):
+                    conn.close()
+                    return tool_error(
+                        "this is a Zielentscheidung — a business/product decision "
+                        "that is Till's to make, not the factory's. The card asks "
+                        "you to PREPARE the choice (lay out the variants, their "
+                        "consequences for code and data, the context), not to "
+                        "DECIDE it. Completing it `done` — even with a well-argued "
+                        "recommendation — means the factory took the owner's "
+                        "decision itself; the Beobachter rejects that as "
+                        "rot-zielentscheid-selbst (\"Frage haette die Fabrik selbst "
+                        "loesen muessen\" has an inverse here: a Zielentscheidung "
+                        "the fabric may NOT resolve alone). Do NOT call "
+                        "kanban_complete. Post the prepared analysis as a comment "
+                        "(what the feature steers today, where in the code, the "
+                        "cost/consequences of each variant — including anything "
+                        "irreversible for existing data/tenants), then call "
+                        "kanban_block(kind=\"needs_input\") with the Zielfrage "
+                        "stated AS A QUESTION in a kanban COMMENT containing \"?\" "
+                        "(that is the only place Till reads it) and carrying that "
+                        "context. Keep the question business-level and free of "
+                        "internal task IDs / branch names."
                     )
 
             # The orchestrator coordinates a work card, it never finishes one:

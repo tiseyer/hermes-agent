@@ -433,6 +433,109 @@ def test_complete_allowed_for_orchestrator_non_repo_card(monkeypatch, worker_env
     assert d["task_id"] == tid
 
 
+def test_complete_rejected_for_zielentscheidung_card(monkeypatch, worker_env):
+    """F39: a Zielentscheidung is the OWNER's call — the factory prepares it and
+    escalates with a Zielfrage (blocked), it never self-decides it (done). Live
+    probe Karte 44 ('Tier-System: Ballast aufloesen (VEREINFACHUNGS-FRAGE)',
+    erwartung=blocked_zielfrage, branch=None): the voicera-reviewer completed it
+    `done` with its own recommendation ('vollständig, aber gestuft entfernen') →
+    beobachter rot-zielentscheid-selbst ('Fabrik hat Zielentscheidung selbst
+    getroffen, done statt blocked'). The gate rejects the completion; the reviewer
+    must block with the prepared Zielfrage instead."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Tier-System: Ballast aufloesen (VEREINFACHUNGS-FRAGE)",
+            assignee="voicera-reviewer", repository="voicera",
+            body=("Das Tier-System traegt Komplexitaet, die niemand nutzt. "
+                  "Entweder ganz entfernen oder auf zwei Stufen reduzieren. "
+                  "Bitte die Folgen beider Varianten fuer Code und Daten "
+                  "darstellen."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "Review grün — Empfehlung: vollständig, aber gestuft entfernen."
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "Zielentscheidung" in d["error"]
+    assert "kanban_block" in d["error"]
+    # The card must stay in-flight (still running), not slip to done.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_rejected_for_zielentscheidung_by_category(monkeypatch, worker_env):
+    """F39: the DB escalation category 'entscheidung' is honoured too, so a
+    decision card the dispatcher DID tag is caught even if its wording is plain.
+    (The content signal stays the load-bearing path — the live card carried
+    category=None — but the structural signal is a free extra.)"""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Produktweiche festlegen",
+            assignee="voicera-reviewer", repository="voicera",
+            body="Bitte den weiteren Weg klären.",
+        )
+        conn.execute(
+            "UPDATE tasks SET category = 'entscheidung' WHERE id = ?", (tid,)
+        )
+        conn.commit()
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "Entschieden: Variante A."})
+    d = json.loads(out)
+    assert "error" in d
+    assert "Zielentscheidung" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_allowed_for_non_decision_no_branch_card(monkeypatch, worker_env):
+    """F39 must not leak to an ordinary no-branch analysis/recon card: a recon
+    card ('Recon: leereTexte usage') carries none of the Zielentscheidung signals
+    (no '(…-FRAGE)' tag, no 'Varianten darstellen', no 'Geschäftsentscheidung',
+    no 'zwei Wege/Quellen') and no category, so it completes normally. Guards the
+    gate's precision — the done path of every build/cleanup/recon card is
+    untouched."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Recon: leereTexte usage in voicera-os",
+            assignee="recon", repository="voicera",
+            body="grep nach Aufrufen der Funktion und Ergebnis berichten.",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "recon")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "0 Aufrufe gefunden; nur die Definition."})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == tid
+
+
 def test_block_rejected_for_orchestrator_repo_work_card(monkeypatch, worker_env):
     """F22, sibling of the F21 complete gate: the orchestrator must not escalate
     a fresh repo work card into the human blocked bucket. A card with a
