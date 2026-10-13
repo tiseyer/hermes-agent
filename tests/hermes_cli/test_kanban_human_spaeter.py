@@ -122,6 +122,70 @@ def test_normales_todo_wird_weiter_ready(kanban_home):
         assert kb.get_task(conn, arbeit).status == "ready"
 
 
+def test_blocked_zielfrage_bleibt_blocked_statt_human(kanban_home):
+    # F38: eine Karte, die als needs_input in 'blocked' liegt UND eine echte
+    # Geschaefts-Zielfrage (Kommentar mit '?', kein Technik-Begriff) traegt, ist
+    # bereits der Eimer, den der Beobachter fuer blocked_zielfrage liest. Der
+    # Manager darf sie NICHT nach 'human' ziehen (sonst rot-stuck
+    # "Zielfrage-Karte haengt in human"). Sie bleibt blocked.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Tier-System aufloesen", assignee="specifier")
+        kb.block_task(conn, tid, kind="needs_input",
+                      reason="brauche eine Entscheidung")
+        kb.add_comment(
+            conn, tid, "specifier",
+            "Brauche Klaerung: Tier-System ganz entfernen oder auf zwei "
+            "Stufen reduzieren? Mit Folgen fuer das Datenmodell und "
+            "bestehende Mandanten.",
+        )
+        # Manager-Eskalation wird verweigert — Karte bleibt blocked.
+        assert kb.move_to_human(conn, tid, category="entscheidung") == "stays_blocked"
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked"
+        # Kategorie wird in place nachgetragen, Status bleibt blocked.
+        assert t.category == "entscheidung"
+        # Kein 'human'-Event.
+        n_human = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE task_id=? AND kind='human'",
+            (tid,),
+        ).fetchone()["c"]
+        assert n_human == 0
+        # Wiederholter Aufruf bleibt no-op (keine weiteren categorized-Events).
+        assert kb.move_to_human(conn, tid, category="entscheidung") == "stays_blocked"
+        n_cat = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE task_id=? AND kind='categorized'",
+            (tid,),
+        ).fetchone()["c"]
+        assert n_cat == 1
+
+
+def test_blocked_technische_rueckfrage_eskaliert_weiter_human(kanban_home):
+    # Gegenprobe: eine needs_input-Karte mit einer rein TECHNISCHEN Rueckfrage
+    # (Technik-Begriff im Kommentar) ist KEINE legitime Zielfrage; der
+    # Beobachter wuerde sie ohnehin nicht als blocked_zielfrage gruenen, also
+    # darf der Manager sie weiter nach human eskalieren.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="specifier")
+        kb.block_task(conn, tid, kind="needs_input", reason="frage")
+        kb.add_comment(conn, tid, "specifier",
+                       "Welche library-version soll ich nehmen?")
+        assert kb.move_to_human(conn, tid, category="frage") == "moved"
+        assert kb.get_task(conn, tid).status == "human"
+
+
+def test_blocked_capability_wall_eskaliert_weiter_human(kanban_home):
+    # Gegenprobe: ein harter capability-Block (Zugang/Creds fehlen) ist eine
+    # menschliche AKTION, keine Zielfrage — auch mit '?'-Kommentar wird er
+    # weiter nach human eskaliert.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="specifier")
+        kb.block_task(conn, tid, kind="capability", reason="kein Zugang")
+        kb.add_comment(conn, tid, "specifier",
+                       "Soll der Shop oeffentlich sichtbar sein?")
+        assert kb.move_to_human(conn, tid, category="blocker") == "moved"
+        assert kb.get_task(conn, tid).status == "human"
+
+
 def _parser():
     import argparse
     from hermes_cli import kanban as kc

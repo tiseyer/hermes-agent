@@ -3281,6 +3281,61 @@ def create_human_card(
     return task_id
 
 
+# F38: Mirror of the Beobachter's TECH_REGEX (checks/beobachter.py) — a
+# technical term in a would-be Zielfrage forces the observer's ``zielfrage``
+# gate to False and the LLM richter CANNOT override it, so such a "question"
+# can never green. Kept byte-for-byte in sync with the observer and with
+# tools/kanban_tools._SPECIFIER_TECH_REGEX.
+_ZIELFRAGE_TECH_REGEX = re.compile(
+    r"\b(rebase|port|library|bibliothek|dependency|abh[äa]ngigkeit|pfad|path|"
+    r"version|framework)\b",
+    re.IGNORECASE,
+)
+
+# Block kinds that denote a human DECISION/answer (a business Zielfrage) rather
+# than a hard capability WALL. ``needs_input`` and an un-typed (``None``) block
+# land a card in ``blocked`` "for a human" — the exact bucket the Beobachter
+# reads for a ``blocked_zielfrage`` card. ``capability`` is a genuinely
+# human-only ACTION (no access/creds), so it is NOT a Zielfrage and may still
+# escalate to ``human``.
+_ZIELFRAGE_BLOCK_KINDS = (None, "needs_input")
+
+
+def _blocked_card_has_zielfrage(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True iff a ``blocked`` card carries a genuine business Zielfrage.
+
+    Mirrors the Beobachter's necessary condition for a legit
+    ``blocked_zielfrage``: a truly-blocked DECISION kind
+    (:data:`_ZIELFRAGE_BLOCK_KINDS`) whose LAST ``?``-comment (the observer's
+    ``_letzte_frage``) is NOT a technical term (:data:`_ZIELFRAGE_TECH_REGEX`).
+    Such a card is already in the correct human-decision bucket — the one the
+    observer greens — so the manager must never pull it into ``human`` (F38).
+    """
+    row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    kind = row["block_kind"] if "block_kind" in row.keys() else None
+    if kind not in _ZIELFRAGE_BLOCK_KINDS:
+        return False
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at ASC",
+        (task_id,),
+    ).fetchall()
+    frage = ""
+    for c in reversed(comments):
+        if "?" in (c["body"] or ""):
+            frage = c["body"]
+            break
+    if not frage:
+        return False
+    return not _ZIELFRAGE_TECH_REGEX.search(frage)
+
+
 def move_to_human(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3369,6 +3424,33 @@ def move_to_human(
             return "noop"
         if status in ("done", "archived"):
             return "terminal"
+        # F38: a card already parked in ``blocked`` with a genuine business
+        # Zielfrage (a needs_input/un-typed block whose last ``?``-comment is
+        # not a technical term) is ALREADY in the correct human-decision
+        # bucket — the exact one the Beobachter reads for a
+        # ``blocked_zielfrage`` card: its richter greens the blocked question
+        # and posts Till's answer. Flipping it to ``human`` strips it from that
+        # path and the observer reports ``rot-stuck`` ("Zielfrage-Karte haengt
+        # in human", live probe Karte 44 t_aa7ae5b0). The manager must leave
+        # such a card in ``blocked``; a passed category is still recorded in
+        # place so the inbox view stays correct. Repeat-safe: the only write is
+        # a category change, so a re-invocation is a pure no-op.
+        if status == "blocked" and _blocked_card_has_zielfrage(conn, task_id):
+            if category is not None:
+                cur_cat = conn.execute(
+                    "SELECT category FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()["category"]
+                if cur_cat != category:
+                    conn.execute(
+                        "UPDATE tasks SET category = ? WHERE id = ?",
+                        (category, task_id),
+                    )
+                    _append_event(
+                        conn, task_id, "categorized",
+                        {"from": cur_cat, "category": category,
+                         "actor": actor, "kept_blocked": True},
+                    )
+            return "stays_blocked"
         # Defensively close any stale run pointer before flipping status so the
         # runs invariant (current_run_id IS NULL ⇔ run in terminal state) holds,
         # mirroring unblock_task.

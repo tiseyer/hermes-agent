@@ -2227,6 +2227,16 @@ def _cmd_human(args: argparse.Namespace) -> int:
     if outcome == "noop":
         print(f"{args.task_id} already human (no-op)")
         return 0
+    if outcome == "stays_blocked":
+        # F38: a legitimate blocked Zielfrage is already the card Till answers
+        # on the board — it must NOT be pulled into ``human`` (that would hide
+        # it from the Beobachter's blocked_zielfrage view). No escalation here.
+        print(
+            f"{args.task_id} stays blocked — already a human-decision "
+            f"Zielfrage in 'blocked'; not escalated to human"
+            + (f" (category {args.category} recorded)" if getattr(args, "category", None) else "")
+        )
+        return 0
     if outcome == "categorized":
         print(f"{args.task_id} already human — category set to {args.category}")
         return 0
