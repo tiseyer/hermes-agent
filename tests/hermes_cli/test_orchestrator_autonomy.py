@@ -11,8 +11,8 @@ Covers the five repairs as deterministic unit/integration tests:
 3. Loop detection: two consecutive failures with the same signature
    route the card to the reviewer as a diagnosis check instead of a
    third identical coder attempt.
-4. GO-gate: smoke/deploy cards with no assignee (or ``default``) are
-   parked on ``till`` instead of auto-spawning.
+4. GO-gate: structured terminal cards are held for ``till`` while card prose
+   is never interpreted as an executable action.
 5. Reviewer worktree isolation: review dispatch materializes a separate
    ``<repo>/.worktrees/<id>-review`` checkout instead of reusing the
    coder's worktree.
@@ -240,14 +240,29 @@ def test_no_loop_on_different_failures(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# 4. GO-gate for smoke/deploy cards
+# 4. GO-gate for structured terminal cards
 # ---------------------------------------------------------------------------
 
-def test_go_gate_holds_unassigned_smoke_card(kanban_home, all_assignees_spawnable):
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Merge branch into main",
+        "Deploy production",
+        "Publish release",
+        "Live migration",
+        "Real smoke test",
+    ],
+)
+def test_go_gate_keeps_structured_terminal_card_blocked(
+    kanban_home, all_assignees_spawnable, title,
+):
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn, title="Smoke: Preview-Proxy prüfen und deployen",
-            )
+            conn,
+            title=title,
+            assignee="till",
+            initial_status="blocked",
+        )
         spawned = []
         kb.dispatch_once(
             conn, spawn_fn=lambda t, w, **k: spawned.append(t),
@@ -255,65 +270,14 @@ def test_go_gate_holds_unassigned_smoke_card(kanban_home, all_assignees_spawnabl
         )
         assert spawned == []
         task = kb.get_task(conn, tid)
-        # GO-gated cards park as blocked@till (board invariant: waiting
-        # on a human == blocked), sticky against recompute_ready.
         assert task.status == "blocked"
         assert task.assignee == "till"
-        assert task.block_kind == "needs_input"
-        events = [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
-        assert events
         blocked_events = [
             e for e in kb.list_events(conn, tid) if e.kind == "blocked"
         ]
-        assert blocked_events, "go gate must write a sticky blocked event"
-        # Sticky: a recompute pass must not promote it back to ready.
+        assert blocked_events, "structured terminal card must be sticky"
         kb.recompute_ready(conn)
         assert kb.get_task(conn, tid).status == "blocked"
-
-
-def test_go_gate_vocabulary_covers_merge_and_release(kanban_home):
-    # B3a: the gate regex must catch terminal MERGE/PR/release vocabulary,
-    # not just deploy/smoke/live (the pre-B3a blind spot), and must still
-    # ignore ordinary prose.
-    for terminal in (
-        "Merge PR #123 nach main",
-        "W3-05 mergen",
-        "Pull Request reviewen und mergen",
-        "Release 1.2 schneiden",
-        "Feature veröffentlichen",
-        "Deploy to prod",  # regression: existing vocab still matches
-    ):
-        assert kb._GO_GATE_RE.search(terminal), terminal
-    for ordinary in (
-        "README-Tippfehler korrigieren",
-        "Doku für das Login-Formular schreiben",
-        "has-pr",          # lowercase 'pr' glued into a word must NOT match
-        "prüfen",          # ditto — 'PR' is uppercase-acronym-only
-        "pull latest changes",  # 'pull' without 'request' is not terminal
-    ):
-        assert not kb._GO_GATE_RE.search(ordinary), ordinary
-
-
-def test_go_gate_holds_preassigned_terminal_card(
-    kanban_home, all_assignees_spawnable,
-):
-    # B3b-ii: the pre-assignee bypass is closed. A terminal card handed to
-    # a real profile up front (a smoke card on "alice") is now parked for
-    # Till's GO — this deliberately reverses the old "explicit assignment
-    # passes the gate" contract.
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn, title="Smoke-Tests gegen prod fahren",
-            assignee="alice",
-        )
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
-        assert spawned == []
-        task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.assignee == "till"  # parking takes the card from alice
-        assert task.block_kind == "needs_input"
-        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
 
 
 def test_go_gate_holds_merger_card_despite_assignee(
@@ -350,23 +314,6 @@ def test_go_gate_holds_card_with_merge_group(
         assert kb.get_task(conn, tid).assignee == "till"
 
 
-def test_go_gate_holds_deploy_card_on_coder_profile(
-    kanban_home, all_assignees_spawnable,
-):
-    # The exact bypass B3b-ii closes: a deploy card pre-routed to a coder
-    # profile. Vocabulary makes it terminal; the pre-assignee no longer
-    # lets it through.
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn, title="Deploy nach prod ausrollen",
-            assignee="hermes-coder",
-        )
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
-        assert spawned == []
-        assert kb.get_task(conn, tid).assignee == "till"
-
-
 def test_go_gate_ignores_normal_assigned_card(
     kanban_home, all_assignees_spawnable,
 ):
@@ -382,6 +329,31 @@ def test_go_gate_ignores_normal_assigned_card(
         assert spawned == [tid]
 
 
+def test_go_gate_ignores_terminal_vocabulary_without_structured_signal(
+    kanban_home, all_assignees_spawnable,
+):
+    """Negated/non-scope prose must not turn an analysis card terminal."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Analyse für Merge, Deploy, Release, Live, Production und Smoke",
+            body=(
+                "Nur spezifizieren und analysieren. Nicht-Scope: kein Merge, "
+                "kein Deploy, kein Release, kein Live-Eingriff, kein Production- "
+                "oder Real-Smoke-Schritt."
+            ),
+            assignee="alice",
+        )
+        spawned = []
+
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+
+        assert spawned == [tid]
+        assert not [
+            e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"
+        ]
+
+
 def test_go_gate_releases_terminal_card_after_explicit_unblock(
     kanban_home, all_assignees_spawnable,
 ):
@@ -389,7 +361,11 @@ def test_go_gate_releases_terminal_card_after_explicit_unblock(
     # profile and unblocks it (the 'unblocked' event = human GO). Without
     # this release valve the broadened gate would re-park it forever.
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="Merge PR #123 nach main")
+        tid = kb.create_task(
+            conn,
+            title="Integrate feature branches",
+            assignee="merger",
+        )
         first = []
         kb.dispatch_once(
             conn, spawn_fn=lambda t, w, **k: first.append(t.id),
@@ -419,72 +395,6 @@ def test_go_gate_ignores_normal_cards(kanban_home, all_assignees_spawnable):
         )
         assert spawned == [tid]
         assert kb.get_task(conn, tid).assignee == "default"
-
-
-def test_go_gate_ignores_spec_card_with_merge_word_only_in_body(
-    kanban_home, all_assignees_spawnable,
-):
-    # The fixed false-positive (diagnosed live 2026-09-29): a spec card whose
-    # title has no terminal vocabulary but whose body carries the boundary
-    # note "kein Merge ohne Tills GO" was wrongly parked, because merge\w* was
-    # matched against title+body concatenated. The full regex now applies to
-    # the TITLE only; a bare "merge" in a body must NOT gate the card.
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="Spezifikation: chat_v2 Queue-API baureif festlegen",
-            body=(
-                "Nur eine Spezifikation erstellen. Grenze: kein Merge ohne "
-                "Tills GO. Kein Release, kein PR in diesem Schritt."
-            ),
-            assignee="alice",
-        )
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
-        assert spawned == [tid]  # runs — no longer parked
-        assert kb.get_task(conn, tid).assignee == "alice"
-
-
-def test_go_gate_holds_deploy_card_with_terminal_phrase_only_in_body(
-    kanban_home, all_assignees_spawnable,
-):
-    # The safety net that title-only would have thrown away: a card whose
-    # title is ordinary but whose body names an unambiguous terminal action
-    # ("go-live auf prod") must STILL be parked. _GO_GATE_BODY_RE keeps the
-    # dangerous deploy/go-live/smoke class gated even from a body mention.
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="chat_v2 Queue-API fertigstellen",
-            body="Letzter Schritt: go-live auf prod, danach Monitoring prüfen.",
-            assignee="hermes-coder",
-        )
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
-        assert spawned == []
-        task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.assignee == "till"
-        assert task.block_kind == "needs_input"
-
-
-def test_go_gate_holds_merge_card_with_merge_word_in_title(
-    kanban_home, all_assignees_spawnable,
-):
-    # Regression: a genuine merge card carrying "merge" in its TITLE is still
-    # gated after the title/body split (the merge class stays covered via
-    # title + the structural legs, only body-only mentions were dropped).
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="W3-05 nach main mergen",
-            body="Feature-Branch in main integrieren.",
-            assignee="alice",
-        )
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
-        assert spawned == []
-        assert kb.get_task(conn, tid).assignee == "till"
 
 
 # ---------------------------------------------------------------------------

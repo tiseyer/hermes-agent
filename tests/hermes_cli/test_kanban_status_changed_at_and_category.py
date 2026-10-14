@@ -271,11 +271,11 @@ def test_create_human_card_rejects_unknown_category(kanban_home):
 
 
 def test_go_gate_park_tags_go_noetig(kanban_home, all_assignees_spawnable):
-    """A terminal card parked by the GO-gate gets category='go_noetig' so the
+    """A merger card parked by the GO-gate gets category='go_noetig' so the
     inbox pill shows it needs Till's explicit GO."""
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn, title="Smoke: Preview-Proxy prüfen und deployen"
+            conn, title="Feature branches integrieren", assignee="merger"
         )
         kb.dispatch_once(
             conn, spawn_fn=lambda t, w, **k: None, default_assignee="default"

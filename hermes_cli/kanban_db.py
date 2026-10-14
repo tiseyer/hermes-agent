@@ -9109,50 +9109,6 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-# Cards whose title/body demands smoke-test / deploy / live actions must
-# never start unattended from the default-assignee fallback — they wait
-# for an explicit human GO (goal "orchestrator-autonomy" / Canary 4).
-_GO_GATE_RE = re.compile(
-    r"(?i)\b(smoke[- ]?tests?|smoke\b|deploy(ment|s|en)?\b|go[- ]?live"
-    r"|live[- ]?(gang|schalt\w*|aktivierung)|production|prod[- ]?release"
-    # B3a: merge / release vocabulary. A terminal MERGE is exactly the
-    # "requires Till's GO" action the original gate missed (verified: the
-    # old regex matched deploy/smoke/live but NOT merge/PR/release —
-    # kartiert in ~/lueckezwei-b1-b3-plan.md B3a).
-    # SCOPE: this full regex is matched against the card TITLE only (see the
-    # dispatcher gate). ``merge\w*``/``release\w*`` are common words that also
-    # appear incidentally in prose ("kein Merge ohne Tills GO" in a spec
-    # card's body) — matching them in a body wrongly parked a spec card
-    # (diagnosed live 2026-09-29). The body is checked by the NARROWER
-    # ``_GO_GATE_BODY_RE`` below; merge/release/PR are caught in a title or
-    # by the structural legs (_is_merger_profile / merge_group), never by a
-    # bare mention in a body.
-    # ``(?-i:PR)`` is case-SENSITIVE on purpose: a lowercase two-letter "pr"
-    # glued into words ("has-pr", "prüfen") must NOT trip the gate — only the
-    # uppercase acronym PR/PRs counts (regression: "has-pr" was wrongly gated).
-    r"|merge\w*|pull[- ]?request|(?-i:PR)s?\b|release\w*|ver[öo]ffentlich\w*)"
-)
-
-# Narrow terminal vocabulary for the card BODY. Only the UNAMBIGUOUS
-# deploy/go-live/smoke phrases — the ones that practically never occur
-# incidentally in prose — keep gating from a body mention. The promiscuous
-# merge/release/PR/veröffentlichen words are DELIBERATELY excluded here
-# (they gate via title or the structural legs instead). This preserves the
-# safety net for the dangerous "no deploy/go-live without Till's GO" class
-# (a card that names the deploy step only in its body) while ending the
-# false-positive where "…kein Merge ohne GO…" in a spec body parked the card.
-# ``deploy`` gates from a body only together with a nearby ``prod`` (Till's
-# "deploy…prod") — a bare "nach dem Deployment testen" must NOT trip it.
-_GO_GATE_BODY_RE = re.compile(
-    r"(?i)("
-    r"\bsmoke[- ]?tests?\b|\bsmoke\b"
-    r"|\bgo[- ]?live\b|\blive[- ]?(gang|schalt\w*|aktivierung)\b"
-    r"|\bproduction\b|\bprod[- ]?release\b"
-    r"|\bdeploy\w*[^\n]{0,40}?\bprod|\bprod\w*[^\n]{0,40}?\bdeploy"
-    r")"
-)
-
-
 def _is_merger_profile(assignee: Optional[str]) -> bool:
     """True when the assignee is the merger integration profile.
 
@@ -9981,7 +9937,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, title, body, tenant, merge_group FROM tasks "
+        "SELECT id, assignee, tenant, merge_group FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         # Family roots are visible projections of their work children, never
         # workers (get_spawn_rejection_reason -> 'family_root'). Excluding them
@@ -10058,33 +10014,25 @@ def _dispatch_once_locked(
             if not dry_run:
                 claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
             continue
-        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): TERMINAL cards
-        # — smoke/deploy/live/merge/release actions (_GO_GATE_RE), merger-
-        # profile cards, or explicit merge groups — dürfen NIE ungefragt
-        # starten und werden an 'till' geparkt (kein Hermes-Profil, also
-        # nicht spawnbar), bis ein Mensch GO gibt.
+        # GO-Gate (goal "orchestrator-autonomy" / Canary 4): only structured
+        # terminal signals are interpreted here. A merger-profile assignee or
+        # a non-empty merge_group denotes a real integration step and is parked
+        # on 'till' until a human gives GO. Title/body prose is deliberately
+        # ignored: specifications routinely mention forbidden actions in
+        # negations and non-scope clauses, which is not an executable request.
+        # Other terminal operations use the public R3 representation directly:
+        # assignee='till' + initial_status='blocked'. Such cards never enter
+        # this ready-row loop and remain sticky until explicitly unblocked.
         #
-        # B3b-ii: das Gate greift jetzt AUCH bei vorab zugewiesenen Karten.
-        # Die alte Bedingung "nur ohne Assignee" war die Umgehungslücke —
-        # eine "Deploy prod"-Karte an ein Coder-Profil oder eine Merge-Karte
-        # an den Merger segelten daran vorbei (kartiert in
-        # ~/lueckezwei-b1-b3-plan.md B3b-ii). Der EINZIGE legitime Release
-        # ist ein expliziter menschlicher unblock (_go_gate_released): dessen
-        # 'unblocked'-Event macht die Karte spawnbar, statt sie erneut zu
-        # parken. Der manuelle `hermes kanban claim` (kanban.py) umgeht das
-        # Gate bewusst — ein Direkt-Claim IST das menschliche GO.
-        # Title carries the full terminal vocabulary; the body only the
-        # narrow, unambiguous phrases (_GO_GATE_BODY_RE). Splitting the two
-        # ends the false-positive where a bare "…kein Merge ohne GO…" note in
-        # a spec body parked the card, while keeping the deploy/go-live safety
-        # net for a card that names the terminal step only in its body.
-        _title = row["title"] or ""
-        _body = row["body"] or ""
+        # The gate also applies to pre-assigned structured cards: assigning a
+        # merge card to the merger must not bypass human approval. The only
+        # legitimate release is an explicit human unblock
+        # (_go_gate_released); its event makes the card spawnable instead of
+        # parking it again. Manual `hermes kanban claim` bypasses this gate on
+        # purpose because a direct claim is itself the human GO.
         _row_merge_group = row["merge_group"]
         _is_terminal_card = (
-            bool(_GO_GATE_RE.search(_title))
-            or bool(_GO_GATE_BODY_RE.search(_body))
-            or _is_merger_profile(row_assignee)
+            _is_merger_profile(row_assignee)
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):
