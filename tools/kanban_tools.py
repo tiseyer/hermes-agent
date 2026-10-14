@@ -1414,14 +1414,45 @@ def _handle_block(args: dict, **kw) -> str:
             == "specifier"
             and kind in _HUMAN_BLOCK_KINDS
         ):
-            # Compute `frage` EXACTLY like the Beobachter's _letzte_frage: the
-            # last comment (insertion order) whose body contains a "?". Block
-            # reasons are NOT comments and are deliberately ignored here.
+            # Compute `frage` like the Beobachter's _letzte_frage (last comment
+            # carrying a "?"), but restricted to the specifier's OWN genuine
+            # question comment: the last comment that (a) carries a "?",
+            # (b) is authored by the specifier (the role raising the Zielfrage —
+            # its SOUL mandates it phrase its Zielfrage AS A QUESTION in a
+            # comment, "brauche Klaerung: …?"), and (c) is NOT its signed
+            # `ABNAHMEKRITERIUM:` acceptance criterion. Block reasons are NOT
+            # comments and are deliberately ignored (F24).
+            #
+            # F28 (second occurrence, live probe card t_82585a19 'Hermes aus dem
+            # Frontend verbannen', klein, erwartung=done): the specifier wrote a
+            # proper signed `ABNAHMEKRITERIUM:` comment (card baureif) and then a
+            # read-only File-Conflict-Check sub-run — unable to kanban_complete
+            # (F01 role gate) and self-scoped out of a handoff — blocked
+            # needs_input with a REASON carrying no "?". The naive _letzte_frage
+            # latched onto the ABNAHMEKRITERIUM comment, which quotes a "?"-
+            # bearing UI error string ("… Hermes nicht erreichbar?") and trips no
+            # TECH_REGEX, so the old gate passed. The observer then judges that
+            # extracted "frage" NOT a Zielfrage (it is a mechanical build
+            # order/criterion) → rot-technische-rueckfrage. An ABNAHMEKRITERIUM
+            # is by definition what makes a card baureif — never a business
+            # Zielfrage — and a build order is not the specifier's Zielfrage, so
+            # excluding both (and non-specifier comments) is a safe mirror: it
+            # rejects only blocks the observer would also reject (a genuine
+            # business Zielfrage is specifier-authored and is not an acceptance
+            # criterion, so it still passes to the richter — see the allowed
+            # test).
             frage = ""
+            has_abk = False
             try:
                 for c in kb.list_comments(conn, tid):
-                    if "?" in (c.body or ""):
-                        frage = c.body or ""
+                    body = c.body or ""
+                    is_specifier = (c.author or "").strip().lower() == "specifier"
+                    is_abk = body.lstrip().upper().startswith("ABNAHMEKRITERIUM")
+                    if is_specifier and is_abk:
+                        has_abk = True
+                    if "?" not in body or not is_specifier or is_abk:
+                        continue
+                    frage = body
             except Exception:
                 frage = ""
             tech = bool(_SPECIFIER_TECH_REGEX.search(frage)) if frage else False
@@ -1438,8 +1469,16 @@ def _handle_block(args: dict, **kw) -> str:
                         "method/scope question, not a business Zielfrage — "
                         "resolve it yourself. "
                         if tech else
-                        "No comment on this card carries a question, so this "
-                        "block is not a legitimate Zielfrage. "
+                        (
+                            "You have ALREADY posted a signed ABNAHMEKRITERIUM: "
+                            "comment, so this card is baureif — your next move is "
+                            "kanban_handoff(to=\"<repo>-coder\"), NOT a block. An "
+                            "ABNAHMEKRITERIUM is never a Zielfrage, and a block "
+                            "whose reason carries no question is not one either. "
+                            if has_abk else
+                            "No question comment of your own is on this card, so "
+                            "this block is not a legitimate Zielfrage. "
+                        )
                     )
                     + "An internal implementation/coordination decision — "
                     "\"which line/endpoint/file is meant\", \"reuse the prior "

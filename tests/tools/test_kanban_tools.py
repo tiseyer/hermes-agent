@@ -852,6 +852,92 @@ def test_block_allowed_for_specifier_question_in_prior_comment(monkeypatch, work
     assert d.get("ok") is True
 
 
+def test_block_rejected_for_specifier_abnahmekriterium_present_no_question(monkeypatch, worker_env):
+    """F28 (2nd occurrence): a specifier that has ALREADY signed an
+    ABNAHMEKRITERIUM: has made the card baureif — the only valid next move is a
+    coder handoff, never a human block. Live probe card t_82585a19 ('Hermes aus
+    dem Frontend verbannen', klein, erwartung=done): the specifier wrote the
+    ABNAHMEKRITERIUM: comment (which quotes a "?"-bearing UI error string,
+    "… Hermes nicht erreichbar?", and trips no TECH_REGEX) and then a read-only
+    File-Conflict-Check sub-run blocked needs_input with a REASON carrying no
+    "?". The naive _letzte_frage latched onto the ABNAHMEKRITERIUM as the
+    "frage", so the old gate passed; the observer's richter then judges that
+    extracted frage NOT a Zielfrage → rot-technische-rueckfrage. The gate now
+    excludes the ABNAHMEKRITERIUM (and non-specifier comments) from the frage,
+    so the block is rejected and steered to a handoff."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Hermes aus dem Frontend verbannen",
+            assignee="specifier", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("ABNAHMEKRITERIUM: 0 sichtbare `Hermes`-Renderstellen unter "
+                  "frontend/src; Rail-/Board-Fehlertexte lauten 'Move "
+                  "fehlgeschlagen — Voicera nicht erreichbar?' und 'Voicera-"
+                  "Board nicht erreichbar'; `tsc --noEmit` Exit 0."),
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("Baureif; Uebergabe technisch blockiert: ein read-only "
+                  "Hilfsworker hat die Hauptkarte irrtuemlich blockiert."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "kanban_complete vom Rollen-Gate abgelehnt; Handoff ausserhalb "
+                  "dieses read-only Teilauftrags.",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "genuine Zielfrage" in d["error"]
+    assert "baureif" in d["error"]
+    assert "kanban_handoff" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_specifier_genuine_question_after_abnahmekriterium(monkeypatch, worker_env):
+    """The ABNAHMEKRITERIUM exclusion must not swallow a genuine business
+    Zielfrage the specifier raises AFTER writing the criterion: a specifier-
+    authored, non-ABNAHMEKRITERIUM "?" comment still passes the gate (the
+    beobachter's richter then judges it)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Branding-Umstellung", assignee="specifier",
+            repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body="ABNAHMEKRITERIUM: 0 sichtbare Hermes-Treffer; tsc Exit 0.",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body="brauche Klaerung: soll der oeffentliche Markenname Voicera sein?",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_block_rejected_for_coder_internal_triage_comment(monkeypatch, worker_env):
     """F28: the repo coder may not escalate internal work-coordination. Live
     probe card t_9b6d4067 ('Ungenutzte Funktion leereTexte entfernen', klein,
