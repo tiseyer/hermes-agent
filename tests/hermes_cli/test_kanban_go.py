@@ -132,6 +132,27 @@ def test_grant_go_releases_gate_once_with_structured_audit(kanban_home, kind):
         assert _snapshot(conn) == before_retry
 
 
+def test_grant_go_idempotency_is_scoped_to_the_current_gate_cycle(kanban_home):
+    with kb.connect() as conn:
+        task_id = _create_task(conn, "repeated build gate")
+        _hold_go_gate(conn, task_id, kind="build", resume_assignee="alice")
+        first = kb.grant_go(conn, task_id, kind="build", actor="Till")
+        assert first.applied is True
+
+        _hold_go_gate(conn, task_id, kind="build", resume_assignee="bob")
+        second = kb.grant_go(conn, task_id, kind="build", actor="Till")
+
+        assert second.applied is True
+        task = _get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee == "bob"
+        assert len(_go_events(conn, task_id)) == 2
+        assert len([
+            comment for comment in kb.list_comments(conn, task_id)
+            if comment.body.startswith("GO erteilt:")
+        ]) == 2
+
+
 @pytest.mark.parametrize(
     ("action", "expected_status"),
     [
@@ -239,6 +260,38 @@ def test_grant_go_rejects_invalid_or_foreign_requests_without_any_write(kanban_h
                     action=request["action"],
                 )
             assert _snapshot(conn) == before
+
+
+def test_grant_go_rejects_archiving_a_running_target_atomically(kanban_home):
+    with kb.connect() as conn:
+        gate_id = _create_task(conn, "GO control")
+        running_id = _create_task(conn, "active worker")
+        claimed = kb.claim_task(conn, running_id, claimer="test:worker")
+        assert claimed is not None
+        assert claimed.status == "running"
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        _hold_go_gate(conn, gate_id)
+        before = _snapshot(conn)
+
+        with pytest.raises(ValueError, match="cannot move running targets"):
+            kb.grant_go(
+                conn,
+                gate_id,
+                kind="build",
+                actor="Till",
+                action={"name": "archive", "target_ids": [running_id]},
+            )
+
+        assert _snapshot(conn) == before
+        running = _get_task(conn, running_id)
+        assert running.status == "running"
+        assert running.current_run_id == run_id
+        open_run = conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert open_run is not None
+        assert open_run["ended_at"] is None
 
 
 def test_go_api_is_a_direct_transport_to_the_canonical_db_service(kanban_home):

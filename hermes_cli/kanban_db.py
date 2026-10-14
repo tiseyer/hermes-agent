@@ -6627,21 +6627,24 @@ def _normalize_go_action(action: Optional[dict[str, Any]]) -> Optional[dict[str,
     return normalized
 
 
-def _go_event_payloads(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+def _go_event_records(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[tuple[int, dict[str, Any]]]:
     rows = conn.execute(
-        "SELECT payload FROM task_events "
+        "SELECT id, payload FROM task_events "
         "WHERE task_id = ? AND kind = 'go_granted' ORDER BY id DESC",
         (task_id,),
     ).fetchall()
-    payloads: list[dict[str, Any]] = []
+    records: list[tuple[int, dict[str, Any]]] = []
     for row in rows:
         try:
             payload = json.loads(row["payload"] or "{}")
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict):
-            payloads.append(payload)
-    return payloads
+            records.append((int(row["id"]), payload))
+    return records
 
 
 def grant_go(
@@ -6668,12 +6671,44 @@ def grant_go(
     archived_targets: list[str] = []
 
     with write_txn(conn):
-        existing = next(
-            (payload for payload in _go_event_payloads(conn, task_id)
-             if payload.get("kind") == kind),
+        task = conn.execute(
+            "SELECT id, title, assignee, tenant, status, current_run_id, merge_group "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+
+        gate_row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'go_gate_held' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if gate_row is None:
+            raise ValueError(f"task {task_id} has no held GO gate")
+        latest_control = conn.execute(
+            "SELECT id, kind FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+        # Idempotency belongs to one concrete gate cycle, not merely to the
+        # task and GO kind. Event ordering is the durable cycle identifier and
+        # also works for grants written before an explicit cycle id existed.
+        existing_record = next(
+            (
+                (event_id, payload)
+                for event_id, payload in _go_event_records(conn, task_id)
+                if event_id > gate_row["id"] and payload.get("kind") == kind
+            ),
             None,
         )
-        if existing is not None:
+        if existing_record is not None:
+            existing_id, existing = existing_record
+            if latest_control is not None and latest_control["id"] > existing_id:
+                raise ValueError(f"task {task_id} has no active held GO gate")
             if (
                 existing.get("actor") != actor
                 or existing.get("action") != normalized_action
@@ -6694,30 +6729,8 @@ def grant_go(
                 action=normalized_action,
             )
 
-        task = conn.execute(
-            "SELECT id, title, assignee, tenant, status, current_run_id, merge_group "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if task is None:
-            raise ValueError(f"unknown task {task_id}")
         if task["status"] != "blocked":
             raise ValueError(f"task {task_id} is not blocked at a GO gate")
-
-        gate_row = conn.execute(
-            "SELECT id, payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'go_gate_held' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if gate_row is None:
-            raise ValueError(f"task {task_id} has no held GO gate")
-        latest_control = conn.execute(
-            "SELECT id, kind FROM task_events "
-            "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
         if (
             latest_control is None
             or latest_control["kind"] != "blocked"
@@ -6781,16 +6794,15 @@ def grant_go(
                         "GO archive targets are already archived: "
                         + ", ".join(already_archived)
                     )
-            else:
-                running = [
-                    target for target in target_ids
-                    if target_rows[target]["status"] == "running"
-                ]
-                if running:
-                    raise ValueError(
-                        "GO set_status cannot move running targets: "
-                        + ", ".join(running)
-                    )
+            running = [
+                target for target in target_ids
+                if target_rows[target]["status"] == "running"
+            ]
+            if running:
+                raise ValueError(
+                    f"GO {normalized_action['name']} cannot move running targets: "
+                    + ", ".join(running)
+                )
 
         now = int(time.time())
         if task["current_run_id"]:
