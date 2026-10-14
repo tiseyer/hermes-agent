@@ -1155,6 +1155,17 @@ class Comment:
 
 
 @dataclass
+class HandoffResult:
+    """Committed result of one atomic worker-to-worker handoff."""
+
+    task_id: str
+    comment_id: int
+    run_id: Optional[int]
+    status: str
+    assignee: str
+
+
+@dataclass
 class Attachment:
     """In-memory view of a row from the ``task_attachments`` table."""
 
@@ -3742,26 +3753,156 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+def _insert_comment_no_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    created_at: Optional[int] = None,
 ) -> int:
+    """Insert one comment inside an existing transaction."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
+    now = int(time.time()) if created_at is None else int(created_at)
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), now),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
     with write_txn(conn):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
-        )
+        comment_id = _insert_comment_no_txn(conn, task_id, author, body)
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return comment_id
+
+
+def handoff_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to: str,
+    note: str,
+    author: str,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> HandoffResult:
+    """Persist handoff evidence and its state transition in one transaction.
+
+    ``kind='review'`` resolves the repository-specific reviewer and lands in
+    ``review``. Other handoffs land in ``ready`` assigned to ``to``. The
+    comment, task transition, run closure, and structured ``handoff`` event
+    either all commit or all roll back.
+    """
+    destination = (to or "").strip()
+    handoff_note = (note or "").strip()
+    handoff_author = (author or "").strip()
+    if not destination:
+        raise ValueError("handoff destination is required")
+    if not handoff_note:
+        raise ValueError("handoff note is required")
+    if not handoff_author:
+        raise ValueError("handoff author is required")
+    if kind not in (None, "review"):
+        raise ValueError("handoff kind must be 'review' or omitted")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, tenant, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+
+        target_status = "ready"
+        target_assignee = destination
+        if kind == "review":
+            pair = resolve_task_repo_profiles(conn, task_id)
+            resolved_reviewer = (
+                pair[1]
+                if pair
+                else _TENANT_REVIEWER_MAP.get(row["tenant"], "reviewer")
+            )
+            if destination not in {"review", "reviewer", resolved_reviewer}:
+                raise ValueError(
+                    f"review handoff destination must resolve to {resolved_reviewer!r}"
+                )
+            if row["assignee"] == resolved_reviewer:
+                raise ValueError(
+                    "a reviewer cannot request review from itself; complete the "
+                    "task or reject it with kanban_block(kind='review')"
+                )
+            target_status = "review"
+            target_assignee = resolved_reviewer
+
+        comment_id = _insert_comment_no_txn(
+            conn, task_id, handoff_author, handoff_note
+        )
+        sql = """
+            UPDATE tasks
+               SET status = ?, assignee = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = ?
+             WHERE id = ? AND status IN ('running', 'ready', 'review')
+        """
+        params: tuple = (
+            target_status,
+            target_assignee,
+            "review" if kind == "review" else None,
+            task_id,
+        )
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params += (int(expected_run_id),)
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            raise ValueError(
+                f"task {task_id} is not handoff-ready or worker run is stale"
+            )
+
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="handoff",
+            status="handoff",
+            summary=handoff_note,
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="handoff",
+                summary=handoff_note,
+            )
+        _append_event(
+            conn,
+            task_id,
+            "handoff",
+            {
+                "comment_id": comment_id,
+                "from": handoff_author,
+                "to": target_assignee,
+                "expected_status": target_status,
+            },
+            run_id=run_id,
+        )
+        return HandoffResult(
+            task_id=task_id,
+            comment_id=comment_id,
+            run_id=run_id,
+            status=target_status,
+            assignee=target_assignee,
+        )
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -7935,6 +8076,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    handoff_anomalies: list[str] = field(default_factory=list)
+    """Task ids whose structured handoff disagrees with persisted state.
+
+    The dispatcher leaves these cards untouched and emits one durable alarm
+    per handoff event so an incomplete transition cannot become a fresh claim.
+    """
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9818,6 +9965,175 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+HANDOFF_ANOMALY_GRACE_SECONDS = 30
+_HANDOFF_SUPERSEDING_EVENTS = frozenset(
+    {
+        "claimed",
+        "spawned",
+        "completed",
+        "blocked",
+        "dependency_wait",
+        "review_rejected",
+        "done_verification_failed",
+        "handoff",
+        "unblocked",
+        "promoted",
+        "gave_up",
+        "reclaimed",
+        "crashed",
+        "timed_out",
+        "spawn_failed",
+    }
+)
+
+
+def detect_handoff_anomalies(
+    conn: sqlite3.Connection,
+    *,
+    grace_seconds: int = HANDOFF_ANOMALY_GRACE_SECONDS,
+    board: Optional[str] = None,
+    persist: bool = True,
+) -> tuple[list[str], set[str]]:
+    """Persist exactly-once alarms for orphaned structured handoffs.
+
+    Returns ``(new_alarm_task_ids, quarantined_task_ids)``. A mismatched
+    handoff is quarantined during the short grace period as well, preventing
+    the dispatcher from claiming away the evidence before it becomes old
+    enough to alarm. Task status is never repaired here.
+    """
+    now = int(time.time())
+    alarmed: list[str] = []
+    quarantined: set[str] = set()
+    log_rows: list[tuple[str, str, int, int, str, Optional[str]]] = []
+    txn = write_txn(conn) if persist else contextlib.nullcontext()
+    with txn:
+        rows = conn.execute(
+            """
+            SELECT t.id AS task_id, t.status, t.assignee, t.claim_lock,
+                   t.claim_expires, t.worker_pid, t.last_heartbeat_at,
+                   e.id AS event_id, e.payload, e.created_at
+              FROM tasks t
+              JOIN task_events e ON e.task_id = t.id
+             WHERE t.status = 'ready'
+               AND e.kind = 'handoff'
+               AND e.id = (
+                   SELECT MAX(e2.id) FROM task_events e2
+                    WHERE e2.task_id = t.id AND e2.kind = 'handoff'
+               )
+            """
+        ).fetchall()
+
+        for row in rows:
+            task_id = row["task_id"]
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            expected_status = payload.get("expected_status")
+            expected_assignee = payload.get("to")
+            comment_id = payload.get("comment_id")
+            state_matches = expected_status == row["status"] and (
+                not expected_assignee or expected_assignee == row["assignee"]
+            )
+            if not expected_status or state_matches or not comment_id:
+                continue
+            # Merger is deliberately a ready control-plane lane, not an
+            # abandoned worker transition.
+            if row["assignee"] == "merger":
+                continue
+            if not conn.execute(
+                "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
+                (comment_id, task_id),
+            ).fetchone():
+                continue
+            later = conn.execute(
+                "SELECT kind FROM task_events "
+                "WHERE task_id = ? AND id > ? ORDER BY id",
+                (task_id, int(row["event_id"])),
+            ).fetchall()
+            if any(
+                event["kind"] in _HANDOFF_SUPERSEDING_EVENTS for event in later
+            ):
+                continue
+            open_run = conn.execute(
+                "SELECT 1 FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            active_claim = row["claim_lock"] is not None and (
+                row["claim_expires"] is None or int(row["claim_expires"]) >= now
+            )
+            if (
+                active_claim
+                or open_run is not None
+                or (row["worker_pid"] and _pid_alive(row["worker_pid"]))
+                or (
+                    row["last_heartbeat_at"] is not None
+                    and now - int(row["last_heartbeat_at"])
+                    < max(0, int(grace_seconds))
+                )
+            ):
+                continue
+
+            quarantined.add(task_id)
+            if now - int(row["created_at"]) < max(0, int(grace_seconds)):
+                continue
+
+            already = False
+            for event in conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'handoff_anomaly'",
+                (task_id,),
+            ):
+                try:
+                    alarm_payload = json.loads(event["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if alarm_payload.get("handoff_event_id") == int(row["event_id"]):
+                    already = True
+                    break
+            if already:
+                continue
+
+            alarmed.append(task_id)
+            if not persist:
+                continue
+
+            alarm_payload = {
+                "handoff_event_id": int(row["event_id"]),
+                "comment_id": int(comment_id),
+                "expected_status": expected_status,
+                "actual_status": row["status"],
+                "expected_assignee": expected_assignee,
+                "actual_assignee": row["assignee"],
+            }
+            _append_event(conn, task_id, "handoff_anomaly", alarm_payload)
+            log_rows.append(
+                (
+                    task_id,
+                    row["status"],
+                    int(row["event_id"]),
+                    int(comment_id),
+                    expected_status,
+                    expected_assignee,
+                )
+            )
+
+    for task_id, status, event_id, comment_id, expected_status, expected_assignee in log_rows:
+        _log.error(
+            "kanban warden [%s]: handoff anomaly task=%s status=%s "
+            "handoff_event_id=%s comment_id=%s no running worker; expected %s@%s",
+            _normalize_board_slug(board) or get_current_board(),
+            task_id,
+            status,
+            event_id,
+            comment_id,
+            expected_status,
+            expected_assignee or "<unchanged>",
+        )
+    return alarmed, quarantined
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9961,6 +10277,9 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    result.handoff_anomalies, handoff_quarantined = detect_handoff_anomalies(
+        conn, board=board, persist=not dry_run,
+    )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. Family roots mirror a work child's state,
@@ -9992,6 +10311,10 @@ def _dispatch_once_locked(
         "AND (family_root_id IS NULL OR id != family_root_id) "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    if handoff_quarantined:
+        ready_rows = [
+            row for row in ready_rows if row["id"] not in handoff_quarantined
+        ]
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks

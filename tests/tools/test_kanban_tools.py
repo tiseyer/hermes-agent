@@ -55,7 +55,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_handoff",
+        "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -137,7 +138,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_handoff",
+        "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -732,6 +734,35 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_handoff_review_happy_path_is_one_tool_call(worker_env):
+    from tools import kanban_tools as kt
+
+    note = "branch wt/test; commit abc123; tests 4 passed"
+    out = kt._handle_handoff(
+        {"to": "reviewer", "kind": "review", "note": note}
+    )
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["status"] == "review"
+    assert result["assignee"] == "reviewer"
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "review"
+        assert [(c.author, c.body) for c in kb.list_comments(conn, worker_env)] == [
+            ("test-worker", note)
+        ]
+        events = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "handoff"
+        ]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        assert events[0].payload["comment_id"] is not None
 
 
 def test_block_rejects_empty_reason(worker_env):
@@ -1480,6 +1511,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_show()" in prompt
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
+    assert 'kanban_handoff(to="reviewer", kind="review"' in prompt
+    assert "do not write a separate completion comment first" in prompt
+    assert 'kanban_block(kind="review")`' not in prompt
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
@@ -1523,8 +1557,8 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 #
 # A worker process has HERMES_KANBAN_TASK set to its own task id. The
-# destructive tools (kanban_complete, kanban_block, kanban_heartbeat,
-# kanban_unblock) must refuse to operate
+# destructive tools (kanban_complete, kanban_block, kanban_handoff,
+# kanban_heartbeat, kanban_unblock) must refuse to operate
 # on any OTHER task id, even if the caller supplies an explicit `task_id`
 # argument. Workers legitimately call kanban_show / kanban_list /
 # kanban_comment / kanban_create / kanban_link on other tasks, so those
@@ -1581,6 +1615,34 @@ def test_worker_block_rejects_foreign_task_id(worker_env):
         assert kb.get_task(conn, other).status == "ready"
     finally:
         conn.close()
+
+
+def test_worker_handoff_rejects_foreign_task_id(worker_env):
+    """A worker cannot route a sibling task through the atomic handoff."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        other = kb.create_task(conn, title="sibling")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.commit()
+
+    from tools import kanban_tools as kt
+
+    out = kt._handle_handoff(
+        {
+            "task_id": other,
+            "to": "reviewer",
+            "kind": "review",
+            "note": "attempted hijack",
+        }
+    )
+    result = json.loads(out)
+    assert "refusing to mutate" in result.get("error", "")
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, other)
+        assert task is not None and task.status == "ready"
+        assert kb.list_comments(conn, other) == []
 
 
 def test_worker_heartbeat_rejects_foreign_task_id(worker_env):

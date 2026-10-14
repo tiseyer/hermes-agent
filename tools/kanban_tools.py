@@ -151,8 +151,8 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
     A process spawned by the dispatcher has ``HERMES_KANBAN_TASK`` set
-    to its own task id. Tools like ``kanban_complete`` / ``kanban_block``
-    / ``kanban_heartbeat`` mutate run-lifecycle state, so a buggy or
+    to its own task id. Tools like ``kanban_complete`` / ``kanban_block`` /
+    ``kanban_handoff`` / ``kanban_heartbeat`` mutate run-lifecycle state, so a buggy or
     prompt-injected worker that passed an explicit ``task_id`` for some
     other task could corrupt sibling or cross-tenant runs (see #19534).
 
@@ -346,8 +346,8 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            "must use kanban_complete, kanban_block, kanban_handoff, "
+            "kanban_heartbeat, or kanban_comment for their assigned task."
         )
     return None
 
@@ -787,6 +787,56 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_handoff(args: dict, **kw) -> str:
+    """Atomically persist a handoff note and route the current task."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    destination = str(args.get("to") or "").strip()
+    note = str(args.get("note") or "").strip()
+    kind = args.get("kind")
+    if not destination:
+        return tool_error("to is required — name the next role")
+    if not note:
+        return tool_error("note is required — provide the handoff evidence")
+    if kind not in (None, "review"):
+        return tool_error("kind must be 'review' or omitted")
+    note = redact_sensitive_text(note, force=True)
+    author = os.environ.get("HERMES_PROFILE") or "worker"
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = kb.handoff_task(
+                conn,
+                tid,
+                to=destination,
+                note=note,
+                author=author,
+                kind=kind,
+                expected_run_id=_worker_run_id(tid),
+            )
+            return _ok(
+                task_id=tid,
+                comment_id=result.comment_id,
+                run_id=result.run_id,
+                status=result.status,
+                assignee=result.assignee,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_handoff: {e}")
+    except Exception as e:
+        logger.exception("kanban_handoff failed")
+        return tool_error(f"kanban_handoff: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1627,6 +1677,47 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_HANDOFF_SCHEMA = {
+    "name": "kanban_handoff",
+    "description": (
+        "Pass this task to the next role in one atomic board operation. The "
+        "handoff note, run closure, status/assignee transition, and audit event "
+        "commit together. Use kind='review' for a code-review request; omit "
+        "kind for a normal ready handoff to the named profile. This is a "
+        "terminal action for the current worker run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "to": {
+                "type": "string",
+                "description": (
+                    "Next profile. For review handoffs pass 'reviewer'; the "
+                    "repository-specific reviewer is resolved server-side."
+                ),
+            },
+            "note": {
+                "type": "string",
+                "description": "Durable handoff evidence for the next role.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["review"],
+                "description": (
+                    "Set to 'review' to land in the review column; omit for "
+                    "a normal ready handoff."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["to", "note"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2040,6 +2131,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_handoff",
+    toolset="kanban",
+    schema=KANBAN_HANDOFF_SCHEMA,
+    handler=_handle_handoff,
+    check_fn=_check_kanban_mode,
+    emoji="➡️",
 )
 
 registry.register(

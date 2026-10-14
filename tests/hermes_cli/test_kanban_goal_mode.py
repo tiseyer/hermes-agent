@@ -204,6 +204,25 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_loop_stops_after_worker_handoff_to_ready(monkeypatch):
+    """A normal role handoff is terminal even though its target state is ready."""
+    _patch_judge(monkeypatch, ["continue"])  # should never be consulted
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-handoff",
+        goal_text="specify then pass to coder",
+        run_turn=lambda prompt: turns.append(prompt) or "unexpected",
+        task_status_fn=lambda: "ready",
+        block_fn=lambda reason: pytest.fail("should not block"),
+        first_response="handed off",
+    )
+
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "status=ready"
+    assert turns == []
+
+
 def test_loop_continues_then_worker_completes(monkeypatch):
     _patch_judge(monkeypatch, ["continue", "continue"])
     statuses = iter(["running", "running", "done"])

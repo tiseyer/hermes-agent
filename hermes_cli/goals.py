@@ -1577,7 +1577,7 @@ class GoalManager:
 # ──────────────────────────────────────────────────────────────────────
 
 # Continuation prompt fed back to a kanban goal-mode worker that has not
-# yet completed/blocked its task. The card's own acceptance criteria are
+# yet completed/blocked/handed off its task. The card's own acceptance criteria are
 # the goal — the worker already has the full task body in its first turn,
 # so we keep this short and point it back at the lifecycle contract.
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
@@ -1585,19 +1585,21 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "Reason: {reason}\n\n"
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If you are "
+    "handing work to another role, call kanban_handoff once. If you are "
     "blocked and need human input, call kanban_block with a reason. Do not "
     "stop without calling one of them."
 )
 
 # Fed when the judge believes the work is done but the worker never called
-# kanban_complete / kanban_block. One explicit nudge to terminate the task
+# kanban_complete / kanban_block / kanban_handoff. One explicit nudge to terminate the task
 # the right way before the loop gives up.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
     "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If something still blocks completion, call "
-    "kanban_block with the reason instead."
+    "summary of what you did. If another role is next, call kanban_handoff "
+    "once. If something still blocks completion, call kanban_block with the "
+    "reason instead."
 )
 
 
@@ -1620,7 +1622,8 @@ def run_kanban_goal_loop(
     is that turn's reply. From here we:
 
     1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
+       ``kanban_complete`` / ``kanban_block`` / ``kanban_handoff``). If so,
+       stop — nothing to do.
     2. Otherwise judge the latest response against ``goal_text`` (the card's
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
@@ -1670,14 +1673,14 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status not in ("running", "ready"):
+        if status != "running":
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
+        # via kanban_complete / kanban_block / kanban_handoff, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
         verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
         if verdict == "wait":
