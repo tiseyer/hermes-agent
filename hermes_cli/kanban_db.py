@@ -155,6 +155,16 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "re
 # three native triggers; ``frage`` and ``go_noetig`` are the two additions.
 VALID_CATEGORIES = {"frage", "entscheidung", "abnahme", "blocker", "go_noetig"}
 
+# F45: the escalation categories whose content is an OWNER DECISION — a business
+# question/sign-off/GO that Till answers. These map onto the Beobachter's
+# ``blocked_zielfrage`` path (rule b): the only human-decision bucket the
+# observer greens. A card escalated for one of these must therefore land in
+# ``blocked@till``, never in the dead ``human`` bucket (which the observer flags
+# ``rot-stuck`` for a watched card after the frist — live Karte 18 t_1fb31d56).
+# ``blocker`` is a pure impediment (not a question for Till) and stays on the
+# human path. See :func:`move_to_human`.
+_HUMAN_DECISION_CATEGORIES = frozenset({"frage", "entscheidung", "abnahme", "go_noetig"})
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -3396,6 +3406,55 @@ _ZIELFRAGE_TECH_REGEX = re.compile(
 _ZIELFRAGE_BLOCK_KINDS = (None, "needs_input")
 
 
+def _card_has_nontech_zielfrage(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True iff ``task_id`` already carries a non-technical ``?``-comment.
+
+    The Beobachter reads the Zielfrage from the newest COMMENT containing ``?``
+    (``_letzte_frage``) and greens rule b only when it is not a technical term
+    (:data:`_ZIELFRAGE_TECH_REGEX`). This is the status-independent variant of
+    :func:`_blocked_card_has_zielfrage` (no ``block_kind`` check) — used by the
+    F45 reroute to decide whether a decision card already has a usable Zielfrage
+    (leave it) or needs one synthesised from its own body/title.
+    """
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
+        (task_id,),
+    ).fetchall()
+    for c in reversed(comments):
+        b = c["body"] or ""
+        if "?" in b and not _ZIELFRAGE_TECH_REGEX.search(b):
+            return True
+    return False
+
+
+def _owner_decision_zielfrage(
+    title: Optional[str], body: Optional[str]
+) -> str:
+    """Compose a prepared owner Zielfrage from a decision card's own content.
+
+    Fallback for the F45 reroute: when a decision-category card escalated to
+    ``human`` has no usable ``?``-comment of its own, present its stated decision
+    (body, else title) framed as a business owner question so the Beobachter's
+    richter can green it (TOR1 business decision · TOR2 options/GO named · TOR3
+    plain language). Deliberately NEITHER asks the owner to author a completeness
+    list NOR names a technical term — the two shapes the richter forces to NEIN
+    (cf. F44 TOR2, :data:`_ZIELFRAGE_TECH_REGEX`). Faithful reformat, not a
+    facade: it only turns the card's own decision statement into a question.
+    """
+    core = (body or "").strip() or (title or "").strip() or "Zielentscheidung"
+    return (
+        "ZIELENTSCHEID (Geschäftsentscheidung des Inhabers, keine Technikfrage):\n\n"
+        f"{core}\n\n"
+        "Welcher der genannten Wege soll gelten? Die Fabrik trifft diese "
+        "Abnahme-/Umfangsentscheidung nicht selbst und baut nach der Antwort "
+        "gezielt weiter; sie verlangt dafür KEINE vom Inhaber zu erstellende "
+        "Vollständigkeitsliste — genügt es, einzelne Punkte zu benennen, baut "
+        "die Fabrik gezielt nach."
+    )
+
+
 def _blocked_card_has_zielfrage(
     conn: sqlite3.Connection, task_id: str
 ) -> bool:
@@ -3439,6 +3498,7 @@ def move_to_human(
     kurzbeschreibung: Optional[str] = None,
     category: Optional[str] = None,
     actor: Optional[str] = None,
+    planned_step: bool = False,
 ) -> str:
     """Flip an EXISTING card's status to ``human`` — "Till must act on this".
 
@@ -3457,6 +3517,11 @@ def move_to_human(
       * ``"terminal"`` — ``done``/``archived``; a resolved card is never
                           re-escalated; nothing written.
       * ``"notfound"`` — unknown id.
+      * ``"stays_blocked"`` — F38: an already-blocked business Zielfrage is left
+                          in ``blocked`` (observer's ``blocked_zielfrage`` bucket).
+      * ``"rerouted_blocked"`` — F45: an ACTIVE work card escalated for an owner
+                          DECISION is routed to ``blocked@till`` (needs_input)
+                          with a Zielfrage instead of the dead ``human`` bucket.
       * ``"moved"``    — flipped to ``human`` (stale run pointer defensively
                           closed like :func:`unblock_task`), a ``human`` event
                           appended, and the card optionally relabelled.
@@ -3546,6 +3611,103 @@ def move_to_human(
                          "actor": actor, "kept_blocked": True},
                     )
             return "stays_blocked"
+        # F45: an ACTIVE, dispatcher-owned work card (ready/running/todo/triage/
+        # scheduled/review) escalated for an owner DECISION must not sink into
+        # the dead ``human`` bucket. The Beobachter greens a watched card ONLY in
+        # done / blocked-with-Zielfrage / ready@merger — a card parked in
+        # ``human`` is flagged ``rot-stuck`` after the frist (live Karte 18
+        # t_1fb31d56: a scope/abnahme decision that duplicated an already-pending
+        # Zielentscheid got human-escalated and rotted > 1h). This is the
+        # symmetric companion to the F38 guard above: that keeps an ALREADY-
+        # blocked Zielfrage in ``blocked`` (the observer's ``blocked_zielfrage``
+        # bucket); this routes a not-yet-blocked decision INTO that same bucket
+        # instead of the human dead-end. Scoped to the question-shaped categories
+        # (:data:`_HUMAN_DECISION_CATEGORIES`) and excluding planned Till steps
+        # (``child_role='human_check'`` go through ``human`` by design) and the
+        # ``blocker`` category (a pure impediment, not a question for Till).
+        _eff_category = category or (
+            conn.execute(
+                "SELECT category FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()["category"]
+        )
+        _crow = conn.execute(
+            "SELECT child_role, title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        # A planned Till step (``plan_human_step`` with no open predecessors, or
+        # a ``child_role='human_check'`` card) is Till's inbox BY DESIGN and must
+        # reach ``human`` even for a decision category — ``planned_step`` lets
+        # that caller opt out of the reroute.
+        _is_planned_step = (
+            planned_step or (_crow["child_role"] or "work") == "human_check"
+        )
+        if (
+            status not in ("done", "archived", "blocked", "human")
+            and not _is_planned_step
+            and _eff_category in _HUMAN_DECISION_CATEGORIES
+        ):
+            if row["current_run_id"]:
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reclaimed', outcome = 'reclaimed',
+                           summary = COALESCE(summary,
+                               'invariant recovery on blocked (F45 reroute)'),
+                           ended_at = ?,
+                           claim_lock = NULL, claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ? AND ended_at IS NULL
+                    """,
+                    (now, int(row["current_run_id"])),
+                )
+            bsets = [
+                "status = 'blocked'", "assignee = 'till'",
+                "block_kind = 'needs_input'", "current_run_id = NULL",
+                "claim_lock = NULL", "claim_expires = NULL", "worker_pid = NULL",
+            ]
+            bparams: list = []
+            if title is not None:
+                bsets.append("title = ?")
+                bparams.append(title)
+            if kurzbeschreibung is not None:
+                bsets.append("body = ?")
+                bparams.append(kurzbeschreibung)
+            if category is not None:
+                bsets.append("category = ?")
+                bparams.append(category)
+            bparams.append(task_id)
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(bsets)} WHERE id = ?", bparams
+            )
+            # Ensure a non-technical ``?``-Zielfrage exists so the observer reads
+            # rule b. A prepared question already on the card wins; otherwise
+            # synthesise a faithful one from the (possibly just-relabelled) body/
+            # title. The caller's reason comment (``HUMAN: …``) is appended after
+            # and only overrides the frage if it itself carries a ``?``.
+            if not _card_has_nontech_zielfrage(conn, task_id):
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        task_id, actor or "manager",
+                        _owner_decision_zielfrage(
+                            title if title is not None else _crow["title"],
+                            kurzbeschreibung if kurzbeschreibung is not None
+                            else _crow["body"],
+                        ),
+                        now,
+                    ),
+                )
+            # Sticky ``blocked`` event so recompute_ready never auto-promotes the
+            # parked decision back to ready (``_has_sticky_block``).
+            _append_event(
+                conn, task_id, "blocked",
+                {"kind": "needs_input", "from": status, "category": _eff_category,
+                 "actor": actor,
+                 "reason": "F45 owner-decision reroute: Entscheidung gehört in "
+                           "blocked@till (blocked_zielfrage), nicht in den toten "
+                           "human-Eimer"},
+            )
+            return "rerouted_blocked"
         # Defensively close any stale run pointer before flipping status so the
         # runs invariant (current_run_id IS NULL ⇔ run in terminal state) holds,
         # mirroring unblock_task.
@@ -3676,10 +3838,12 @@ def plan_human_step(
                  "actor": actor},
             )
             return "planned"
-    # Nothing open to wait for -> Till is needed now.
+    # Nothing open to wait for -> Till is needed now. This IS a planned Till
+    # step, so it goes to the ``human`` inbox even for a decision category (the
+    # F45 reroute is only for direct, un-planned escalations).
     return move_to_human(
         conn, task_id, title=title, kurzbeschreibung=kurzbeschreibung,
-        category=category, actor=actor,
+        category=category, actor=actor, planned_step=True,
     )
 
 

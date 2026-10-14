@@ -215,3 +215,122 @@ def test_cli_human_after_plant_und_kategorie_nachtragen(kanban_home, capsys):
         assert kb.get_task(conn, till).status == "todo"
         assert kb.get_task(conn, till).child_role == "human_check"
         assert kb.get_task(conn, warte).category == "frage"
+
+
+# --------------------------------------------------------------------------
+# F45 — an ACTIVE work card escalated for an owner DECISION must land in
+# blocked@till (blocked_zielfrage, rule b), NOT in the dead ``human`` bucket
+# (which the Beobachter flags rot-stuck after the frist). Symmetric companion
+# to F38 (which keeps an ALREADY-blocked Zielfrage in blocked). Live Karte 18
+# t_1fb31d56: a scope/abnahme decision got human-escalated and rotted > 1h.
+# --------------------------------------------------------------------------
+def _ready(conn, tid):
+    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    conn.commit()
+
+
+def test_active_decision_reroutes_to_blocked_zielfrage(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Ziel für vollständige deutsche UI klären",
+            body="Bitte festlegen: neues vollständiges Lokalisierungsvorhaben "
+                 "oder den bisherigen breiten Stand abschließen.",
+            assignee="orchestrator",
+        )
+        _ready(conn, tid)
+        out = kb.move_to_human(conn, tid, category="entscheidung")
+        assert out == "rerouted_blocked"
+        t = kb.get_task(conn, tid)
+        # Landed in the observer's green owner-decision bucket, not human.
+        assert t.status == "blocked"
+        assert t.assignee == "till"
+        assert t.block_kind == "needs_input"
+        assert t.category == "entscheidung"
+        # A non-technical ?-Zielfrage is present for the observer's rule b.
+        frage = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=? AND body LIKE '%?%' "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert frage is not None and "ZIELENTSCHEID" in frage["body"]
+        # No ``human`` event — the card never touched the dead bucket.
+        n_human = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE task_id=? AND kind='human'",
+            (tid,),
+        ).fetchone()["c"]
+        assert n_human == 0
+        # Sticky blocked event → recompute_ready must not auto-promote it.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+        # Re-invocation is now caught by the F38 guard — safe no-op.
+        assert kb.move_to_human(conn, tid, category="entscheidung") == "stays_blocked"
+
+
+def test_active_decision_reuses_prepared_zielfrage(kanban_home):
+    # A card that already carries a prepared non-technical Zielfrage keeps it —
+    # no synthesised comment is appended on reroute.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Abnahme-GO", assignee="orchestrator")
+        _ready(conn, tid)
+        kb.add_comment(
+            conn, tid, "orchestrator",
+            "VORBEREITETER ZIELENTSCHEID: Soll der erreichte Stand abgenommen "
+            "und freigegeben werden, oder ein neues Vorhaben aufgesetzt werden?",
+        )
+        n_before = conn.execute(
+            "SELECT COUNT(*) c FROM task_comments WHERE task_id=?", (tid,),
+        ).fetchone()["c"]
+        assert kb.move_to_human(conn, tid, category="abnahme") == "rerouted_blocked"
+        n_after = conn.execute(
+            "SELECT COUNT(*) c FROM task_comments WHERE task_id=?", (tid,),
+        ).fetchone()["c"]
+        # No synthesised Zielfrage — the prepared one is reused.
+        assert n_after == n_before
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_active_blocker_still_escalates_to_human(kanban_home):
+    # Gegenprobe: ``blocker`` is a pure impediment (not a question for Till) —
+    # it is NOT a decision category, so it keeps the human path.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Zugang fehlt", assignee="orchestrator")
+        _ready(conn, tid)
+        assert kb.move_to_human(conn, tid, category="blocker") == "moved"
+        assert kb.get_task(conn, tid).status == "human"
+
+
+def test_planned_human_check_step_still_uses_human(kanban_home):
+    # Gegenprobe: a planned Till step (child_role human_check) is Till's inbox by
+    # design and must still reach ``human`` even with a decision category.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Geplante Abnahme", assignee="default",
+            child_role="human_check",
+        )
+        _ready(conn, tid)
+        assert kb.move_to_human(conn, tid, category="abnahme") == "moved"
+        assert kb.get_task(conn, tid).status == "human"
+
+
+def test_cli_human_on_active_decision_routes_to_blocked(kanban_home, capsys):
+    root, kc = _parser()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Ziel für vollständige deutsche UI klären",
+            body="neues vollständiges Lokalisierungsvorhaben oder den "
+                 "bisherigen breiten Stand abschließen.",
+            assignee="orchestrator",
+        )
+        _ready(conn, tid)
+    rc = kc.kanban_command(root.parse_args(
+        ["kanban", "human", tid, "--category", "entscheidung",
+         "--reason", "Abnahmeziel widerspricht der begründeten Sperre."]))
+    assert rc == 0
+    assert "blocked@till" in capsys.readouterr().out
+    with kb.connect() as conn:
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked" and t.block_kind == "needs_input"
+        # The rationale comment is carried onto the card for context.
+        assert conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'HUMAN:%'",
+            (tid,),
+        ).fetchone() is not None

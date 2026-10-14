@@ -223,17 +223,20 @@ def test_family_root_clock_only_bumps_on_aggregate_change(kanban_home):
 # ---------------------------------------------------------------------------
 
 def test_move_to_human_sets_category_and_event(kanban_home):
+    # ``blocker`` is a non-decision category, so the human flip still applies
+    # (the F45 reroute only diverts owner-DECISION categories to blocked@till —
+    # covered in test_kanban_human_spaeter.py).
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="decide this", tenant="voicera")
-        out = kb.move_to_human(conn, tid, category="entscheidung", actor="mgr")
+        out = kb.move_to_human(conn, tid, category="blocker", actor="mgr")
         row = conn.execute(
             "SELECT status, category FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
         assert out == "moved"
         assert row["status"] == "human"
-        assert row["category"] == "entscheidung"
+        assert row["category"] == "blocker"
         events = [e for e in kb.list_events(conn, tid) if e.kind == "human"]
-        assert events and events[-1].payload.get("category") == "entscheidung"
+        assert events and events[-1].payload.get("category") == "blocker"
 
 
 def test_move_to_human_rejects_unknown_category(kanban_home):

@@ -4852,7 +4852,9 @@ def test_scope_recut_ceiling_allows_early_handbacks_then_escalates(kanban_home):
                 "SELECT body FROM task_comments WHERE task_id = ?", (tid,)
             )
         ]
-        assert any("ENTSCHEIDUNG BENÖTIGT" in b for b in bodies), bodies
+        # F44 reshaped this escalation from an owner-enumeration demand into a
+        # prepared Abnahme/Freigabe-GO on the reached state.
+        assert any("ABNAHME/FREIGABE (GO)" in b for b in bodies), bodies
 
 
 def test_scope_recut_ceiling_ignores_forward_handoffs(kanban_home):

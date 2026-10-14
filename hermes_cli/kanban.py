@@ -2234,7 +2234,9 @@ def _cmd_human(args: argparse.Namespace) -> int:
                     actor=actor,
                 )
             # Comment only on the actual move — keeps a repeat call a pure no-op.
-            if outcome in ("moved", "planned") and reason:
+            # ``rerouted_blocked`` (F45) is an actual transition too: carry the
+            # manager's rationale onto the card as context for the Zielfrage.
+            if outcome in ("moved", "planned", "rerouted_blocked") and reason:
                 kb.add_comment(conn, args.task_id, actor, f"HUMAN: {reason}")
     except ValueError as exc:
         print(f"kanban: human: {exc}", file=sys.stderr)
@@ -2259,6 +2261,16 @@ def _cmd_human(args: argparse.Namespace) -> int:
             f"{args.task_id} stays blocked — already a human-decision "
             f"Zielfrage in 'blocked'; not escalated to human"
             + (f" (category {args.category} recorded)" if getattr(args, "category", None) else "")
+        )
+        return 0
+    if outcome == "rerouted_blocked":
+        # F45: a decision escalation of an active work card belongs in the
+        # observer's green owner-decision bucket (blocked_zielfrage), not the
+        # dead human bucket that the Beobachter flags rot-stuck.
+        print(
+            f"{args.task_id} routed to blocked@till (owner-decision Zielfrage) "
+            f"instead of human"
+            + (f": {reason}" if reason else "")
         )
         return 0
     if outcome == "categorized":
