@@ -6665,6 +6665,11 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        # A merger that reaches triage through the block-loop breaker has
+        # already attempted its terminal action. Treating that evidence as a
+        # fresh specification request can run the same merge twice.
+        if is_merger_profile(existing["assignee"]):
+            return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -6801,9 +6806,12 @@ def decompose_triage_task(
     # insert transaction. A triage root is not dispatchable yet, so it must be
     # parked here rather than letting tenant fallback create misrouted children.
     root_for_routing = conn.execute(
-        "SELECT title, body, tenant, status FROM tasks WHERE id = ?", (task_id,),
+        "SELECT title, body, tenant, status, assignee FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if root_for_routing is not None and root_for_routing["status"] == "triage":
+        if is_merger_profile(root_for_routing["assignee"]):
+            return None
         try:
             resolve_repo_profiles(
                 (root_for_routing["title"] or "") + "\n" + (root_for_routing["body"] or ""),
@@ -6864,12 +6872,14 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, title, body, status, tenant, repository, workspace_kind, "
-            "workspace_path, initiative_id FROM tasks WHERE id = ?",
+            "workspace_path, initiative_id, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if is_merger_profile(root_row["assignee"]):
             return None
         # The root is a family member and a board projection of its children;
         # further descendants inherit this stable family id through create_task.
@@ -9153,7 +9163,7 @@ _GO_GATE_BODY_RE = re.compile(
 )
 
 
-def _is_merger_profile(assignee: Optional[str]) -> bool:
+def is_merger_profile(assignee: Optional[str]) -> bool:
     """True when the assignee is the merger integration profile.
 
     A merger card performs the terminal branch merge, so it is a GO-gated
@@ -9167,6 +9177,11 @@ def _is_merger_profile(assignee: Optional[str]) -> bool:
         return False
     a = assignee.strip().lower()
     return a == "merger" or a.endswith("-merger")
+
+
+# Backward-compatible private alias for callers that imported the original
+# helper before merger identity became a cross-module invariant.
+_is_merger_profile = is_merger_profile
 
 
 def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -10084,7 +10099,7 @@ def _dispatch_once_locked(
         _is_terminal_card = (
             bool(_GO_GATE_RE.search(_title))
             or bool(_GO_GATE_BODY_RE.search(_body))
-            or _is_merger_profile(row_assignee)
+            or is_merger_profile(row_assignee)
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):

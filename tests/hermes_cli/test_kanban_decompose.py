@@ -15,6 +15,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
+from hermes_cli import kanban_diagnostics as diagnostics
 
 
 @pytest.fixture
@@ -83,6 +84,94 @@ def test_auto_decomposer_selection_excludes_backlog_cards(kanban_home):
         conn.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (parked,))
 
     assert decomp.list_triage_ids() == [triage]
+
+
+def test_auto_decomposer_excludes_merger_after_block_loop_and_does_not_rerun(
+    kanban_home,
+):
+    """A merger loop is terminal evidence, never fresh decomposition work."""
+    spawned = []
+    with kb.connect_closing() as conn:
+        merger = kb.create_task(
+            conn,
+            title="Integrate feature branches",
+            assignee="merger",
+        )
+        control = kb.create_task(
+            conn,
+            title="Clarify ordinary work",
+            assignee="orchestrator",
+            triage=True,
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (merger,))
+
+        assert kb.claim_task(conn, merger, claimer="merger") is not None
+        assert kb.block_task(
+            conn, merger, reason="missing merge capability", kind="capability",
+        )
+        assert kb.unblock_task(conn, merger)
+        assert kb.claim_task(conn, merger, claimer="merger") is not None
+        assert kb.block_task(
+            conn, merger, reason="missing merge capability", kind="capability",
+        )
+        merger_task = kb.get_task(conn, merger)
+        assert merger_task is not None
+        assert merger_task.status == "triage"
+        runs_before = len(kb.list_runs(conn, merger))
+
+        # The normal triage control remains visible; the terminal merger does not.
+        assert decomp.list_triage_ids() == [control]
+        with patch("agent.auxiliary_client.call_llm") as call_llm:
+            outcome = decomp.decompose_task(merger, author="auto-decomposer")
+        assert outcome.ok is False
+        assert "merger tasks are terminal" in outcome.reason
+        call_llm.assert_not_called()
+        assert kb.specify_triage_task(
+            conn,
+            merger,
+            title="Specified merger",
+            author="auto-decomposer",
+        ) is False
+        assert kb.decompose_triage_task(
+            conn,
+            merger,
+            root_assignee="orchestrator",
+            children=[{
+                "title": "Duplicate merge work",
+                "assignee": "merger",
+                "parents": [],
+            }],
+            author="auto-decomposer",
+        ) is None
+
+        task = kb.get_task(conn, merger)
+        events = kb.list_events(conn, merger)
+        comments = kb.list_comments(conn, merger)
+        merger_diags = diagnostics._rule_triage_aux_unavailable(
+            task,
+            events,
+            kb.list_runs(conn, merger),
+            123,
+            {"auxiliary": {}, "kanban": {"auto_decompose": True}},
+        )
+
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace, **kwargs: spawned.append(task.id),
+        )
+
+        merger_task = kb.get_task(conn, merger)
+        control_task = kb.get_task(conn, control)
+        assert merger_task is not None
+        assert control_task is not None
+        assert merger_task.status == "triage"
+        assert control_task.status == "triage"
+        assert not any(event.kind == "specified" for event in events)
+        assert not any("promoted to todo" in comment.body for comment in comments)
+        assert merger_diags == []
+        assert spawned == []
+        assert len(kb.list_runs(conn, merger)) == runs_before
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):

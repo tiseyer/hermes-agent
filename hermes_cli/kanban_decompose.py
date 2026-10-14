@@ -289,6 +289,10 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if kb.is_merger_profile(task.assignee):
+        return DecomposeOutcome(
+            task_id, False, "merger tasks are terminal and cannot be decomposed"
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -457,7 +461,7 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return decomposable task ids currently in the triage column."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +469,4 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [row.id for row in rows if not kb.is_merger_profile(row.assignee)]

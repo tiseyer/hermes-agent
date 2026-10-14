@@ -388,6 +388,12 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
     """
     if _task_field(task, "status") != "triage":
         return []
+    # Merger cards are terminal work. A block-loop routes them to triage as
+    # evidence for an operator, not as input for another specify/decompose
+    # cycle, so an unavailable triage helper is irrelevant and misleading.
+    from hermes_cli import kanban_db
+    if kanban_db.is_merger_profile(_task_field(task, "assignee")):
+        return []
 
     status = triage_aux_status(cfg)
     if status is None:
