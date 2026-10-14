@@ -203,7 +203,7 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
         "No gateway is running — the task will sit in 'ready' until you "
         "start it. Run:\n"
         "    hermes gateway start\n"
-        "The gateway hosts an embedded dispatcher (tick interval 60s by "
+        "The gateway hosts an embedded dispatcher (tick interval 30s by "
         "default); your task will be picked up on the next tick after "
         "the gateway comes up."
     )

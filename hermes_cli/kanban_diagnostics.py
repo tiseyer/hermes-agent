@@ -1038,7 +1038,7 @@ DEFAULT_CONFIG = {
     "blocked_stale_hours": 24,
     # Stranded-task threshold. 30 min by default — below that, the
     # signal is dominated by tasks that are about to be claimed on the
-    # next dispatcher tick (default 60s) and would just be noise.
+    # next dispatcher tick (default 30s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
 }
 

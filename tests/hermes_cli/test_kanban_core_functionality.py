@@ -3477,6 +3477,8 @@ def test_check_dispatcher_presence_warns_when_no_gateway(monkeypatch):
     running, msg = kb_cli._check_dispatcher_presence()
     assert running is False
     assert "hermes gateway start" in msg
+    assert "tick interval 30s by default" in msg
+    assert "tick interval 60s" not in msg
 
 
 def test_check_dispatcher_presence_warns_when_flag_off(monkeypatch):
