@@ -6750,6 +6750,93 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # F43 (hand-back-less variant): the scope-recut escalation belongs
+            # ON the card the Beobachter watches (blocked@till with the
+            # Zielfrage → rule b green). An orchestrator that instead spins the
+            # owner question off into a NEW "Zielentscheid" child blocked@till
+            # and parks THIS card as its dependency strands the watched card in
+            # ``todo`` — recompute_ready never promotes a card gated on an
+            # unanswered human block, so it rots to the frist and the Beobachter
+            # flags rot-stuck even though the question is perfectly legitimate.
+            # Detect that shape and fold the Zielfrage back onto THIS card: when
+            # every non-terminal parent is a held human decision, the card is
+            # not waiting on autonomous work at all — present it AS blocked@till
+            # with the mirrored Zielfrage instead of a dead-end todo park. A mix
+            # with any still-working parent stays a legitimate dependency wait.
+            _owner_frage = _human_decision_gate_question(conn, task_id)
+            if _owner_frage:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="dependency on human Zielentscheidung → "
+                            "blocked@till (F43 gate-fold)",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="dependency on human Zielentscheidung → "
+                                "blocked@till (F43 gate-fold)",
+                    )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Umfang/Abnahme nicht fabrik-intern abschließbar — diese "
+                        "Karte wartet auf eine Inhaber-Zielentscheidung und wird "
+                        "nach der Antwort automatisch fortgesetzt.\n\n"
+                        + _owner_frage,
+                        int(time.time()),
+                    ),
+                )
+                # Sticky ``blocked`` event: without it recompute_ready would
+                # promote the parked card back to ready the moment the (now
+                # redundant) decision child finishes — the same unspawnable
+                # limbo F41/F43 guard against.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"kind": "needs_input",
+                     "reason": "F43 owner-decision gate: Zielfrage auf die "
+                               "beobachtete Karte gefaltet statt sie in todo "
+                               "zu parken"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "scope_recut_ceiling",
+                    {"routed_to": "till", "variant": "dependency_gate_fold"},
+                    run_id=run_id,
+                )
+                routed_to = "blocked"
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_blocked",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id,
+                    reason="F43 owner-decision gate fold",
+                )
+                return True
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -9702,6 +9789,78 @@ def _scope_recut_count(conn: sqlite3.Connection, task_id: str) -> int:
         if to == "orchestrator" or to.endswith("-orchestrator"):
             n += 1
     return n
+
+
+def _zielfrage_text_of(
+    conn: sqlite3.Connection, task_id: str, body: Optional[str],
+) -> Optional[str]:
+    """Best Zielfrage text carried by ``task_id`` — latest ``?`` comment, else body.
+
+    The Beobachter reads the question from the newest COMMENT containing ``?``
+    (see ``_letzte_frage``); a card created blocked with its Zielfrage in the
+    BODY (no comment yet) is the common case for an orchestrator-spun decision
+    child, so fall back to the body. Returns ``None`` when neither carries a
+    question.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for r in rows:
+        b = (r["body"] or "").strip()
+        if "?" in b:
+            return b
+    if body and "?" in body:
+        return body.strip()
+    return None
+
+
+def _human_decision_gate_question(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Mirror-Zielfrage when ``task_id`` is gated SOLELY on held human decision(s).
+
+    The forward pipeline is orchestrator → specifier → coder → reviewer; a card
+    parked as a ``dependency`` normally waits in ``todo`` for its parents to
+    finish autonomously. But when the orchestrator escalates an unclosable scope
+    (F43) by creating a NEW decision ("Zielentscheid") child blocked@till and
+    dependency-parks THIS card beneath it, the card's only blocker is an
+    unanswered OWNER question — it will never promote on its own and rots in
+    ``todo`` until the Beobachter flags rot-stuck.
+
+    Return the parents' Zielfrage text (to fold back onto this card as a
+    blocked@till question) ONLY when EVERY non-terminal parent is a held human
+    decision (``status='blocked'`` and ``assignee`` in {till, human}). A single
+    still-working / autonomous non-terminal parent makes this a legitimate
+    dependency wait → ``None`` (keep the normal todo park). No non-terminal
+    parent at all → ``None`` (nothing gating it; recompute_ready promotes it).
+    """
+    parents = conn.execute(
+        "SELECT t.id AS id, t.status AS status, t.assignee AS assignee, "
+        "t.body AS body "
+        "FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    nonterminal = [
+        p for p in parents if (p["status"] or "") not in ("done", "archived")
+    ]
+    if not nonterminal:
+        return None
+    texts: list[str] = []
+    for p in nonterminal:
+        is_human_block = (
+            (p["status"] or "") == "blocked"
+            and (p["assignee"] or "").strip().lower() in ("till", "human")
+        )
+        if not is_human_block:
+            # an autonomous (still-running / todo / review) parent → genuine
+            # build dependency; do not hijack the normal todo-park.
+            return None
+        q = _zielfrage_text_of(conn, p["id"], p["body"])
+        if q:
+            texts.append(q)
+    return "\n\n".join(texts) if texts else None
 
 
 def _resolve_merger(

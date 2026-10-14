@@ -4869,3 +4869,79 @@ def test_scope_recut_ceiling_ignores_forward_handoffs(kanban_home):
                 f"{t.status}@{t.assignee}"
             )
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_dependency_on_human_zielfrage_folds_onto_watched_card(kanban_home):
+    """F43 gate-fold: dependency-parking a card beneath a blocked@till
+    Zielentscheid child escalates THE CARD itself to blocked@till with the
+    mirrored Zielfrage instead of stranding it in ``todo`` (rot-stuck)."""
+    with kb.connect() as conn:
+        main = kb.create_task(conn, title="alle UI-Worte", assignee="orchestrator")
+        decision = kb.create_task(
+            conn,
+            title="Zielentscheid: Abnahmeflaeche schliessen",
+            body="ZIELENTSCHEIDUNG: Soll der erreichte Stand als fertig gelten, "
+                 "oder welche Ansichten/Begriffe muessen noch deutsch sein?",
+            assignee="till",
+        )
+        # The decision child is a held human Zielfrage (blocked@till).
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', assignee = 'till', "
+            "block_kind = 'needs_input' WHERE id = ?",
+            (decision,),
+        )
+        kb.link_tasks(conn, decision, main)  # decision gates main
+
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (main,))
+        assert kb.block_task(conn, main, kind="dependency",
+                             reason="warte auf Zielentscheid") is True
+
+        t = kb.get_task(conn, main)
+        assert t.status == "blocked", t.status
+        assert t.assignee == "till", t.assignee
+        assert t.block_kind == "needs_input", t.block_kind
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (main,)
+            )
+        ]
+        assert "scope_recut_ceiling" in kinds
+        assert kinds[-1] != "dependency_wait"  # not the todo-park path
+        assert kb._has_sticky_block(conn, main) is True
+
+        # The Zielfrage is mirrored onto the watched card as a ``?`` comment so
+        # the Beobachter's rule-b Zielfrage richter can read it.
+        bodies = [
+            r["body"] for r in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ?", (main,)
+            )
+        ]
+        assert any("fertig gelten" in (b or "") and "?" in (b or "")
+                   for b in bodies), bodies
+
+
+def test_dependency_on_autonomous_parent_still_parks_todo(kanban_home):
+    """A genuine build dependency (parent still working) keeps the normal
+    todo-park — the gate-fold must not hijack ordinary file-conflict waits."""
+    with kb.connect() as conn:
+        main = kb.create_task(conn, title="feature B", assignee="voicera-coder")
+        running_parent = kb.create_task(conn, title="feature A", assignee="voicera-coder")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?",
+                     (running_parent,))
+        kb.link_tasks(conn, running_parent, main)
+
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (main,))
+        assert kb.block_task(conn, main, kind="dependency",
+                             reason="file-conflict with feature A") is True
+
+        t = kb.get_task(conn, main)
+        assert t.status == "todo", t.status
+        assert t.block_kind == "dependency", t.block_kind
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (main,)
+            )
+        ]
+        assert "dependency_wait" in kinds
+        assert "scope_recut_ceiling" not in kinds
