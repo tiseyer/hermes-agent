@@ -102,6 +102,17 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "backlog", "todo", "scheduled", "ready", "running", "blocked", "human", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Human GO is a deliberately tiny protocol.  These are not task statuses:
+# they name the two irreversible boundaries a caller may approve.  Structured
+# follow-up actions are equally narrow; completion and worker claiming keep
+# their existing dedicated state machines instead of being smuggled through a
+# generic status setter.
+VALID_GO_KINDS = frozenset({"build", "merge"})
+VALID_GO_ACTIONS = frozenset({"archive", "set_status"})
+VALID_GO_ACTION_STATUSES = frozenset(
+    VALID_STATUSES - {"running", "blocked", "done", "archived"}
+)
+
 # ``human`` is the single status for "a person (Till) must act on this card".
 # It unifies the three legacy crutches (assignee='till', child_role='human_check',
 # block_kind='needs_input') behind one first-class column — see
@@ -6564,6 +6575,335 @@ def promote_task(
     return True, None
 
 
+@dataclass(frozen=True)
+class GoGrantResult:
+    """Result of an idempotent :func:`grant_go` request."""
+
+    task_id: str
+    kind: str
+    actor: str
+    timestamp: int
+    timestamp_iso: str
+    applied: bool
+    action: Optional[dict[str, Any]] = None
+
+
+def _normalize_go_action(action: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Validate and copy the allow-listed immediate action request."""
+    if action is None:
+        return None
+    if not isinstance(action, dict):
+        raise ValueError("GO action must be an object")
+    name = action.get("name")
+    if name not in VALID_GO_ACTIONS:
+        raise ValueError(f"GO action must be one of {sorted(VALID_GO_ACTIONS)}")
+    allowed_keys = {"name", "target_ids"}
+    if name == "set_status":
+        allowed_keys.add("status")
+    extra = set(action) - allowed_keys
+    if extra:
+        raise ValueError(f"unknown GO action field(s): {', '.join(sorted(extra))}")
+
+    raw_target_ids = action.get("target_ids")
+    if not isinstance(raw_target_ids, list) or not raw_target_ids:
+        raise ValueError("GO action target_ids must contain at least one task id")
+    target_ids: list[str] = []
+    for raw in raw_target_ids:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("GO action target_ids must be non-empty strings")
+        target_ids.append(raw.strip())
+    if len(set(target_ids)) != len(target_ids):
+        raise ValueError("GO action target_ids must be unique")
+
+    normalized: dict[str, Any] = {"name": name, "target_ids": target_ids}
+    if name == "set_status":
+        status = action.get("status")
+        if status not in VALID_GO_ACTION_STATUSES:
+            raise ValueError(
+                "GO set_status action status must be one of "
+                f"{sorted(VALID_GO_ACTION_STATUSES)}"
+            )
+        normalized["status"] = status
+    return normalized
+
+
+def _go_event_payloads(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'go_granted' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def grant_go(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    actor: str,
+    action: Optional[dict[str, Any]] = None,
+) -> GoGrantResult:
+    """Atomically grant a held human GO and execute one structured action.
+
+    The ``go_granted`` event is the canonical audit record.  ``unblocked`` is
+    emitted in the same transaction for compatibility with the dispatcher's
+    existing GO-release predicate.  A repeated identical request returns the
+    original grant without writing another event, comment, or target action.
+    """
+    if kind not in VALID_GO_KINDS:
+        raise ValueError(f"GO kind must be one of {sorted(VALID_GO_KINDS)}")
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("GO actor is required")
+    actor = actor.strip()
+    normalized_action = _normalize_go_action(action)
+    archived_targets: list[str] = []
+
+    with write_txn(conn):
+        existing = next(
+            (payload for payload in _go_event_payloads(conn, task_id)
+             if payload.get("kind") == kind),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.get("actor") != actor
+                or existing.get("action") != normalized_action
+            ):
+                raise ValueError(
+                    f"GO {kind!r} for {task_id} was already granted with a different request"
+                )
+            timestamp = int(existing["timestamp"])
+            return GoGrantResult(
+                task_id=task_id,
+                kind=kind,
+                actor=actor,
+                timestamp=timestamp,
+                timestamp_iso=time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)
+                ),
+                applied=False,
+                action=normalized_action,
+            )
+
+        task = conn.execute(
+            "SELECT id, title, assignee, tenant, status, current_run_id, merge_group "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task["status"] != "blocked":
+            raise ValueError(f"task {task_id} is not blocked at a GO gate")
+
+        gate_row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'go_gate_held' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if gate_row is None:
+            raise ValueError(f"task {task_id} has no held GO gate")
+        latest_control = conn.execute(
+            "SELECT id, kind FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (
+            latest_control is None
+            or latest_control["kind"] != "blocked"
+            or gate_row["id"] < latest_control["id"]
+        ):
+            raise ValueError(f"task {task_id} has no active held GO gate")
+        try:
+            gate_payload = json.loads(gate_row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"task {task_id} has an invalid GO gate record") from exc
+        gate_kind = gate_payload.get("kind")
+        if gate_kind is None:
+            gate_kind = _go_gate_kind_for(
+                title=task["title"],
+                assignee=task["assignee"],
+                merge_group=task["merge_group"],
+            )
+        if gate_kind != kind:
+            raise ValueError(
+                f"active GO gate for task {task_id} requires {gate_kind!r}, not {kind!r}"
+            )
+        resume_assignee = _canonical_assignee(gate_payload.get("resume_assignee"))
+        if resume_assignee is None:
+            if kind == "merge":
+                resume_assignee = "merger"
+            else:
+                resolved = resolve_task_repo_profiles(conn, task_id)
+                resume_assignee = resolved[0] if resolved is not None else "default"
+
+        target_rows: dict[str, sqlite3.Row] = {}
+        if normalized_action is not None:
+            target_ids = normalized_action["target_ids"]
+            placeholders = ",".join("?" for _ in target_ids)
+            rows = conn.execute(
+                f"SELECT id, tenant, status, current_run_id FROM tasks "
+                f"WHERE id IN ({placeholders})",
+                tuple(target_ids),
+            ).fetchall()
+            target_rows = {row["id"]: row for row in rows}
+            missing = [target for target in target_ids if target not in target_rows]
+            if missing:
+                raise ValueError(f"unknown GO action target(s): {', '.join(missing)}")
+            foreign = [
+                target for target in target_ids
+                if target_rows[target]["tenant"] != task["tenant"]
+            ]
+            if foreign:
+                raise ValueError(
+                    "GO action targets must belong to the gate task tenant: "
+                    + ", ".join(foreign)
+                )
+            if task_id in target_rows:
+                raise ValueError("GO action cannot target its own gate task")
+            if normalized_action["name"] == "archive":
+                already_archived = [
+                    target for target in target_ids
+                    if target_rows[target]["status"] == "archived"
+                ]
+                if already_archived:
+                    raise ValueError(
+                        "GO archive targets are already archived: "
+                        + ", ".join(already_archived)
+                    )
+            else:
+                running = [
+                    target for target in target_ids
+                    if target_rows[target]["status"] == "running"
+                ]
+                if running:
+                    raise ValueError(
+                        "GO set_status cannot move running targets: "
+                        + ", ".join(running)
+                    )
+
+        now = int(time.time())
+        if task["current_run_id"]:
+            _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="invariant recovery on GO grant",
+            )
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        released = conn.execute(
+            "UPDATE tasks SET status = ?, assignee = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL, category = NULL, "
+            "status_changed_at = ? "
+            "WHERE id = ? AND status = 'blocked'",
+            (new_status, resume_assignee, now, task_id),
+        )
+        if released.rowcount != 1:
+            raise ValueError(f"task {task_id} changed while granting GO")
+
+        if normalized_action is not None:
+            for target_id in normalized_action["target_ids"]:
+                if normalized_action["name"] == "archive":
+                    target_run_id = _end_run(
+                        conn,
+                        target_id,
+                        outcome="reclaimed",
+                        status="reclaimed",
+                        summary="task archived by structured GO action",
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status = 'archived', current_run_id = NULL, "
+                        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                        "status_changed_at = ? "
+                        "WHERE id = ?",
+                        (now, target_id),
+                    )
+                    _append_event(
+                        conn,
+                        target_id,
+                        "archived",
+                        {"source": "go_action", "gate_task_id": task_id},
+                        run_id=target_run_id,
+                    )
+                    archived_targets.append(target_id)
+                else:
+                    target_status = normalized_action["status"]
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                        "status_changed_at = ? "
+                        "WHERE id = ?",
+                        (target_status, now, target_id),
+                    )
+                    _append_event(
+                        conn,
+                        target_id,
+                        "status",
+                        {
+                            "status": target_status,
+                            "source": "go_action",
+                            "gate_task_id": task_id,
+                        },
+                    )
+
+        timestamp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        audit_payload = {
+            "task_id": task_id,
+            "kind": kind,
+            "actor": actor,
+            "timestamp": now,
+            "action": normalized_action,
+        }
+        _append_event(conn, task_id, "unblocked", {"status": new_status})
+        _append_event(conn, task_id, "go_granted", audit_payload)
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                actor,
+                f"GO erteilt: Karte {task_id}; Art {kind}; Akteur {actor}; "
+                f"Zeit {timestamp_iso}.",
+                now,
+            ),
+        )
+
+    if archived_targets:
+        recompute_ready(conn)
+        for target_id in archived_targets:
+            try:
+                cleanup_worktree_artifacts(conn, target_id)
+            except Exception:
+                pass
+    return GoGrantResult(
+        task_id=task_id,
+        kind=kind,
+        actor=actor,
+        timestamp=now,
+        timestamp_iso=timestamp_iso,
+        applied=True,
+        action=normalized_action,
+    )
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -9152,6 +9492,10 @@ _GO_GATE_BODY_RE = re.compile(
     r")"
 )
 
+_MERGE_GO_GATE_RE = re.compile(
+    r"(?i)\b(merge\w*|pull[- ]?request|(?-i:PR)s?\b|release\w*|ver[öo]ffentlich\w*)"
+)
+
 
 def _is_merger_profile(assignee: Optional[str]) -> bool:
     """True when the assignee is the merger integration profile.
@@ -9167,6 +9511,19 @@ def _is_merger_profile(assignee: Optional[str]) -> bool:
         return False
     a = assignee.strip().lower()
     return a == "merger" or a.endswith("-merger")
+
+
+def _go_gate_kind_for(
+    *, title: Optional[str], assignee: Optional[str], merge_group: Optional[str]
+) -> str:
+    """Classify a terminal gate once so later GO requests cannot reinterpret it."""
+    if (
+        _is_merger_profile(assignee)
+        or bool((merge_group or "").strip())
+        or bool(_MERGE_GO_GATE_RE.search(title or ""))
+    ):
+        return "merge"
+    return "build"
 
 
 def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -10121,6 +10478,12 @@ def _dispatch_once_locked(
                         _append_event(
                             conn, row["id"], "go_gate_held",
                             {"assignee": "till", "status": "blocked",
+                             "resume_assignee": row_assignee,
+                             "kind": _go_gate_kind_for(
+                                 title=_title,
+                                 assignee=row_assignee,
+                                 merge_group=_row_merge_group,
+                             ),
                              "reason": "terminal card requires "
                                        "explicit human GO"},
                         )

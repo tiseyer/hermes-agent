@@ -43,11 +43,11 @@ import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -55,6 +55,15 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+GO_ROUTE_PATH = "/api/plugins/kanban/go"
+GO_TOKEN_SCOPE = "kanban:go"
+try:
+    from hermes_cli.dashboard_auth.token_auth import register_token_route
+
+    register_token_route(GO_ROUTE_PATH)
+except Exception as exc:  # noqa: BLE001 - optional dashboard auth seam
+    log.warning("kanban: could not register token route %s: %s", GO_ROUTE_PATH, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +961,76 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /go  (atomic human GO + structured immediate action)
+# ---------------------------------------------------------------------------
+
+class GoActionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Literal["archive", "set_status"]
+    target_ids: list[str] = Field(min_length=1)
+    status: Optional[str] = None
+
+
+class GrantGoBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1)
+    kind: Literal["build", "merge"]
+    action: Optional[GoActionBody] = None
+
+
+def _verified_go_actor(request: Request) -> str:
+    """Derive the audit actor from verified request state, never request JSON."""
+    principal = getattr(request.state, "token_principal", None)
+    if principal is not None:
+        scopes = tuple(getattr(principal, "scopes", ()) or ())
+        if GO_TOKEN_SCOPE not in scopes:
+            raise HTTPException(status_code=403, detail="GO token lacks required scope")
+        actor = str(getattr(principal, "principal", "") or "").strip()
+        if not actor:
+            raise HTTPException(status_code=401, detail="GO token has no principal")
+        return actor
+
+    session = getattr(request.state, "session", None)
+    if session is not None:
+        for attr in ("display_name", "email", "user_id"):
+            actor = str(getattr(session, attr, "") or "").strip()
+            if actor:
+                return actor
+
+    # Legacy loopback dashboard auth has a process token but no user identity.
+    # Its truthful audit identity is the dashboard, not a body-supplied claim.
+    return "dashboard"
+
+
+@router.post("/go")
+def grant_go(
+    payload: GrantGoBody,
+    request: Request,
+    board: Optional[str] = Query(None),
+):
+    """Grant a held GO without routing the request through a chat model."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        action = payload.action.model_dump(exclude_none=True) if payload.action else None
+        actor = _verified_go_actor(request)
+        result = kanban_db.grant_go(
+            conn,
+            payload.task_id,
+            kind=payload.kind,
+            actor=actor,
+            action=action,
+        )
+        return asdict(result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         conn.close()
 
