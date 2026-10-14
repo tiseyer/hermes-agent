@@ -9492,6 +9492,76 @@ def _infra_selfrepair_count(conn: sqlite3.Connection, task_id: str) -> int:
     return int(row["n"]) if row else 0
 
 
+# F41 convergence ceiling for the coder-rebuild bounce.
+#
+# A card can churn in the factory WITHOUT ever tripping an infra/failure brake:
+# the coder keeps COMPLETING SUCCESSFULLY and the reviewer keeps rejecting (each
+# rejection emits ``review_rejected`` and sends the card back to ready@coder), or
+# an open-ended acceptance criterion forces a specifier↔coder re-cut loop (every
+# ``HALT`` the coder hands back emits a ``handoff`` to the coder lane once the
+# criterion is re-sharpened). None of these are ``crashed``/``failed`` runs, so
+# the failed-run review-loop brake and ``check_respawn_guard``'s ``loop_detected``
+# (both of which need two consecutive FAILED runs with an identical signature)
+# never fire. The card looks healthy on every single tick yet never converges,
+# so it sits in running/ready/review past the 1.0h ``klein`` frist and the
+# Beobachter rightly flags 'rot-running' ("Karte zu lange in progress").
+#
+# Live t_2cb8b57c: an "übersetze ALLE verbleibenden englischen UI-Worte" done-card
+# whose acceptance criterion has no countable endpoint — the reviewer could always
+# find one more string, and an arbitrary Datei-Obergrenze in the Bauauftrag made
+# the coder HALT and renegotiate the scope three times before the first review even
+# ran. The card DID reach its correct terminal state on its own (reviewer → merger
+# "FREIGABE nötig (Merge-GO)" → GO-gate → blocked@till) — but ~8 min past the frist.
+#
+# Each distinct coder build entry (a ``handoff`` whose ``to`` is a coder profile, or
+# a ``review_rejected`` that bounces the card back to the coder) is counted as one
+# "rebuild". After this many rebuilds the acceptance bar has provably failed to
+# close through normal routing: the factory cannot mechanically decide what "alle"/
+# "vollständig" means — that is an owner scope/Freigabe decision, not a technical
+# task. Escalate ONCE to the human with a prepared Zielfrage (F39: never self-decide
+# a Zielentscheidung — escalate it with the current state + the open options)
+# instead of burning yet another non-converging round and blowing the frist.
+#
+# The cap allows a healthy card its initial build plus a couple of genuine
+# review-fix rounds (1 + up to 2 rebuilds) and only trips on the 4th build entry,
+# which for a 1.0h klein card is already pathological. On t_2cb8b57c the 4th rebuild
+# landed at ~12:28 — a comfortable ~28 min before the 12:56 frist — so the card
+# reaches blocked@till (rule b, evaluated BEFORE the age check) well in time.
+_REBUILD_CONVERGENCE_CAP = 4
+
+
+def _coder_rebuild_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many times ``task_id`` has (re-)entered the coder build lane.
+
+    Counts two event kinds that each mark the start of another build/fix
+    attempt: a ``handoff`` whose resolved ``to`` is a coder profile (``coder``
+    or ``*-coder`` — the specifier/orchestrator (re-)sharpening the criterion
+    and handing the card to the coder) and a ``review_rejected`` (the reviewer
+    bouncing the card back to the implementer). The first build is itself one
+    handoff-to-coder, so a brand-new card sits at 1 and only a genuinely
+    non-converging card accumulates toward :data:`_REBUILD_CONVERGENCE_CAP`.
+    """
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('handoff', 'review_rejected')",
+        (task_id,),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        if r["kind"] == "review_rejected":
+            n += 1
+            continue
+        to = ""
+        try:
+            to = str((json.loads(r["payload"] or "{}") or {}).get("to") or "")
+        except Exception:
+            to = ""
+        to = to.strip().lower()
+        if to == "coder" or to.endswith("-coder"):
+            n += 1
+    return n
+
+
 def _resolve_merger(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[str]:
@@ -11254,6 +11324,82 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # F41 convergence ceiling: a coder card that has (re-)entered the build
+        # lane too many times (specifier↔coder scope re-cuts + reviewer
+        # rejections) has provably failed to converge through normal routing.
+        # None of those are FAILED runs, so no infra/failure brake fires and the
+        # card would churn past the frist (rot-running). Stop rebuilding and
+        # escalate ONCE to the human with a prepared scope Zielfrage (F39: never
+        # self-decide a Zielentscheidung — escalate it with context + options).
+        # Scoped to coder-assignee cards and gated on a configured coder profile
+        # so bare-DB unit tests (no handoff/review_rejected history) never trip.
+        _rebuild_assignee = (row_assignee or "").strip().lower()
+        _is_coder_card = (
+            _rebuild_assignee == "coder" or _rebuild_assignee.endswith("-coder")
+        )
+        if (
+            not dry_run
+            and _is_coder_card
+            and _coder_rebuild_count(conn, row["id"]) >= _REBUILD_CONVERGENCE_CAP
+        ):
+            with write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ? AND status = 'ready'
+                       AND claim_lock IS NULL
+                    """,
+                    (row["id"],),
+                )
+                if cur.rowcount == 1:
+                    conn.execute(
+                        "INSERT INTO task_comments "
+                        "(task_id, author, body, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            row["id"],
+                            "orchestrator",
+                            "Umfang nicht abschließbar: Diese Karte ist nach "
+                            f"{_REBUILD_CONVERGENCE_CAP} Bau-/Review-Runden nicht "
+                            "fertig geworden — die Abnahme findet laufend weitere "
+                            "Fälle, weil der verlangte Umfang ('alle verbleibenden "
+                            "Begriffe') keinen abzählbaren Endpunkt hat und sich "
+                            "nicht fabrik-intern festlegen lässt. Das ist eine "
+                            "Umfangs- und Freigabe-Entscheidung des Inhabers, nicht "
+                            "der Fabrik.\n\nENTSCHEIDUNG BENÖTIGT: Soll der aktuell "
+                            "erreichte Stand so abgenommen und freigegeben werden, "
+                            "oder soll der genaue Fertig-Umfang festgelegt werden — "
+                            "also welche Ansichten und welche Begriffe als "
+                            "abgeschlossen gelten und welche bewusst im Original "
+                            "bleiben?",
+                            int(time.time()),
+                        ),
+                    )
+                    # Sticky block event: without it recompute_ready promotes the
+                    # parked card back to ready@till — an unspawnable limbo
+                    # (mirrors the F34 review-loop escalation).
+                    _append_event(
+                        conn, row["id"], "blocked",
+                        {"kind": "needs_input",
+                         "reason": "rebuild convergence ceiling: Umfang nicht "
+                                   "fabrik-intern abschließbar"},
+                    )
+                    _append_event(
+                        conn, row["id"], "rebuild_convergence_ceiling",
+                        {"rebuilds": _coder_rebuild_count(conn, row["id"]),
+                         "cap": _REBUILD_CONVERGENCE_CAP,
+                         "routed_to": "till"},
+                    )
+            result.respawn_guarded.append(
+                (row["id"], "rebuild_convergence_ceiling")
+            )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so

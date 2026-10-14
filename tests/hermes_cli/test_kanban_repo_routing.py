@@ -673,6 +673,78 @@ def test_review_loop_noninfra_still_escalates_to_till(
     assert task.assignee == "till"
 
 
+def _add_event(conn, task_id, kind, payload):
+    import json as _json
+    import time as _time
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, kind, _json.dumps(payload), int(_time.time())),
+    )
+
+
+def test_rebuild_convergence_ceiling_escalates_scope_zielfrage(
+    kanban_home, role_profiles_exist,
+):
+    """A coder card that re-entered the build lane _REBUILD_CONVERGENCE_CAP
+    times (specifier↔coder re-cuts + reviewer rejections) is escalated ONCE to
+    the human with a prepared scope Zielfrage instead of burning another
+    non-converging round (F41)."""
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Deutsche Übersetzung der verbleibenden englischen Worte",
+            assignee="voicera-coder", tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        # Four build entries: 2 specifier→coder re-cuts + 2 reviewer rejections.
+        _add_event(conn, tid, "handoff", {"from": "specifier", "to": "voicera-coder"})
+        _add_event(conn, tid, "handoff", {"from": "specifier", "to": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        assert kb._coder_rebuild_count(conn, tid) == kb._REBUILD_CONVERGENCE_CAP
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda t, w, **k: spawns.append(t.id),
+        )
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+        ceiling = [e for e in kb.list_events(conn, tid)
+                   if e.kind == "rebuild_convergence_ceiling"]
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+    assert spawns == [], "no further non-converging coder round"
+    assert task.status == "blocked"
+    assert task.assignee == "till"
+    assert task.block_kind == "needs_input"
+    assert ("rebuild_convergence_ceiling"
+            in [r[1] for r in res.respawn_guarded])
+    assert ceiling and ceiling[-1].payload.get("routed_to") == "till"
+    # A real, visible Zielfrage (the Beobachter reads it from a comment, with "?").
+    assert any("?" in (c.body or "") for c in comments)
+    # Sticky block so recompute_ready can't promote it back to an unspawnable limbo.
+    assert blocked and blocked[-1].payload.get("kind") == "needs_input"
+
+
+def test_rebuild_convergence_below_cap_still_spawns(
+    kanban_home, role_profiles_exist,
+):
+    """Three build entries (initial build + two genuine review-fix rounds) is
+    healthy iteration, not a loop — the coder still spawns (F41 cap not hit)."""
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="normal fix", assignee="voicera-coder", tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        _add_event(conn, tid, "handoff", {"from": "specifier", "to": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        assert kb._coder_rebuild_count(conn, tid) < kb._REBUILD_CONVERGENCE_CAP
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawns.append(t.id))
+        task = kb.get_task(conn, tid)
+    assert spawns == [tid], "healthy iteration still gets its coder spawn"
+    assert task.status == "running"
+
+
 def test_ready_loop_detect_scoped_to_assignee(
     kanban_home, role_profiles_exist,
 ):
