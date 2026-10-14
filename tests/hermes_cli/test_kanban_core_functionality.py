@@ -3180,9 +3180,8 @@ def test_cli_show_renders_skills(kanban_home):
     assert "translation" in shown
 
 
-def test_legacy_db_without_skills_column_migrates(tmp_path):
-    """_migrate_add_optional_columns is idempotent and adds skills
-    when absent. Run it twice on a pared-down schema to confirm."""
+def test_legacy_db_without_optional_columns_migrates(tmp_path):
+    """The optional-column migration is idempotent and leaves legacy text alone."""
     import sqlite3
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(str(db_path))
@@ -3217,11 +3216,13 @@ def test_legacy_db_without_skills_column_migrates(tmp_path):
 
     before = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     assert "skills" not in before
+    assert "short_description" not in before
 
     # Run the migrator directly — the same function connect() calls.
     kb._migrate_add_optional_columns(conn)
     after = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     assert "skills" in after, f"migration did not add skills column: {after}"
+    assert "short_description" in after
 
     # Idempotent: running again must not raise.
     kb._migrate_add_optional_columns(conn)
@@ -3233,6 +3234,7 @@ def test_legacy_db_without_skills_column_migrates(tmp_path):
     keys = set(row.keys())
     assert "skills" in keys
     assert row["skills"] is None
+    assert row["short_description"] is None
     conn.close()
 
 

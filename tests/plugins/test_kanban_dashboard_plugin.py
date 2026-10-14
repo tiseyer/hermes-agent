@@ -23,12 +23,13 @@ from hermes_cli import kanban_db as kb
 
 # ``GET /board`` historically serialised the Task dataclass fields below,
 # followed by dashboard-owned card metadata. Keep this literal contract rather
-# than deriving it from the current Task dataclass: new persistence fields must
-# remain invisible unless ``family_view=true`` is explicitly requested.
+# than deriving it from the current Task dataclass: persistence fields must be
+# exposed deliberately (short_description is a card-facing field), while family
+# routing fields remain hidden unless ``family_view=true`` is requested.
 _LEGACY_BOARD_CARD_KEYS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by",
     "created_at", "started_at", "completed_at", "workspace_kind", "workspace_path",
-    "claim_lock", "claim_expires", "tenant", "branch_name", "project_id", "result",
+    "claim_lock", "claim_expires", "tenant", "short_description", "branch_name", "project_id", "result",
     "idempotency_key", "consecutive_failures", "worker_pid", "last_failure_error",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id",
     "workflow_template_id", "current_step_key", "skills", "model_override",
@@ -473,6 +474,24 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
+
+
+def test_task_detail_exposes_short_description_separately_from_body(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Getrennte Texte", "body": "Volltext\nmit 'Quotes' und ✓"},
+    ).json()["task"]
+
+    with kb.connect() as conn:
+        assert kb.relabel_task(
+            conn, created["id"], kurzbeschreibung="Kurzer Überblick"
+        )
+
+    task = client.get(
+        f"/api/plugins/kanban/tasks/{created['id']}"
+    ).json()["task"]
+    assert task["body"] == "Volltext\nmit 'Quotes' und ✓"
+    assert task["short_description"] == "Kurzer Überblick"
 
 
 def test_task_detail_includes_links_and_events(client):

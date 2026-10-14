@@ -82,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "id": t.id,
         "title": t.title,
         "body": t.body,
+        "short_description": t.short_description,
         "assignee": t.assignee,
         "status": t.status,
         "block_kind": t.block_kind,
@@ -635,7 +636,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=f"New title (max {kb.HUMAN_CARD_TITLE_MAX} chars, not truncated)",
     )
     p_relabel.add_argument(
-        "--kurzbeschreibung", "--desc", default=None, dest="kurzbeschreibung",
+        "--kurzbeschreibung", "--kurz", "--desc", default=None,
+        dest="kurzbeschreibung",
         help=(f"New short description (max {kb.HUMAN_CARD_KURZBESCHREIBUNG_MAX} "
               "chars, not truncated)"),
     )

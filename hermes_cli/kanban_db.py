@@ -887,6 +887,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    short_description: Optional[str] = None
     # Canonical repository-profile name. NULL keeps legacy body/tenant routing.
     repository: Optional[str] = None
     branch_name: Optional[str] = None
@@ -1001,6 +1002,9 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            short_description=(
+                row["short_description"] if "short_description" in keys else None
+            ),
             repository=row["repository"] if "repository" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
@@ -1187,6 +1191,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
     title                TEXT NOT NULL,
     body                 TEXT,
+    -- Optional card-sized summary. Deliberately separate from the unrestricted
+    -- body so relabelling a card cannot destroy its diagnosis/spec/handoff.
+    short_description    TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
@@ -1986,6 +1993,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     Called by ``init_db`` so opening an old DB is always safe.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "short_description" not in cols:
+        # No backfill from body: legacy body values are full text as often as
+        # they are summaries, so copying them would invent semantics.
+        _add_column_if_missing(
+            conn, "tasks", "short_description", "short_description TEXT"
+        )
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -3398,7 +3411,7 @@ def relabel_task(
     actor: Optional[str] = None,
 ) -> bool:
     """Change ONLY a card's labels — its ``title`` and/or ``kurzbeschreibung``
-    (stored in ``body``, the DTO's short-text source).
+    (stored separately in ``short_description``).
 
     A pure relabel: it never touches status, family linkage, assignee, priority
     or any other field, and it never moves the card. Built for the manager's
@@ -3439,7 +3452,7 @@ def relabel_task(
 
     with write_txn(conn):
         row = conn.execute(
-            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+            "SELECT title, short_description FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None:
             return False
@@ -3451,9 +3464,9 @@ def relabel_task(
             params.append(title)
             payload["title"] = {"old": row["title"], "new": title}
         if kurzbeschreibung is not None:
-            sets.append("body = ?")
+            sets.append("short_description = ?")
             params.append(kurzbeschreibung)
-            payload["kurzbeschreibung"] = {"old": row["body"],
+            payload["kurzbeschreibung"] = {"old": row["short_description"],
                                            "new": kurzbeschreibung}
         params.append(task_id)
         conn.execute(

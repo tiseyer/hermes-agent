@@ -758,7 +758,7 @@
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.title || ""} ${t.short_description || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -2945,6 +2945,10 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          t.short_description
+            ? h("div", { className: "hermes-kanban-card-short-description" },
+                t.short_description)
+            : null,
           rollup ? h("div", { className: "hermes-kanban-card-rollup" },
             h("div", { className: "hermes-kanban-card-rollup-progress" },
               h(ProgressBar, { done: rollup.done, total: rollup.total }),

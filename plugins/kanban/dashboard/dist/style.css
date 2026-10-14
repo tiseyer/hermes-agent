@@ -275,6 +275,16 @@
   word-break: break-word;
 }
 
+.hermes-kanban-card-short-description {
+  color: var(--color-muted-foreground);
+  display: -webkit-box;
+  font-size: 0.75rem;
+  line-height: 1.3;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .hermes-kanban-card-meta {
   font-size: 0.7rem;
   color: var(--color-muted-foreground);
