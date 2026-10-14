@@ -3449,8 +3449,8 @@ def test_config_default_dispatch_in_gateway_is_true():
         f"{kanban.get('dispatch_in_gateway')!r}"
     )
     interval = kanban.get("dispatch_interval_seconds")
-    assert isinstance(interval, (int, float)) and interval >= 1, (
-        f"dispatch_interval_seconds must be a positive number, got {interval!r}"
+    assert interval == 30, (
+        f"dispatch_interval_seconds default should be 30, got {interval!r}"
     )
 
 
@@ -3586,6 +3586,8 @@ def test_cli_daemon_without_force_prints_deprecation_exits_2(kanban_home, capsys
     err = capsys.readouterr().err
     assert "DEPRECATED" in err
     assert "hermes gateway start" in err
+    assert "default: every 30 seconds" in err
+    assert "dispatch_interval_seconds: 30" in err
 
 
 def test_cli_daemon_help_marks_deprecated():
