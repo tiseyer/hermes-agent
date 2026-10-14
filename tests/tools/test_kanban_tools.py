@@ -3841,3 +3841,81 @@ def test_reviewer_routes_db_less_backend_pytest_to_merger(monkeypatch, worker_en
         assert task.assignee == "merger"
     finally:
         conn.close()
+
+
+def test_completion_is_premise_noop_detects_historical_noop():
+    """F47: the predicate fires only when a no-op delivery AND the premise it
+    rests on (already fixed / producer not found) are both present — mirroring
+    the Beobachter's exact rejection of Karte 19 (t_68d0de26)."""
+    from tools import kanban_tools as kt
+    coder = (
+        "Ergebnis: erfüllt als belegter No-op. `git status --porcelain` belegen "
+        "exakt 0 geänderte Dateien. Metadaten: `changed_files=[]`. im Repo "
+        "existiert kein weiterer PLAN-/SUMMARY-Writer."
+    )
+    reviewer = "REVIEW GRÜN (belegter No-op)\nBetroffene Datei-Liste: `[]` (No-op)."
+    orch = "Diese Karte wird als bereits historisch behoben geschlossen."
+    # Positive: full thread, and each factory comment on its own.
+    assert kt._completion_is_premise_noop([orch, coder, reviewer], "", "", {"changed_files": []}) is True
+    assert kt._completion_is_premise_noop([coder], "", "", None) is True
+    assert kt._completion_is_premise_noop([reviewer], "", "", None) is True
+    # Negative: a real diff with a regression test keeps the honest done path.
+    real = (
+        "REVIEW GRÜN. Betroffene Dateien: backend/app/services/foo.py, "
+        "tests/test_foo.py. Fix implementiert, Regressionstest ergänzt, pytest 12/12."
+    )
+    assert kt._completion_is_premise_noop([real], "", "", {"changed_files": ["backend/app/services/foo.py"]}) is False
+    # Negative: no-op wording without the premise, or premise with a real diff.
+    assert kt._completion_is_premise_noop(["changed_files=[]"], "", "", None) is False
+    assert kt._completion_is_premise_noop(
+        ["kein Repo-Writer gefunden, daher Fix am Aufrufer; 3 Dateien geändert"],
+        "", "", {"changed_files": ["a.py"]},
+    ) is False
+
+
+def test_complete_rejected_for_premise_noop_card(monkeypatch, worker_env):
+    """F47 e2e: the reviewer completing a repo work card as a historical no-op
+    (0 changed files, 'bereits historisch behoben', 'kein Repo-Writer gefunden')
+    is rejected — a 0-file `done` is 'done ohne vollständige Abnahme'. The reviewer
+    must escalate a prepared premise-Zielfrage to blocked@till instead. The card
+    stays in-flight (running), never slips to done."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen",
+            body=(
+                "Der Erzeuger schreibt ein Streu-Tag in die Artefakte. Fix im "
+                "Generator, Regressionstest am Beispielartefakt."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/review",
+        )
+        kb.add_comment(
+            conn, tid, author="orchestrator",
+            body="Diese Karte wird als bereits historisch behoben geschlossen.",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=(
+                "Ergebnis: belegter No-op, exakt 0 geänderte Dateien, "
+                "changed_files=[]. Kein Repo-Writer gefunden."
+            ),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRÜN (belegter No-op)"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "NO-OP" in d["error"]
+    assert "kanban_block" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()

@@ -521,6 +521,80 @@ def _card_is_zielentscheidung(
     return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
 
 
+# F47: a reviewer completing a repo work card as a NO-OP — the factory concluded
+# the demanded fix is unnecessary (already fixed historically) or impossible (the
+# producer/generator could not be located) and delivered 0 changed files, yet
+# drove the card to `done`. Live probe Karte 19 ('S3-Backup: Streu-Tag
+# </content> aus SUMMARY/PLAN entfernen', t_68d0de26, erwartung=done): the
+# orchestrator unilaterally ruled the defect "bereits historisch behoben", the
+# specifier codified that into an ABNAHMEKRITERIUM that EXPECTS "exakt 0
+# geänderte Dateien" (a read-back verification, not a regression test), the coder
+# delivered ``changed_files=[]`` on an empty ``wt/<id>`` (HEAD == base) while
+# admitting "kein Repo-Writer gefunden", and the reviewer signed it "REVIEW GRÜN
+# (belegter No-op)". The Beobachter's Richter rejects it a: the card demanded (1)
+# a regression test on an example artifact that is red before the fix and (2) a
+# fix AT the generator; both are missing, so a 0-file no-op is "done ohne
+# vollständige Abnahme" (branch=True, shell=rot, ergebnis_passt=False). Whether a
+# fix card is already satisfied or rests on a FALSE PREMISE (here the stray tag is
+# a historical tool-call leak scrubbed by a past commit, NOT a backup output, and
+# the real producer is external/unidentified) is the OWNER's call — the factory
+# may PREPARE that finding but must never self-certify "nichts zu tun" as a green
+# done (sibling of F39's zielentscheid-selbst; the no-op variant). So a no-op
+# reviewer completion is rerouted to a prepared premise-Zielfrage at blocked@till.
+# BOTH signals are required — an explicit no-op delivery AND the "already fixed /
+# producer not found" premise it rests on — so a reviewer completing a REAL diff
+# (changed files listed) keeps the honest Regel-a done path. Scanned over the
+# factory-authored deliverables (comment thread + summary/result + metadata), not
+# the Beobachter-written card body, so an original fix title/body never trips it.
+_NOOP_DELIVERY_RE = re.compile(
+    r"(?:\bno[-\s]?op\b"
+    r"|(?:exakt\s+|genau\s+)?\b0\s+ge(?:ä|ae)nderte?\s+dateien\b"
+    r"|\bnull\s+ge(?:ä|ae)nderte?\s+dateien\b"
+    r"|changed_files\s*[=:]\s*\[\s*\]"
+    r"|(?:betroffene?\s+)?datei[-\s]?liste:?\s*\[\s*\]"
+    r"|keine?\s+(?:einzige\s+)?(?:datei|code)[-\s]?(?:diff|(?:ä|ae)nderung))",
+    re.IGNORECASE,
+)
+_NOOP_PREMISE_RE = re.compile(
+    r"(?:bereits\s+(?:historisch\s+)?(?:behoben|gefixt|gel(?:ö|oe)st|erledigt)"
+    r"|historisch\s+(?:behoben|gefixt|entfernt)"
+    r"|belegter?\s+no[-\s]?op"
+    r"|kein(?:en)?\s+(?:repo[-\s]?)?(?:writer|producer|erzeuger|generator)\b"
+    r"|(?:writer|producer|erzeuger|generator)[^\n]{0,40}?"
+    r"nicht\s+(?:gefunden|identifiz\w*|auffindbar|belegt|existier\w*)"
+    r"|nicht\s+identifizierbar)",
+    re.IGNORECASE,
+)
+
+
+def _completion_is_premise_noop(
+    comment_bodies: list[str],
+    summary: str,
+    result: str,
+    metadata: object,
+) -> bool:
+    """True when a reviewer drives a repo work card to `done` as a NO-OP that
+    rests on an 'already fixed / producer not found' premise (F47). The factory
+    delivered 0 changed files instead of the demanded fix + regression-test and
+    self-certified it green; the Beobachter rejects that as "done ohne
+    vollständige Abnahme". Both the no-op delivery AND the premise it rests on
+    must be present, so a reviewer completing a real diff is untouched."""
+    parts = list(comment_bodies or [])
+    if summary:
+        parts.append(str(summary))
+    if result:
+        parts.append(str(result))
+    if isinstance(metadata, dict):
+        try:
+            parts.append(json.dumps(metadata))
+        except (TypeError, ValueError):
+            pass
+    blob = "\n".join(parts)
+    return bool(
+        _NOOP_DELIVERY_RE.search(blob) and _NOOP_PREMISE_RE.search(blob)
+    )
+
+
 # F44: an owner-SCOPE human-block whose "Zielfrage" is UNPREPARED — the factory
 # escalates an open-ended "alle"/"vollständig" scope (e.g. "alle verbleibenden
 # englischen UI-Worte übersetzen") by CONCEDING it has no closed check-set (the
@@ -1274,6 +1348,72 @@ def _handle_complete(args: dict, **kw) -> str:
                     # Handoff failed (card not in running/ready, or lost the
                     # claim race). Fall through to the normal completion path
                     # rather than wedging the reviewer.
+
+            # No-op reviewer completion of a repo work card → escalate a prepared
+            # premise-Zielfrage, don't self-certify `done` (F47). A card that was
+            # dispatched through specifier→coder→reviewer exists to CHANGE code;
+            # when the factory instead concludes the fix is already resolved or
+            # that the producer/generator cannot be located and delivers 0 changed
+            # files, a `done` is "done ohne vollständige Abnahme" (branch=True but
+            # the acceptance — a test on an example artifact red before the fix, a
+            # fix AT the source — is unmet; the Beobachter rejects it a,
+            # ergebnis_passt=False). Whether the card is already satisfied or rests
+            # on a false premise is the OWNER's call: prepare the finding and
+            # escalate, never self-certify "nichts zu tun". See the
+            # _completion_is_premise_noop rationale above for the probe (Karte 19,
+            # t_68d0de26) and why BOTH the no-op delivery and its premise are
+            # required (a real-diff completion is untouched). Scoped to the
+            # reviewer (who completes work cards) and a repo-bound card with a
+            # branch (it ran the pipeline). Runs in the reviewer's own short-lived
+            # worker (re-imported per spawn), so it survives the gateway-restart
+            # gap that defeats dispatcher-side fixes (cf. F19).
+            if (
+                task
+                and _is_reviewer_profile(os.environ.get("HERMES_PROFILE"))
+                and (task.repository or task.tenant or "").strip()
+                and (task.branch_name or "").strip()
+            ):
+                noop_comments = [
+                    (r[0] or "")
+                    for r in conn.execute(
+                        "SELECT body FROM task_comments WHERE task_id = ? "
+                        "ORDER BY created_at",
+                        (tid,),
+                    ).fetchall()
+                ]
+                if _completion_is_premise_noop(
+                    noop_comments, summary or "", result or "", metadata
+                ):
+                    conn.close()
+                    return tool_error(
+                        "this card was completed as a NO-OP (0 changed files) — "
+                        "the factory concluded the demanded fix is already "
+                        "resolved, or that the producer/generator could not be "
+                        "located, and delivered no diff and no regression test. A "
+                        "work card dispatched through specifier→coder→reviewer "
+                        "exists to CHANGE code; a 0-file `done` is 'done ohne "
+                        "vollständige Abnahme' (branch=True, but the acceptance — "
+                        "a test on an example artifact that is red before the "
+                        "fix, plus a fix AT the source/generator — is unmet), "
+                        "which the Beobachter rejects a (ergebnis_passt=False). "
+                        "Whether the card is already satisfied or rests on a FALSE "
+                        "PREMISE (the symptom was only scrubbed out of artifacts "
+                        "by a past commit, the real producer is "
+                        "external/unidentified, or the defect persists elsewhere) "
+                        "is the OWNER's call — the factory may PREPARE that "
+                        "finding but must not self-certify 'nichts zu tun' as a "
+                        "green done. Do NOT call kanban_complete. Post ONE comment "
+                        "stating, as a QUESTION containing \"?\", the prepared "
+                        "premise-Zielfrage: what the card demanded, what you "
+                        "actually found (no repo producer / symptom only scrubbed "
+                        "historically / further occurrences elsewhere), and the "
+                        "concrete choices for Till (close the card as obsolete, "
+                        "rescope it to a real source fix or a repo-wide cleanup, "
+                        "or supply a concrete reproducing producer). Keep it "
+                        "business-level and free of internal task IDs / branch "
+                        "names. Then call kanban_block(kind=\"needs_input\") so it "
+                        "parks at blocked@till."
+                    )
 
             try:
                 ok = kb.complete_task(
