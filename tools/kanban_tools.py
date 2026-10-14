@@ -1705,10 +1705,19 @@ def _handle_handoff(args: dict, **kw) -> str:
                 )
             if ws_kind is None and to_profile and to_profile.endswith("-coder"):
                 row = conn.execute(
-                    "SELECT tenant FROM tasks WHERE id = ?", (tid,),
+                    "SELECT tenant, repository FROM tasks WHERE id = ?", (tid,),
                 ).fetchone()
                 tenant = (row[0] if row else None) or ""
-                workdir = kb._tenant_workdir_map().get(tenant.strip().lower())
+                repo = (row[1] if row and len(row) > 1 else None) or ""
+                # A declared repository beats the tenant default for the
+                # checkout: its repo-specific workdir has the remote the
+                # profile's base_ref/push_target name; the tenant checkout may
+                # not (e.g. hermes card on a voicera tenant).
+                _prof = kb._repository_profiles().get(repo.strip().lower()) if repo else None
+                workdir = (
+                    (getattr(_prof, "workdir", "") if _prof else "")
+                    or kb._tenant_workdir_map().get(tenant.strip().lower())
+                )
                 if workdir:
                     ws_kind = "worktree"
                     if ws_path is None:

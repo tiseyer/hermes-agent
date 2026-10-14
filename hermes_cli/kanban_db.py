@@ -10149,6 +10149,14 @@ class RepositoryProfile:
     base_ref: str
     merge_target: str
     push_target: str
+    # Optional repo-specific local checkout. When set it OVERRIDES the
+    # tenant_workdirs anchor for this repository's cards — a declared
+    # repository beats the tenant default for the worktree checkout, exactly
+    # as it already does for role routing (see note above). Required for any
+    # cross-tenant card (e.g. a voicera-tenant card with repository=hermes,
+    # which must build in the hermes fork checkout — WITH the ``fork`` remote —
+    # not the voicera product checkout that only has ``origin``).
+    workdir: str = ""
 
 
 class RepositoryProfileError(ValueError):
@@ -10244,6 +10252,7 @@ def _load_routing_config() -> _RoutingConfig:
                 base_ref=str(spec.get("base_ref", "") or "").strip(),
                 merge_target=str(spec.get("merge_target", "") or "").strip(),
                 push_target=str(spec.get("push_target", "") or "").strip(),
+                workdir=str(spec.get("workdir", "") or "").strip(),
             )
             raw_sigs = spec.get("signatures") or []
             if isinstance(raw_sigs, str):
@@ -11540,8 +11549,11 @@ def _dispatch_once_locked(
                 claimed.workspace_kind == "scratch"
                 and (claimed.assignee or "").strip().lower().endswith("-coder")
             ):
-                _coder_workdir = _tenant_workdir_map().get(
-                    (claimed.tenant or "").strip().lower()
+                _coder_workdir = (
+                    (repository_profile.workdir if repository_profile else "")
+                    or _tenant_workdir_map().get(
+                        (claimed.tenant or "").strip().lower()
+                    )
                 )
                 if _coder_workdir:
                     set_workspace_kind(conn, claimed.id, "worktree")
@@ -11846,8 +11858,11 @@ def _dispatch_once_locked(
             # actually pushed, the review-worktree fetch below fails loudly and
             # the card blocks honestly — no fake-green.
             if claimed.workspace_kind == "scratch":
-                _rv_workdir = _tenant_workdir_map().get(
-                    (claimed.tenant or "").strip().lower()
+                _rv_workdir = (
+                    (repository_profile.workdir if repository_profile else "")
+                    or _tenant_workdir_map().get(
+                        (claimed.tenant or "").strip().lower()
+                    )
                 )
                 if _rv_workdir:
                     set_workspace_kind(conn, claimed.id, "worktree")
