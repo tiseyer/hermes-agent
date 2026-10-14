@@ -1116,8 +1116,32 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not handler:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
+        # Fast-follow (2026-10-14 corruption §10): board-mutating CLI
+        # subcommands are an independent 3rd writer class next to the gateway
+        # dispatcher and the voicera-api bridge. Serialise them on the SAME
+        # <db>.dispatch.lock so a `hermes kanban comment/complete/...` from a
+        # fabrik worker (or the Manager-Tick cron, which writes via this CLI)
+        # never commits concurrently with the dispatcher's WAL frames.
+        # `dispatch`/`daemon` are EXCLUDED: they take _dispatch_tick_lock
+        # themselves, and re-locking the same file via a second fd in the same
+        # process would stall (flock treats fds independently). Read-only
+        # actions (list/show/stats/tail/...) are not wrapped.
+        _MUTATING_ACTIONS = {
+            "init", "create", "swarm", "assign", "reclaim", "reassign",
+            "link", "unlink", "claim", "comment", "attach", "attach-rm",
+            "complete", "edit", "relabel", "human", "block", "schedule",
+            "unblock", "promote", "archive", "specify", "decompose",
+            "heartbeat", "notify-subscribe", "notify-unsubscribe", "gc",
+        }
+        write_lock = contextlib.nullcontext()
+        if action in _MUTATING_ACTIONS and hasattr(kb, "write_serialize_lock"):
+            try:
+                write_lock = kb.write_serialize_lock(kb.kanban_db_path())
+            except Exception:
+                write_lock = contextlib.nullcontext()
         try:
-            return int(handler(args) or 0)
+            with write_lock:
+                return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1

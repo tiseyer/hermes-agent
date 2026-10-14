@@ -1615,6 +1615,101 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+@contextlib.contextmanager
+def write_serialize_lock(db_path: Path, timeout: float = 10.0):
+    """Blocking cross-process single-writer lock for EXTERNAL writers.
+
+    Shares the board's ``<db>.dispatch.lock`` file with
+    :func:`_dispatch_tick_lock`, so a writer that lives outside the gateway
+    process — notably the voicera-api bridge on :9130 — serialises against the
+    dispatcher instead of racing it on WAL frames (issue #35240; the
+    2026-10-14 ``disk image is malformed`` incident happened on a concurrent
+    cockpit ``kanban_comment`` write through that unguarded path).
+
+    Unlike the dispatcher's non-blocking probe (which SKIPS a contended tick),
+    an external write must not be silently dropped, so this BLOCKS up to
+    ``timeout`` seconds. If the lock is still held after the timeout it
+    proceeds anyway (best-effort: SQLite ``busy_timeout`` remains the
+    correctness backstop) rather than failing the request. On a platform
+    without ``fcntl``/``msvcrt`` it degrades to a no-op.
+
+    Yields ``True`` when the lock is held, ``False`` when it proceeded without
+    it (timeout, open failure, or unavailable primitive).
+    """
+    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    handle = None
+    acquired = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        deadline = time.monotonic() + max(0.0, timeout)
+        if _IS_WINDOWS:
+            try:
+                import msvcrt
+
+                locking = getattr(msvcrt, "locking")
+                nb_lock = getattr(msvcrt, "LK_NBLCK")
+                while True:
+                    try:
+                        handle.seek(0)
+                        locking(handle.fileno(), nb_lock, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+            except AttributeError:
+                acquired = False
+        else:
+            try:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (BlockingIOError, OSError):
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+            except ImportError:
+                acquired = False
+    except OSError:
+        # Could not even open the lock file (permissions, read-only FS). Never
+        # block a write on a probe failure; busy_timeout is the backstop.
+        handle = None
+    if not acquired:
+        _log.warning(
+            "kanban write_serialize_lock for %s not acquired within %.1fs — "
+            "proceeding without the cross-process single-writer lock "
+            "(SQLite busy_timeout is the backstop).",
+            lock_path, timeout,
+        )
+    try:
+        yield acquired
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        locking = getattr(msvcrt, "locking")
+                        unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                        locking(handle.fileno(), unlock_mode, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (OSError, AttributeError):
+                pass
+            finally:
+                handle.close()
+
+
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     """Return True for a TLS record header at ``data[offset:]``."""
     if len(data) < offset + 5:
