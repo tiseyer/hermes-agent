@@ -708,6 +708,16 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
+Repository-backed workers also have an explicit `memory_limit_mb` in the
+built-in repository-profile registry (currently 8192 MiB per worker). On Linux,
+the dispatcher starts the complete worker process tree in a transient systemd
+user scope with aggregate cgroup-v2 `MemoryMax`, swap disabled, and
+`OOMPolicy=kill`. This is deliberately independent of the concurrency caps:
+raising `max_in_progress` does not enlarge an individual worker's budget. A
+configured limited worker fails closed instead of starting unbounded when the
+systemd user manager or cgroup-v2 memory controller is unavailable; such hosts
+must keep the task parked or provide the required systemd/cgroup support.
+
 ### Scheduled task starts (`scheduled_at`)
 
 Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.

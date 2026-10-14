@@ -9227,6 +9227,7 @@ class RepositoryProfile:
     base_ref: str
     merge_target: str
     push_target: str
+    memory_limit_mb: int
 
 
 class RepositoryProfileError(ValueError):
@@ -9246,6 +9247,7 @@ _REPOSITORY_PROFILES = {
         # upstream (origin) is NousResearch, read-only; workers push to the
         # personal fork (tiseyer/hermes-agent). See fork-push rule 3be97e69f5.
         push_target="fork",
+        memory_limit_mb=8192,
     ),
     "goya": RepositoryProfile(
         name="goya",
@@ -9254,6 +9256,7 @@ _REPOSITORY_PROFILES = {
         base_ref="origin/develop",
         merge_target="develop",
         push_target="origin",
+        memory_limit_mb=8192,
     ),
     "voicera": RepositoryProfile(
         name="voicera",
@@ -9262,6 +9265,7 @@ _REPOSITORY_PROFILES = {
         base_ref="origin/develop",
         merge_target="develop",
         push_target="origin",
+        memory_limit_mb=8192,
     ),
     # ams-erp: main-based, no develop branch (verified via ls-remote against
     # git@github-ams-erp:tiseyer/ams-erp.git, 2026-09-24 — only main + feature
@@ -9273,6 +9277,7 @@ _REPOSITORY_PROFILES = {
         base_ref="origin/main",
         merge_target="main",
         push_target="origin",
+        memory_limit_mb=8192,
     ),
     # voicera-website: production website, main-based, no develop branch
     # (verified via ls-remote against tiseyer/voicera-website, 2026-09-24 —
@@ -9287,6 +9292,7 @@ _REPOSITORY_PROFILES = {
         base_ref="origin/main",
         merge_target="main",
         push_target="origin",
+        memory_limit_mb=8192,
     ),
     # life-os: Vercel-hosted, main = production, feature branches = preview
     # (Till, 2026-09-24). ls-remote git@github-life-os:tiseyer/life-os.git
@@ -9299,6 +9305,7 @@ _REPOSITORY_PROFILES = {
         base_ref="origin/main",
         merge_target="main",
         push_target="origin",
+        memory_limit_mb=8192,
     ),
 }
 
@@ -9396,6 +9403,15 @@ def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfi
         raise RepositoryProfileError(
             f"repository profile {profile.name!r} has invalid base_ref "
             f"{profile.base_ref!r}; expected remote/branch"
+        )
+    if (
+        isinstance(profile.memory_limit_mb, bool)
+        or not isinstance(profile.memory_limit_mb, int)
+        or profile.memory_limit_mb <= 0
+    ):
+        raise RepositoryProfileError(
+            f"repository profile {profile.name!r} has invalid memory_limit_mb "
+            f"{profile.memory_limit_mb!r}; expected a positive integer"
         )
     return profile
 
@@ -10438,16 +10454,19 @@ def _dispatch_once_locked(
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Pass dispatcher context only when the callable supports it.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
+            else:
+                spawn_kwargs = {}
+                if "board" in sig.parameters:
+                    spawn_kwargs["board"] = board
+                if "repository_profile" in sig.parameters:
+                    spawn_kwargs["repository_profile"] = repository_profile
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures
@@ -10630,12 +10649,15 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
+            else:
+                spawn_kwargs = {}
+                if "board" in sig.parameters:
+                    spawn_kwargs["board"] = board
+                if "repository_profile" in sig.parameters:
+                    spawn_kwargs["repository_profile"] = repository_profile
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
@@ -10912,11 +10934,46 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _systemd_user_manager(
+    env: dict[str, str],
+) -> Optional[tuple[str, dict[str, str]]]:
+    """Return ``systemd-run`` plus a usable user-bus environment on Linux.
+
+    Gateway services commonly omit login-session variables even while the
+    user's systemd manager and bus are active. Derive the standard values from
+    the uid, but require the real bus socket and cgroup-v2 memory controller
+    before claiming that aggregate worker-tree limits are available.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    controllers = Path("/sys/fs/cgroup/cgroup.controllers")
+    try:
+        if "memory" not in controllers.read_text(encoding="utf-8").split():
+            return None
+    except OSError:
+        return None
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        return None
+
+    resolved_env = dict(env)
+    runtime_dir = resolved_env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    bus_socket = Path(runtime_dir) / "bus"
+    if not bus_socket.is_socket():
+        return None
+    resolved_env.setdefault("XDG_RUNTIME_DIR", runtime_dir)
+    resolved_env.setdefault(
+        "DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus_socket}"
+    )
+    return systemd_run, resolved_env
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    repository_profile: Optional[RepositoryProfile] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10929,6 +10986,11 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    A resolved repository profile runs the complete worker process tree in a
+    transient systemd user scope. ``MemoryMax`` is aggregate across the scope,
+    unlike ``RLIMIT_AS`` which would let every child consume the full budget.
+    Limited workers fail closed when Linux cgroup-v2/systemd is unavailable.
     """
     import subprocess
     if not task.assignee:
@@ -11064,6 +11126,30 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    if repository_profile is not None:
+        repository_profile = _validated_repository_profile(repository_profile)
+        manager = _systemd_user_manager(env)
+        if manager is None:
+            raise RuntimeError(
+                "repository-profile memory limit requires a Linux cgroup-v2 "
+                "systemd user manager; refusing to spawn an unbounded worker"
+            )
+        systemd_run, env = manager
+        env["HERMES_KANBAN_MEMORY_LIMIT_MB"] = str(
+            repository_profile.memory_limit_mb
+        )
+        cmd = [
+            systemd_run,
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--property", f"MemoryMax={repository_profile.memory_limit_mb}M",
+            "--property", "MemorySwapMax=0",
+            "--property", "OOMPolicy=kill",
+            "--",
+            *cmd,
+        ]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11308,6 +11394,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 f"(base ref: {repository_profile.base_ref}; "
                 f"merge target: {repository_profile.merge_target}; "
                 f"push target: {repository_profile.push_target})"
+            )
+            lines.append(
+                f"Worker memory limit: {repository_profile.memory_limit_mb} MiB "
+                "(aggregate cgroup-v2 scope)"
             )
     lines.append("")
 

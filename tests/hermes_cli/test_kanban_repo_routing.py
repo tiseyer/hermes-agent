@@ -210,6 +210,7 @@ def test_repository_profile_missing_push_target_fails_closed(
             base_ref=profile.base_ref,
             merge_target=profile.merge_target,
             push_target="",
+            memory_limit_mb=profile.memory_limit_mb,
         ),
     )
     with kb.connect() as conn:
@@ -244,6 +245,7 @@ def test_repository_profile_missing_required_field_fails_closed(
             base_ref="",
             merge_target=profile.merge_target,
             push_target=profile.push_target,
+            memory_limit_mb=profile.memory_limit_mb,
         ),
     )
     with kb.connect() as conn:
@@ -277,6 +279,7 @@ def test_dispatch_blocks_for_missing_repository_profile_field(
             base_ref=profile.base_ref,
             merge_target="",
             push_target=profile.push_target,
+            memory_limit_mb=profile.memory_limit_mb,
         ),
     )
     with kb.connect() as conn:
