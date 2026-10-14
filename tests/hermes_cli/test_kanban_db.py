@@ -4223,6 +4223,43 @@ def test_dispatch_review_counts_toward_max_spawn(
     assert len(spawns) == 2
 
 
+def test_dispatch_reserves_free_slot_for_review_under_max_in_progress(
+    kanban_home, all_assignees_spawnable,
+):
+    """A review card must not be starved by fresh ready work when the
+    concurrency budget has only one free slot.
+
+    Regression for the 'rot-review-haengt' befund (card t_c3d4d245): with
+    max_in_progress saturated by a steady stream of ready work, the review
+    column never got a slot and in-flight reviews hung past the Beobachter's
+    1h deadline with no reviewer ever spawned. Finish-before-start now
+    reserves the free slot(s) for the review column so the review loop claims
+    them on the same tick.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        # One worker already running occupies 1 of the 2 slots.
+        running = kb.create_task(conn, title="running", assignee="alice")
+        kb.claim_task(conn, running)
+        # More fresh ready work than free slots — it would otherwise grab
+        # the single free slot and starve the review card.
+        kb.create_task(conn, title="ready 1", assignee="bob")
+        kb.create_task(conn, title="ready 2", assignee="bob")
+        # A card already in review (finished coder work awaiting verification).
+        rev = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, rev, "review")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=2)
+
+    # The one free slot (cap 2 - 1 running) is reserved for the review card.
+    assert spawns == [rev], f"expected only the review card to spawn, got {spawns}"
+    assert any(s[0] == rev for s in res.spawned), res.spawned
+
+
 def test_dispatch_review_spawns_when_ready_empty(
     kanban_home, all_assignees_spawnable,
 ):

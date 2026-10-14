@@ -10948,6 +10948,36 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # Finish-before-start: reserve free concurrency slots for cards already
+    # in the review column so a steady stream of fresh *ready* work can't
+    # perpetually consume every max_in_progress slot and strand in-flight
+    # reviews. A card in 'review' is finished coder work (branch pushed,
+    # tests green) waiting only for verification; starving it indefinitely
+    # wastes the whole coder effort and surfaces to the Beobachter as
+    # 'rot-review-haengt' — a review over the 1h deadline whose reviewer was
+    # *never spawned* (worker_pid None, 0 runs). That is exactly the
+    # max_in_progress=2 congestion that kept 12 review cards parked while
+    # recon/brain-reader/orchestrator ready work cycled through both slots.
+    # The GLOBAL cap (max_spawn, used by the review loop below) is left
+    # untouched, so total concurrency still never exceeds max_in_progress;
+    # we only hold the READY loop back far enough to leave the reserved
+    # slots free for the review loop to claim on this same tick. The review
+    # column ORDER BY (priority DESC, created_at ASC) then drains the oldest
+    # reviews first, so a long-parked card like t_c3d4d245 is picked up.
+    _ready_spawn_cap = max_spawn
+    if max_spawn is not None and ready_rows:
+        _review_pending = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'review' AND claim_lock IS NULL "
+                "AND assignee IS NOT NULL "
+                "AND (family_root_id IS NULL OR id != family_root_id)"
+            ).fetchone()[0]
+        )
+        if _review_pending > 0:
+            _free_slots = max(0, max_spawn - running_count)
+            _review_reserve = min(_review_pending, _free_slots)
+            _ready_spawn_cap = max_spawn - _review_reserve
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10986,7 +11016,11 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        # Honour the review reservation: _ready_spawn_cap == max_spawn when no
+        # review work is pending, otherwise it is reduced to leave the reserved
+        # slots free for the review loop below (which still breaks on the full
+        # max_spawn global cap).
+        if _ready_spawn_cap is not None and running_count + spawned >= _ready_spawn_cap:
             break
         row_assignee = row["assignee"]
         # Keep dispatcher candidate selection in lock-step with the health
