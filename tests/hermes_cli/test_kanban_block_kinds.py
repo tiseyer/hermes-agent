@@ -163,6 +163,56 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# F43 dependency-recut convergence ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_recut_ceiling_escalates_to_blocked(kanban_home: Path) -> None:
+    """A card re-parked as a dependency past the ceiling escalates to the owner.
+
+    The open-ended "alle verbleibenden Begriffe" spiral: the orchestrator keeps
+    linking a fresh autonomous recon child and re-parking THIS card in ``todo``.
+    Those parents are not held human decisions, so the gate-fold declines; the
+    N+1th park must instead convert to blocked@till with a prepared Freigabe
+    Zielfrage (the Beobachter greens it rule b) rather than rot in ``todo``.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # First two parks are allowed — they stay in ``todo`` (converging grace).
+        assert kb.block_task(conn, tid, reason="wait recon 1", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        _make_running_again(conn, tid)
+        assert kb.block_task(conn, tid, reason="wait recon 2", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        # Third re-cut park has provably failed to converge → owner escalation.
+        _make_running_again(conn, tid)
+        assert kb.block_task(conn, tid, reason="wait recon 3", kind="dependency")
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked"
+        assert t.assignee == "till"
+        assert t.block_kind == "needs_input"
+        evs = [e for e in kb.list_events(conn, tid)
+               if e.kind == "scope_recut_ceiling"]
+        assert evs, "expected a scope_recut_ceiling event"
+        assert (evs[-1].payload or {}).get("variant") == "dependency_park"
+        # The prepared Freigabe Zielfrage is on the card as a comment.
+        comments = kb.list_comments(conn, tid)
+        assert any("ABNAHME/FREIGABE (GO)" in (c.body or "") for c in comments)
+
+
+def test_dependency_recut_below_ceiling_stays_todo(kanban_home: Path) -> None:
+    """Two dependency parks (a genuine recon wait) are NOT escalated."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="wait recon 1", kind="dependency")
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="wait recon 2", kind="dependency")
+        t = kb.get_task(conn, tid)
+        assert t.status == "todo"
+        assert t.block_kind == "dependency"
+
+
+# ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
 

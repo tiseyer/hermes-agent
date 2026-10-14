@@ -5389,15 +5389,7 @@ def handoff_task(
                         "bekannten Resttexte sind vereinzelte dynamische/selten "
                         "gerenderte Strings. Das ist eine Abnahme-/Freigabe-"
                         "Entscheidung des Inhabers, nicht der Fabrik.\n\n"
-                        "ABNAHME/FREIGABE (GO): Soll der aktuell erreichte, breit "
-                        "übersetzte Stand für diese Runde als fertig abgenommen und "
-                        "freigegeben werden? Folge bei GO: vereinzelte dynamische "
-                        "Resttexte bleiben vorerst im englischen Original. Die Fabrik "
-                        "legt den erreichten Stand zur Abnahme vor und verlangt KEINE "
-                        "vom Inhaber zu erstellende Vollständigkeitsliste; falls "
-                        "einzelne sichtbare Begriffe dennoch zwingend deutsch sein "
-                        "müssen, genügt es, genau diese zu benennen — dann baut die "
-                        "Fabrik gezielt nach.",
+                        + _SCOPE_FREIGABE_GO,
                         int(time.time()),
                     ),
                 )
@@ -7006,6 +6998,96 @@ def block_task(
                     assignee=_blocked_task.assignee if _blocked_task else None,
                     run_id=run_id,
                     reason="F43 owner-decision gate fold",
+                )
+                return True
+            # F43 (dependency-park variant): the owner question did not fold (the
+            # parents are autonomous recon, not held human decisions), but if the
+            # card has already been dependency-parked to the ceiling it is in the
+            # non-converging re-cut spiral — each round links a fresh recon/audit
+            # child whose "vollständige" inventory the next round falsifies, and
+            # the card would just re-park in ``todo`` and rot. Convert this
+            # (N+1)th park into the same single owner escalation the hand-back
+            # ceiling raises (blocked@till + prepared Freigabe Zielfrage → the
+            # Beobachter greens it rule b) instead of re-arming the spiral.
+            if _dependency_recut_count(conn, task_id) >= _DEPENDENCY_RECUT_CEILING:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="dependency-recut convergence ceiling → blocked@till",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="dependency-recut convergence ceiling "
+                                "→ blocked@till",
+                    )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Umfang nicht abschließbar: Diese Karte wurde bereits "
+                        f"{_DEPENDENCY_RECUT_CEILING}-mal als Abhängigkeit in `todo` "
+                        "geparkt und bei jeder Runde eine neue read-only "
+                        "Recon-/Audit-Inventur verknüpft — jede als vollständig "
+                        "bezeichnete Inventur der englischen UI-Texte wird von der "
+                        "nächsten Runde widerlegt, weil der verlangte Umfang ('alle "
+                        "verbleibenden Begriffe') keinen abzählbaren Endpunkt hat und "
+                        "sich nicht fabrik-intern festlegen lässt. Die Fabrik hat den "
+                        "breit übersetzten Stand erreicht und dokumentiert; die "
+                        "bekannten Resttexte sind vereinzelte dynamische/selten "
+                        "gerenderte Strings. Das ist eine Abnahme-/Freigabe-"
+                        "Entscheidung des Inhabers, nicht der Fabrik.\n\n"
+                        + _SCOPE_FREIGABE_GO,
+                        int(time.time()),
+                    ),
+                )
+                # Sticky block event: without it recompute_ready would promote the
+                # parked card back to ready@till — the unspawnable limbo the F43
+                # family guards against.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"kind": "needs_input",
+                     "reason": "dependency-recut convergence ceiling: Umfang nicht "
+                               "fabrik-intern abschließbar"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "scope_recut_ceiling",
+                    {"recuts": _dependency_recut_count(conn, task_id),
+                     "cap": _DEPENDENCY_RECUT_CEILING,
+                     "routed_to": "till",
+                     "variant": "dependency_park"},
+                    run_id=run_id,
+                )
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_blocked",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id,
+                    reason="F43 dependency-recut convergence ceiling",
                 )
                 return True
             cur = conn.execute(
@@ -9960,6 +10042,66 @@ def _scope_recut_count(conn: sqlite3.Connection, task_id: str) -> int:
         if to == "orchestrator" or to.endswith("-orchestrator"):
             n += 1
     return n
+
+
+# Shared Zielfrage for an unclosable open-ended scope (F43 family). Both the
+# hand-back ceiling (:func:`handoff_task`) and the dependency-park ceiling
+# (:func:`block_task`) present the owner the SAME prepared Abnahme/Freigabe
+# decision — the only thing that actually unblocks an "alle verbleibenden
+# Begriffe" card — instead of re-arming the recon/re-cut spiral. Keeping it one
+# constant stops the two escalation sites from drifting apart.
+_SCOPE_FREIGABE_GO = (
+    "ABNAHME/FREIGABE (GO): Soll der aktuell erreichte, breit "
+    "übersetzte Stand für diese Runde als fertig abgenommen und "
+    "freigegeben werden? Folge bei GO: vereinzelte dynamische "
+    "Resttexte bleiben vorerst im englischen Original. Die Fabrik "
+    "legt den erreichten Stand zur Abnahme vor und verlangt KEINE "
+    "vom Inhaber zu erstellende Vollständigkeitsliste; falls "
+    "einzelne sichtbare Begriffe dennoch zwingend deutsch sein "
+    "müssen, genügt es, genau diese zu benennen — dann baut die "
+    "Fabrik gezielt nach."
+)
+
+
+# F43 (dependency-park variant) convergence ceiling.
+#
+# The hand-back ceiling (:data:`_SCOPE_RECUT_CEILING`, enforced in
+# :func:`handoff_task`) catches a card bounced UP to the orchestrator a third
+# time. But an orchestrator that has learned not to hand the card back can spin
+# the SAME non-convergence loop one notch lower: on each wake it links yet
+# another read-only recon/audit/ledger child and re-parks THIS card as a
+# ``dependency`` in ``todo`` (``block_task(kind='dependency')`` →
+# ``dependency_wait`` event). Those parents are autonomous work, not held human
+# decisions, so :func:`_human_decision_gate_question` returns ``None`` and the
+# gate-fold declines — the card just re-parks in ``todo`` every round and rots to
+# the frist (exactly the live t_70d295c6 tail: dependency_wait on the ledger
+# t_e550a193, then on the audit t_bd07aec7, each inventory falsified by the next).
+#
+# A genuinely-converging dependency wait parks ONCE and then sits until its
+# parents finish and promote it forward — it does not re-emit ``dependency_wait``
+# round after round. Re-parking is therefore itself the scope-recut signal.
+# Allow the first two parks (an initial recon foundation plus one re-cut); a
+# THIRD dependency-park attempt has provably failed to converge and is converted
+# — worker-side, well before the frist — into the same single owner escalation
+# (``blocked`` @ ``till`` with the prepared Freigabe Zielfrage) the hand-back
+# ceiling raises. Mirrors F43 so the Beobachter greens it rule b.
+_DEPENDENCY_RECUT_CEILING = 2
+
+
+def _dependency_recut_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many times ``task_id`` has already been parked as a ``dependency``.
+
+    Counts prior ``dependency_wait`` events. Each one is a round in which the
+    orchestrator re-cut the scope and parked the card to wait on a freshly linked
+    recon/audit child; the accumulated count drives
+    :data:`_DEPENDENCY_RECUT_CEILING`.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_wait'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row and row["n"] is not None else 0
 
 
 def _zielfrage_text_of(
