@@ -10664,6 +10664,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when a ``review_rejected`` or ``handoff`` event arrives
+        AFTER the PR comment — a deliberate "keep working the existing PR"
+        signal (the reviewer bounced it back to the coder). Without this a
+        review-reject loop dead-locks the card in ready → rot-stuck.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -10764,13 +10768,37 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR;
+    #    re-spawning risks a duplicate PR on the same task. EXCEPTION (mirrors
+    #    the recent_success re-queue bypass above): a deliberate "continue the
+    #    work" signal AFTER the PR was opened means the next spawn iterates on
+    #    the EXISTING PR branch (wt/<id>), not a second PR. A ``review_rejected``
+    #    (the reviewer bounced the card back to the coder to fix THIS PR) or a
+    #    ``handoff`` to the implementer is exactly that signal. Without this
+    #    bypass a review-reject loop dead-locks: the reviewer keeps handing the
+    #    card back to ready@coder, but the coder's own earlier PR comment stays
+    #    inside the 24h window and the active_pr guard defers every respawn — so
+    #    the card never runs again and ages out in ready → rot-stuck (F42,
+    #    t_340076fe).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            ts = int(c["created_at"] or 0)
+            if latest_pr_at is None or ts > latest_pr_at:
+                latest_pr_at = ts
+    if latest_pr_at is not None:
+        rework_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('review_rejected', 'handoff') LIMIT 1",
+            (task_id, latest_pr_at),
+        ).fetchone()
+        if not rework_after:
             return "active_pr"
 
     return None

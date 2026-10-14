@@ -2205,6 +2205,53 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_active_pr_bypassed_by_review_rejected(kanban_home):
+    """A review_rejected AFTER the PR comment is a deliberate "keep working
+    the existing PR" bounce and must bypass active_pr — otherwise a review-
+    reject loop dead-locks the card in ready until it ages out (F42,
+    t_340076fe): the reviewer hands it back to the coder, but the coder's own
+    earlier PR comment keeps the guard tripping so it can never respawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rejected-pr", assignee="voicera-coder")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'voicera-coder', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/1', ?)",
+            (t, now - 120),
+        )
+        # Baseline: the PR comment alone defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        # Reviewer rejects and bounces the card back to the coder.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'review_rejected', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_not_bypassed_by_earlier_rejection(kanban_home):
+    """A review_rejected that predates the PR comment does NOT bypass the
+    guard — the PR is the newest state, so re-spawning would still risk a
+    duplicate. Only a bounce AFTER the latest PR comment is a rework signal."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-after-reject", assignee="voicera-coder")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'review_rejected', ?)",
+            (t, now - 120),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'voicera-coder', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/1', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
