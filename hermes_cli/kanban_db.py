@@ -5220,13 +5220,20 @@ def handoff_task(
                         "bezeichnete Inventur der englischen UI-Texte wird von der "
                         "nächsten Runde widerlegt, weil der verlangte Umfang ('alle "
                         "verbleibenden Begriffe') keinen abzählbaren Endpunkt hat und "
-                        "sich nicht fabrik-intern festlegen lässt. Das ist eine "
-                        "Umfangs- und Freigabe-Entscheidung des Inhabers, nicht der "
-                        "Fabrik.\n\nENTSCHEIDUNG BENÖTIGT: Soll der aktuell erreichte "
-                        "Stand so abgenommen und freigegeben werden, oder soll der "
-                        "genaue Fertig-Umfang festgelegt werden — also welche "
-                        "Ansichten und welche Begriffe als abgeschlossen gelten und "
-                        "welche bewusst im Original bleiben?",
+                        "sich nicht fabrik-intern festlegen lässt. Die Fabrik hat den "
+                        "breit übersetzten Stand erreicht und dokumentiert; die "
+                        "bekannten Resttexte sind vereinzelte dynamische/selten "
+                        "gerenderte Strings. Das ist eine Abnahme-/Freigabe-"
+                        "Entscheidung des Inhabers, nicht der Fabrik.\n\n"
+                        "ABNAHME/FREIGABE (GO): Soll der aktuell erreichte, breit "
+                        "übersetzte Stand für diese Runde als fertig abgenommen und "
+                        "freigegeben werden? Folge bei GO: vereinzelte dynamische "
+                        "Resttexte bleiben vorerst im englischen Original. Die Fabrik "
+                        "legt den erreichten Stand zur Abnahme vor und verlangt KEINE "
+                        "vom Inhaber zu erstellende Vollständigkeitsliste; falls "
+                        "einzelne sichtbare Begriffe dennoch zwingend deutsch sein "
+                        "müssen, genügt es, genau diese zu benennen — dann baut die "
+                        "Fabrik gezielt nach.",
                         int(time.time()),
                     ),
                 )

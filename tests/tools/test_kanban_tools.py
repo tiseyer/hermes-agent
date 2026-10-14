@@ -938,6 +938,114 @@ def test_block_allowed_for_specifier_genuine_question_after_abnahmekriterium(mon
     assert d.get("ok") is True
 
 
+def test_block_rejected_for_specifier_unprepared_scope_demand(monkeypatch, worker_env):
+    """F44: a specifier that cannot close an open 'alle'/'vollständig' scope must
+    not off-load the enumeration onto the owner. Live probe Karte 18
+    ('Deutsche Uebersetzung der verbleibenden englischen UI-Worte', klein,
+    erwartung=done, t_e7ef743c): the specifier blocked needs_input conceding the
+    scope has no closed check-set (ledger falsified, classes 'nur Beispiele',
+    'keine abschließende Whitelist') and then asked the owner 'welche konkret
+    aufgezählten Ansichten/Begriffe gelten als vollständig zu übersetzen, welche
+    dürfen englisch bleiben?'. The observer's richter marks TOR1/TOR3 JA but
+    TOR2 NEIN → rot-technische-rueckfrage. The gate rejects it and steers the
+    specifier to enumerate the cut itself (build) or escalate a prepared GO."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Deutsche Uebersetzung der verbleibenden englischen UI-Worte",
+            assignee="specifier", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("BLOCKED: Das Vollständigkeitsziel „alle produktiv sichtbaren "
+                  "statischen Frontend-Texte“ hat noch keine geschlossene "
+                  "Prüfmenge: Der 55er-Ledger ist falsifiziert, die bekannten "
+                  "Regressionsklassen sind nur Beispiele, und die erlaubten "
+                  "englischen Fachbegriffe haben ausdrücklich keine abschließende "
+                  "Whitelist. Welche konkret aufgezählten Ansichten/Begriffe "
+                  "gelten für diese Runde als vollständig zu übersetzen, und "
+                  "welche konkret aufgezählten englischen Begriffe dürfen sichtbar "
+                  "bleiben?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "UNPREPARED scope escalation" in d["error"]
+    assert "kanban_handoff" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_orchestrator_unprepared_scope_demand(monkeypatch, worker_env):
+    """F44 also fires for the orchestrator (the other scope-owning role): it
+    posted the same off-loading Zielfrage ('… oder welche konkret aufgezählten
+    Ansichten/Begriffe …?') on Karte 18 before handing to the specifier."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Deutsche Uebersetzung der verbleibenden englischen UI-Worte",
+            assignee="orchestrator", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="orchestrator",
+            body=("Der 55er-Ledger ist falsifiziert, nur Beispiele. ZIELFRAGE AN "
+                  "DEN INHABER: Soll der erreichte Stand als fertig gelten; oder "
+                  "welche konkret aufgezählten Ansichten/Begriffe müssen noch "
+                  "deutsch sein und welche dürfen bewusst englisch bleiben?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Zielfrage", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "UNPREPARED scope escalation" in d["error"]
+
+
+def test_block_allowed_for_specifier_prepared_go_on_reached_state(monkeypatch, worker_env):
+    """F44 must not catch a PREPARED escalation: a plain Abnahme/Freigabe-GO on
+    the reached state (no open-set concession married to an owner-enumeration
+    demand) passes the gate so the richter can green it (rule b)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Deutsche Uebersetzung der verbleibenden englischen UI-Worte",
+            assignee="specifier", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("Der breit übersetzte Stand ist erreicht und dokumentiert. "
+                  "ABNAHME/FREIGABE: Soll der aktuell erreichte Stand für diese "
+                  "Runde als fertig abgenommen und freigegeben werden? Folge bei "
+                  "GO: vereinzelte dynamische Resttexte bleiben vorerst im "
+                  "englischen Original."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe GO oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_block_rejected_for_coder_internal_triage_comment(monkeypatch, worker_env):
     """F28: the repo coder may not escalate internal work-coordination. Live
     probe card t_9b6d4067 ('Ungenutzte Funktion leereTexte entfernen', klein,

@@ -521,6 +521,76 @@ def _card_is_zielentscheidung(
     return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
 
 
+# F44: an owner-SCOPE human-block whose "Zielfrage" is UNPREPARED — the factory
+# escalates an open-ended "alle"/"vollständig" scope (e.g. "alle verbleibenden
+# englischen UI-Worte übersetzen") by CONCEDING it has no closed check-set (the
+# inventory/ledger is falsified, the known regression classes are "nur
+# Beispiele", the allowed English terms have "keine abschließende Whitelist")
+# AND then asking the OWNER to PRODUCE the complete enumeration ("welche konkret
+# aufgezählten Ansichten/Begriffe gelten als vollständig zu übersetzen, welche
+# dürfen englisch bleiben?"). That is exactly what the Beobachter's Zielfrage-
+# Richter rejects at TOR 2 (kontext): the question is "offene Scoping-Arbeit ohne
+# aufbereitete, konkret aufgezählte Optionen samt Folgen — die Fabrik muss die
+# Kandidaten-Ansichten/Begriffe zuerst SELBST enumerieren und als Vorschlag
+# vorlegen". TOR1 (owner taste dimension) and TOR3 (answerable in plain language)
+# are JA, but TOR2 NEIN → rot-technische-rueckfrage (live probe Karte 18
+# 't_e7ef743c', klein, erwartung=done: the specifier blocked needs_input with
+# precisely this off-loading question).
+#
+# A legitimate owner escalation is PREPARED: the factory presents the achieved
+# state and concrete options WITH consequences, or a plain Abnahme/Freigabe-GO on
+# the reached state ("Soll der breit übersetzte Stand als fertig abgenommen
+# werden? GO") — never a demand that the owner author the completeness list. So
+# the gate mirrors the observer's own TOR2 necessary condition at the worker: it
+# rejects a human-block ONLY when BOTH signals are present (AND-ed, like the
+# F21/F32 pairs) — (a) the factory's own admission that the scope has no closed/
+# prepared set, and (b) an interrogative demand that the owner enumerate which
+# views/terms count as done or stay English. A prepared GO/Vorschlag carries
+# neither the open-set concession as its question nor an off-loaded "welche …?",
+# so it still passes to the richter untouched. Not a facade — it enforces exactly
+# the observer's TOR2, never more.
+_SCOPE_OPEN_SET_RE = re.compile(
+    r"(?:kein\w*|noch\s+kein\w*|ohne)\b[^.\n]{0,40}?"
+    r"(?:geschlossene?|abschlie\w+|vollst\w+)\b[^.\n]{0,25}?"
+    r"(?:pr[üu]fmenge|whitelist|white-?list|liste|menge|umfang|aufz\w+)"
+    r"|\bnur\s+beispiel\w*"
+    r"|\bfalsifiziert\b"
+    r"|\b(?:kein\w*|ohne)\s+abz[äa]hlbar\w*\s+(?:endpunkt|umfang|ende)\b"
+    r"|\bvollst\w+ziel\b"
+    r"|ledger[^.\n]{0,40}?(?:falsifiziert|widerlegt)"
+    r"|(?:inventur|inventar|menge)[^.\n]{0,40}?widerlegt",
+    re.IGNORECASE,
+)
+_SCOPE_ENUM_DEMAND_RE = re.compile(
+    # "welche (konkret aufgezählten) Ansichten/Begriffe/Texte … (als fertig/
+    #  vollständig gelten | übersetzt werden | englisch / im Original bleiben)"
+    r"welche\b[^?]{0,120}?"
+    r"(?:ansichten|sichten|views|begriffe|texte|w[öo]rter|worte|elemente"
+    r"|labels?|strings?|fl[äa]chen?)"
+    r"[^?]{0,160}?"
+    r"(?:vollst\w+|[üu]bersetz\w+|abgeschlossen|als\s+fertig|fertig\s+gelten"
+    r"|englisch|im\s+original\s+bleiben|sichtbar\s+bleiben|bleiben\s+d[üu]rfen)"
+    # … or an explicit demand that the OWNER author/produce the full list
+    r"|(?:inhaber|till|owner|du)\b[^.\n]{0,80}?"
+    r"(?:liste\s+der|aufz[äa]hl\w+|enumerier\w+|vollst\w+\s+liste)"
+    r"[^.\n]{0,60}?"
+    r"(?:erzeug\w+|festleg\w+|benenn\w+|liefer\w+|erstell\w+|vorgeb\w+|aufz[äa]hl\w+)",
+    re.IGNORECASE,
+)
+
+
+def _block_is_unprepared_scope_demand(blob: str) -> bool:
+    """True when a scope human-block off-loads the completeness enumeration onto
+    the owner instead of preparing it (F44). Requires BOTH an open-set concession
+    (:data:`_SCOPE_OPEN_SET_RE`) and an owner-enumeration demand
+    (:data:`_SCOPE_ENUM_DEMAND_RE`) so a prepared GO/Vorschlag is never caught."""
+    if not blob:
+        return False
+    return bool(_SCOPE_OPEN_SET_RE.search(blob)) and bool(
+        _SCOPE_ENUM_DEMAND_RE.search(blob)
+    )
+
+
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
 
@@ -1315,6 +1385,63 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        # Unprepared-scope-demand block gate (F44, sibling of the F23/F24/F43
+        # scope gates). A specifier or orchestrator that cannot mechanically
+        # close an open-ended "alle"/"vollständig" scope must NOT escalate by
+        # off-loading the enumeration onto the owner — conceding there is no
+        # closed check-set (ledger falsified, classes "nur Beispiele", "keine
+        # abschließende Whitelist") and then asking "welche konkret aufgezählten
+        # Ansichten/Begriffe gelten als vollständig zu übersetzen, welche dürfen
+        # englisch bleiben?". The observer's richter marks that TOR1 JA / TOR3 JA
+        # but TOR2 NEIN (offene Scoping-Arbeit ohne aufbereitete Optionen) →
+        # rot-technische-rueckfrage (live probe Karte 18 't_e7ef743c'). A
+        # legitimate owner escalation is PREPARED: present the achieved state and
+        # concrete options WITH consequences, or a plain Abnahme/Freigabe-GO on
+        # the reached state — never a demand that the owner author the list. The
+        # gate scans the block reason + the full comment thread (the factory
+        # states the off-loading question in a comment, which is where the
+        # observer reads it) and fires only when BOTH signals are present, so a
+        # prepared GO/Vorschlag passes untouched. Scoped to the two scope-owning
+        # roles + human-escalation kinds; worker-side (re-imported per spawn),
+        # live on the next spawn without a gateway restart (cf. F19).
+        if (
+            task
+            and _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            in ("specifier", "orchestrator")
+            and kind in _HUMAN_BLOCK_KINDS
+        ):
+            scope_blob = str(reason or "")
+            try:
+                scope_blob += "\n" + "\n".join(
+                    c.body or "" for c in kb.list_comments(conn, tid)
+                )
+            except Exception:
+                pass
+            if _block_is_unprepared_scope_demand(scope_blob):
+                conn.close()
+                return tool_error(
+                    "this is an UNPREPARED scope escalation — you concede the "
+                    "'alle'/'vollständig' scope has no closed check-set and then "
+                    "ask the owner to produce the complete list of views/terms "
+                    "('welche konkret aufgezählten Ansichten/Begriffe …?'). That "
+                    "is off-loading the fabric's own enumeration work: the "
+                    "observer's richter judges it TOR1 JA / TOR3 JA but TOR2 NEIN "
+                    "(offene Scoping-Arbeit ohne aufbereitete, konkret "
+                    "aufgezählte Optionen samt Folgen) → rot-technische-"
+                    "rueckfrage. The fabric must enumerate the candidate views/"
+                    "terms ITSELF first. Two clean moves: (a) define a CLOSED, "
+                    "enumerated cut yourself (exactly these views/terms are in "
+                    "scope, the rest is declared Nicht-Scope), write the "
+                    "ABNAHMEKRITERIUM and kanban_handoff(to=\"<repo>-coder\") so "
+                    "the card converges to done; or (b) if the owner decision "
+                    "truly cannot be avoided, escalate a PREPARED proposal — a "
+                    "plain Abnahme/Freigabe-GO on the reached state ('Soll der "
+                    "aktuell erreichte, breit übersetzte Stand für diese Runde "
+                    "als fertig abgenommen werden? GO; Folge bei GO: vereinzelte "
+                    "dynamische Resttexte bleiben vorerst im Original') OR the "
+                    "concrete options WITH their consequences — NEVER a question "
+                    "that asks the owner to author the completeness list."
+                )
         # Orchestrator block gate (F22, sibling of the F21 complete gate). The
         # orchestrator coordinates a fresh repo work card by decomposing it and
         # handing it to the specifier — it never escalates one to a human
