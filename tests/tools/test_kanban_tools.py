@@ -3455,3 +3455,108 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_block_rejected_for_coder_defective_acceptance_criterion(monkeypatch, worker_env):
+    """F37: the repo coder may not escalate a defective ABNAHMEKRITERIUM to a
+    human. Live probe card t_82eac595 ('Tests fuer die Mandanten-Farben',
+    erwartung=done): the coder read the public API as
+    ``tenantChartColor(name, mode: "light" | "dark")`` but the specifier's
+    criterion demanded Boolean args, so building was impossible. It blocked
+    needs_input with 'HALT: Specifier-Abnahmekriterium nutzt Boolean-Modi ...
+    bitte Kriterium technisch korrigieren und Karte erneut an den Coder geben.'
+    - no '?' anywhere, so the beobachter extracts no frage and classes the
+    question-less blocked done-card as rot-infra-eskalation-ohne-frage. A wrong
+    criterion is the SPECIFIER's to fix, re-handed to the coder - a
+    factory-internal loop, never Till's. The gate rejects the block and steers
+    the coder to kanban_handoff(to="specifier")."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Tests fuer die Mandanten-Farben",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": ("HALT: Specifier-Abnahmekriterium nutzt Boolean-Modi, die "
+                   "oeffentliche API erwartet \"light\" | \"dark\"; bitte "
+                   "Kriterium technisch korrigieren und Karte erneut an den "
+                   "Coder geben."),
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "acceptance criterion" in d["error"]
+    assert "kanban_handoff(to=\"specifier\")" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_coder_criterion_defect_in_comment(monkeypatch, worker_env):
+    """F37: the gate also scans comments (like the beobachter's _letzte_frage),
+    so a coder cannot move the 'criterion is wrong' finding into a comment and
+    slip a terse reason past the gate."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Tests fuer die Mandanten-Farben",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=("Das Abnahmekriterium muss auf tenantChartColor(\"Acme\", "
+                  "\"light\") != tenantChartColor(\"Acme\", \"dark\") korrigiert "
+                  "werden, bevor gebaut wird."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Kommentar oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "acceptance criterion" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_coder_business_wall_mentioning_criterion(monkeypatch, worker_env):
+    """F37 must not swallow a genuine business block that merely mentions the
+    word 'Kriterium' without framing it as defective. A real Freigabe question
+    still passes to the beobachter's richter."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coder hit a wall",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=("Alle Kriterien erfuellt, aber brauche Klaerung: soll ich "
+                  "nach main freigeben?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a decision from Till", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True

@@ -235,6 +235,44 @@ _CODER_INTERNAL_TRIAGE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# F37: the coder found the specifier's ACCEPTANCE CRITERION itself defective and
+# tried to escalate "please correct it" to a human. Live probe card t_82eac595
+# ('Tests fuer die Mandanten-Farben', erwartung=done): voicera-coder read the
+# public API as ``tenantChartColor(name, mode: "light" | "dark")`` but the
+# specifier's ABNAHMEKRITERIUM demanded ``tenantChartColor("Acme GmbH", false)``
+# /``true`` — Boolean args that are both ``!= "dark"`` at runtime and invalid at
+# typecheck. The coder correctly refused to build against a wrong criterion and
+# called ``kanban_block(kind='needs_input', reason="HALT: Specifier-Abnahme-
+# kriterium nutzt Boolean-Modi … bitte Kriterium technisch korrigieren und Karte
+# erneut an den Coder geben.")``. No comment carries a "?", so the Beobachter
+# extracts no frage and classes the question-less blocked done-card as
+# rot-infra-eskalation-ohne-frage (F37 2a — the same question-less-blocked symptom
+# F28/F25 produce, here from a spec-correction wall). But the ABNAHMEKRITERIUM is
+# the SPECIFIER's to write and fix (it owns the criterion, F01); a technically
+# wrong one is a pure factory-internal coder->specifier->coder correction loop,
+# NEVER Till's decision — Till never sees the criterion and cannot answer on a
+# business basis (the Manager's own diagnosis of this card says exactly this: "(A)
+# Abnahmekriterium … praezisieren und … erneut an den Coder"). Mirror that
+# necessary condition in code: a coder human-block that NAMES the acceptance
+# criterion / specifier spec AND frames it as defective (correct / adjust /
+# wrong / contradicts / invalid, or the explicit "erneut an den Coder" loop) is
+# routed BACK to the specifier via kanban_handoff, not parked at a human. The two
+# signals are AND-ed (like F32's app-path + import-hygiene pair) so a genuine
+# business block that merely mentions "Kriterium" in passing keeps its human-wall
+# path. Scoped to repo coders + human-escalation kinds, worker-side (re-imported
+# per spawn), live on the next coder spawn with no gateway restart (cf. F19).
+_CODER_SPEC_REF_RE = re.compile(
+    r"(?:abnahme|akzeptanz)[-\s]?kriteri|\bspecifier\b|\bkriterium\b",
+    re.IGNORECASE,
+)
+_CODER_SPEC_DEFECT_RE = re.compile(
+    r"\bkorrigier|\banpass|\bpr[äa]zisier|\bfalsch\b|\bung[üu]ltig"
+    r"|\bwiderspr|\bfehlerhaft|\bstimmt\s+nicht\b|\bnicht\s+korrekt\b"
+    r"|erneut\s+an\s+den\s+coder"
+    r"|zur[üu]ck\s+an\s+(?:den\s+)?(?:specifier|spezifizierer)",
+    re.IGNORECASE,
+)
+
 # Read-only helper roles the specifier SPAWNS as delegation subagents for facts
 # (recon = code-state, brain-reader = Brain knowledge). They own no write access
 # ("kein Write, kein Edit, keine Commits" — recon SOUL) and are NEVER a valid
@@ -1399,12 +1437,15 @@ def _handle_block(args: dict, **kw) -> str:
             and kind in _HUMAN_BLOCK_KINDS
         ):
             frage = ""
+            all_comment_bodies: list[str] = []
             try:
                 for c in kb.list_comments(conn, tid):
-                    if "?" in (c.body or ""):
-                        frage = c.body or ""
+                    body = c.body or ""
+                    all_comment_bodies.append(body)
+                    if "?" in body:
+                        frage = body
             except Exception:
-                frage = ""
+                pass
             blob = f"{frage}\n{reason}"
             if _CODER_INTERNAL_TRIAGE_REGEX.search(blob):
                 conn.close()
@@ -1425,6 +1466,41 @@ def _handle_block(args: dict, **kw) -> str:
                     "the normal way. Only block for a genuine business/Freigabe "
                     "decision that is Till's to make — stated as a question in "
                     "a comment, free of internal task IDs and branch names."
+                )
+            # F37: a coder human-block that names the acceptance criterion /
+            # specifier spec AND frames it as defective is a factory-internal
+            # coder->specifier->coder correction, not a Till Zielfrage. Route it
+            # back to the specifier (who owns the ABNAHMEKRITERIUM) instead of
+            # parking a question-less blocked done-card at a human. Scanned over
+            # the FULL comment thread + reason (not the "?"-filtered frage): a
+            # criterion-defect finding is usually a statement ("…muss korrigiert
+            # werden"), not a question, so it would otherwise slip past a terse
+            # reason when posted as a plain comment.
+            spec_blob = "\n".join([*all_comment_bodies, reason])
+            if (
+                _CODER_SPEC_REF_RE.search(spec_blob)
+                and _CODER_SPEC_DEFECT_RE.search(spec_blob)
+            ):
+                conn.close()
+                return tool_error(
+                    "the coder may not escalate a defective acceptance criterion "
+                    "to a human. The ABNAHMEKRITERIUM is the SPECIFIER's to write "
+                    "and fix — it owns the criterion. When it is technically "
+                    "wrong (e.g. it calls the public API with the wrong argument "
+                    "shape, or contradicts the verified signature), that is a "
+                    "factory-internal coder->specifier->coder correction, NOT a "
+                    "Zielfrage for Till: Till never sees the criterion and cannot "
+                    "answer it, so the Beobachter rejects the question-less "
+                    "blocked done-card as an infra escalation. Do NOT block. Hand "
+                    "the card BACK to the specifier to correct the criterion: "
+                    "post ONE comment stating the exact contradiction and the "
+                    "corrected criterion you need (the verified signature / "
+                    "argument shape, no files changed), then call "
+                    "kanban_handoff(to=\"specifier\"). The specifier rewrites the "
+                    "ABNAHMEKRITERIUM and re-hands the card to you; you then build "
+                    "cleanly on wt/<id> and hand off to the reviewer, who "
+                    "completes the card. Only block for a genuine business/"
+                    "Freigabe decision that is Till's to make."
                 )
         try:
             ok = kb.block_task(
