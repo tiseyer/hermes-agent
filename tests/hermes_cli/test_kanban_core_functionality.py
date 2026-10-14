@@ -886,6 +886,166 @@ def test_cli_gc_reports_counts(kanban_home):
     assert "GC complete" in out
 
 
+def test_cli_gc_removes_only_terminal_orphaned_auto_decomposer_artifacts(
+    kanban_home,
+):
+    old = int(time.time()) - 31 * 24 * 3600
+    with kb.connect() as conn:
+        orphan_root = kb.create_task(conn, title="orphan family", triage=True)
+        orphan_children = kb.decompose_triage_task(
+            conn,
+            orphan_root,
+            root_assignee="orchestrator",
+            author="auto-decomposer",
+            children=[
+                {"title": "done orphan", "assignee": "worker", "parents": []},
+                {"title": "archived orphan", "assignee": "worker", "parents": [0]},
+                {"title": "active orphan", "assignee": "worker", "parents": []},
+            ],
+        )
+        assert orphan_children is not None
+        done_id, archived_id, active_orphan_id = orphan_children
+
+        healthy_root = kb.create_task(conn, title="healthy family", triage=True)
+        healthy_children = kb.decompose_triage_task(
+            conn,
+            healthy_root,
+            root_assignee="orchestrator",
+            author="auto-decomposer",
+            children=[
+                {"title": "healthy active child", "assignee": "worker", "parents": []},
+            ],
+        )
+        assert healthy_children is not None
+        healthy_child_id = healthy_children[0]
+        standalone_id = kb.create_task(conn, title="active sentinel")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, "
+                "status_changed_at = ?, created_at = ? WHERE id = ?",
+                (old, old, old, done_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', completed_at = ?, "
+                "status_changed_at = ?, created_at = ? WHERE id = ?",
+                (old, old, old, archived_id),
+            )
+            for task_id in (done_id, archived_id):
+                conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, 'worker', 'done', ?, ?, 'completed')",
+                    (task_id, old, old),
+                )
+                conn.execute(
+                    "INSERT INTO kanban_notify_subs "
+                    "(task_id, platform, chat_id, thread_id, created_at) "
+                    "VALUES (?, 'telegram', ?, '', ?)",
+                    (task_id, task_id, old),
+                )
+            # Simulate the external deletion that leaves decomposer children
+            # structurally orphaned. The task-scoped rows intentionally remain.
+            conn.execute("DELETE FROM tasks WHERE id = ?", (orphan_root,))
+
+        for task_id in (done_id, archived_id):
+            kb.add_comment(conn, task_id, "test", "stale artifact")
+            attachment_dir = kb.task_attachments_dir(task_id)
+            attachment_dir.mkdir(parents=True)
+            attachment = attachment_dir / "artifact.txt"
+            attachment.write_text("stale")
+            kb.add_attachment(
+                conn,
+                task_id,
+                filename=attachment.name,
+                stored_path=str(attachment),
+                size=attachment.stat().st_size,
+                uploaded_by="test",
+            )
+            scratch_dir = kb.workspaces_root() / task_id
+            scratch_dir.mkdir(parents=True)
+            (scratch_dir / "state.txt").write_text("stale")
+
+        active_ids = (
+            active_orphan_id,
+            healthy_root,
+            healthy_child_id,
+            standalone_id,
+        )
+        active_before = {
+            task_id: dict(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone())
+            for task_id in active_ids
+        }
+
+        def structural_orphans(db_conn) -> int:
+            return db_conn.execute(
+                "SELECT COUNT(*) FROM tasks t "
+                "WHERE t.created_by = 'auto-decomposer' "
+                "AND t.parent_id IS NOT NULL AND t.family_root_id IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.id = t.family_root_id)"
+            ).fetchone()[0]
+
+        def collectable_orphans(db_conn) -> int:
+            return db_conn.execute(
+                "SELECT COUNT(*) FROM tasks t "
+                "WHERE t.created_by = 'auto-decomposer' "
+                "AND t.parent_id IS NOT NULL AND t.family_root_id IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.id = t.family_root_id) "
+                "AND t.status IN ('done', 'archived') "
+                "AND COALESCE(t.completed_at, t.status_changed_at, t.created_at) <= ?",
+                (old,),
+            ).fetchone()[0]
+
+        assert structural_orphans(conn) == 3
+        assert collectable_orphans(conn) == 2
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 6
+
+    dry_out = run_slash("gc --orphan-retention-days 30 --dry-run")
+    assert "2 orphaned auto-decomposer task(s)" in dry_out
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 6
+
+    out = run_slash("gc --orphan-retention-days 30")
+    assert "2 orphaned auto-decomposer task(s)" in out
+
+    with kb.connect() as conn:
+        assert collectable_orphans(conn) == 0
+        assert structural_orphans(conn) == 1
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 4
+        active_after = {
+            task_id: dict(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone())
+            for task_id in active_ids
+        }
+        assert active_after == active_before
+
+        placeholders = ",".join("?" for _ in (done_id, archived_id))
+        for table in (
+            "task_comments",
+            "task_events",
+            "task_runs",
+            "task_attachments",
+            "kanban_notify_subs",
+        ):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id IN ({placeholders})",
+                (done_id, archived_id),
+            ).fetchone()[0] == 0
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM task_links WHERE parent_id IN ({placeholders}) "
+            f"OR child_id IN ({placeholders})",
+            (done_id, archived_id, done_id, archived_id),
+        ).fetchone()[0] == 0
+
+    for task_id in (done_id, archived_id):
+        assert not (kb.workspaces_root() / task_id).exists()
+        assert not kb.task_attachments_dir(task_id).exists()
+
+
 # ---------------------------------------------------------------------------
 # run_slash parity — every verb returns a sensible, non-crashy string
 # ---------------------------------------------------------------------------

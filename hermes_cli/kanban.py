@@ -973,6 +973,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
+    p_gc.add_argument(
+        "--orphan-retention-days",
+        type=int,
+        default=30,
+        help="Delete terminal auto-decomposer children whose family root has "
+             "been absent for N days (default: 30, -1 disables)",
+    )
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
     p_gc.add_argument("--log-max-total-mb", type=int, default=500,
@@ -2974,6 +2981,103 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _gc_orphaned_auto_decomposer_tasks(
+    *,
+    older_than_days: int,
+    dry_run: bool,
+) -> int:
+    """Remove terminal decomposer children whose family root no longer exists.
+
+    The guards deliberately sit at the destructive boundary: only old
+    ``done``/``archived`` children created by the gateway auto-decomposer are
+    candidates, and any active run excludes a row even if its task status is
+    stale. Filesystem cleanup is limited to the conventional per-task
+    directories; inherited/shared workspace paths are never removed here.
+    """
+    import shutil
+
+    if older_than_days < 0:
+        return 0
+
+    cutoff = int(time.time()) - older_than_days * 24 * 3600
+    candidate_sql = (
+        "SELECT t.id, t.workspace_kind FROM tasks t "
+        "WHERE t.created_by = 'auto-decomposer' "
+        "AND t.parent_id IS NOT NULL "
+        "AND t.family_root_id IS NOT NULL "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM tasks root WHERE root.id = t.family_root_id"
+        ") "
+        "AND t.status IN ('done', 'archived') "
+        "AND COALESCE(t.completed_at, t.status_changed_at, t.created_at) <= ? "
+        "AND t.current_run_id IS NULL "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM task_runs run "
+        "  WHERE run.task_id = t.id AND run.status = 'running'"
+        ") "
+        "ORDER BY t.id"
+    )
+    with kb.connect_closing() as conn:
+        if dry_run:
+            rows = conn.execute(candidate_sql, (cutoff,)).fetchall()
+        else:
+            with kb.write_txn(conn):
+                # Select under the same write lock as deletion so a dispatcher
+                # cannot start a run between the safety checks and the DELETE.
+                rows = conn.execute(candidate_sql, (cutoff,)).fetchall()
+                task_ids = [row["id"] for row in rows]
+                if task_ids:
+                    placeholders = ",".join("?" for _ in task_ids)
+                    conn.execute(
+                        f"DELETE FROM task_links WHERE parent_id IN ({placeholders}) "
+                        f"OR child_id IN ({placeholders})",
+                        (*task_ids, *task_ids),
+                    )
+                    for table in (
+                        "task_comments",
+                        "task_events",
+                        "task_runs",
+                        "task_attachments",
+                        "kanban_notify_subs",
+                    ):
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE task_id IN ({placeholders})",
+                            task_ids,
+                        )
+                    conn.execute(
+                        f"DELETE FROM tasks WHERE id IN ({placeholders})",
+                        task_ids,
+                    )
+        task_ids = [row["id"] for row in rows]
+
+    scratch_root = kb.workspaces_root().resolve()
+    attachments_root = kb.attachments_root().resolve()
+    for row in rows:
+        task_id = row["id"]
+        directories = [attachments_root / task_id]
+        if row["workspace_kind"] == "scratch":
+            directories.append(scratch_root / task_id)
+        for directory in directories:
+            try:
+                resolved = directory.resolve()
+                expected_root = (
+                    attachments_root
+                    if directory.parent == attachments_root
+                    else scratch_root
+                )
+                resolved.relative_to(expected_root)
+            except (OSError, ValueError):
+                continue
+            if resolved.parent != expected_root or not resolved.is_dir():
+                continue
+            if dry_run:
+                print(f"[dry-run] would remove task artifact directory {resolved}")
+            else:
+                shutil.rmtree(resolved, ignore_errors=True)
+
+    return len(task_ids)
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune worktree build
     artifacts of terminal tasks, prune old events, and delete old worker
@@ -3029,6 +3133,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                     print(f"[dry-run] would prune {entry['path']} "
                           f"({entry['bytes'] / (1024 * 1024):.1f} MiB)")
 
+    # Select/delete orphan rows only after the existing worktree sweep has
+    # seen them; otherwise deleting the task first would make its build
+    # artifacts undiscoverable to cleanup_worktree_artifacts().
+    orphan_days = getattr(args, "orphan_retention_days", 30)
+    removed_orphans = _gc_orphaned_auto_decomposer_tasks(
+        older_than_days=orphan_days,
+        dry_run=dry_run,
+    )
+
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     log_cap_mb = getattr(args, "log_max_total_mb", 500)
@@ -3053,7 +3166,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{pruned_dirs} artifact dir(s) "
           f"({pruned_bytes / (1024 * 1024):.1f} MiB), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) {verb}")
+          f"{removed_events} event row(s), {removed_logs} log file(s), "
+          f"{removed_orphans} orphaned auto-decomposer task(s) {verb}")
     return 0
 
 
