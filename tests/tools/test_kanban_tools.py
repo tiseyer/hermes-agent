@@ -3560,3 +3560,90 @@ def test_block_allowed_for_coder_business_wall_mentioning_criterion(monkeypatch,
     out = kt._handle_block({"reason": "need a decision from Till", "kind": "needs_input"})
     d = json.loads(out)
     assert d.get("ok") is True
+
+
+# ---------------------------------------------------------------------------
+# F21: a DB-less backend pytest targeting the importable app package is
+# env-gated in the Beobachter venv (collection boots app.database's async
+# engine, which the check venv can't provision) → reviewer routes it to the
+# merger, not a doomed self-`done`.
+# ---------------------------------------------------------------------------
+
+def test_card_is_build_gated_db_less_backend_pytest():
+    """The live probe t_cdc32d75: a reviewed DB-less unit test for
+    `_check_priority` in `backend/app/services/todo_service.py`. The test uses
+    no DB fixture and passes 4/4 for coder and reviewer, but the Beobachter's
+    `cd backend && pytest tests/test_todo_priority.py` dies at COLLECTION — the
+    import chain reaches `app/database.py` which calls `create_async_engine(
+    settings.DATABASE_URL)` at import, and the check venv has no aiosqlite / real
+    DATABASE_URL. A pure env gap; must route to the merger like F31."""
+    from tools import kanban_tools as kt
+    title = "Unit-Test fuer die Prioritaetspruefung im To-Do-Service ohne Datenbank"
+    body = (
+        "_check_priority in backend/app/services/todo_service.py wird nur im "
+        "Postgres-Test mitgeprueft. Reiner Unit-Test fuer PRIORITY_MIN/"
+        "PRIORITY_MAX. Keine DB-Fixture."
+    )
+    comments = [
+        "ABNAHMEKRITERIUM: Aus `backend/` beendet `.venv/bin/python -m pytest "
+        "tests/test_todo_priority.py -q` ohne laufende Datenbank und ohne "
+        "DB-Fixture mit genau vier Grenzfaellen.",
+    ]
+    assert kt._card_is_build_gated(title, body, comments) is True
+
+
+def test_card_not_build_gated_for_static_helper_pytest():
+    """A truly static pytest card (pure helper, no app-package import, no
+    DB framing) must keep the honest Regel-a `done` path — all three F21 signals
+    are required."""
+    from tools import kanban_tools as kt
+    assert kt._card_is_build_gated(
+        "Unit-Test fuer String-Helfer",
+        "Teste reine Funktion in backend/app_utils/strcase.py.",
+        ["ABNAHMEKRITERIUM: pytest tests/test_strcase.py -q -> 3 passed"],
+    ) is False
+
+
+def test_reviewer_routes_db_less_backend_pytest_to_merger(monkeypatch, worker_env):
+    """End-to-end: the reviewer completing the env-gated DB-less pytest card does
+    not land `done` (which would be shell=ROT every re-check); it hands the
+    branch to `ready @ merger` with a Merge-GO Freigabe note."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Unit-Test fuer die Prioritaetspruefung ohne Datenbank",
+            body=(
+                "_check_priority in backend/app/services/todo_service.py. "
+                "Reiner Unit-Test. Keine DB-Fixture."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/review",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=(
+                "ABNAHMEKRITERIUM: Aus `backend/` `.venv/bin/python -m pytest "
+                "tests/test_todo_priority.py -q` ohne laufende Datenbank und "
+                "ohne DB-Fixture, vier Grenzfaelle."
+            ),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRUEN - 4 passed, diff nur Testdatei"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("assignee") == "merger"
+    assert d.get("status") == "ready"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.assignee == "merger"
+    finally:
+        conn.close()

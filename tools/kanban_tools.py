@@ -377,6 +377,43 @@ _IMPORT_HYGIENE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# F21 (this befund): a backend *pytest* card whose target lives inside the
+# importable ``app`` package and is explicitly a DB-less unit test. F31's
+# runtime-env gate deliberately EXCLUDES pytest, because a static backend pytest
+# card greens honestly in the Beobachter venv and must keep its Regel-a ``done``
+# path. But a pytest that targets a function in the DB-bound app package
+# (``backend/app/services/…``, ``…/models/…``) imports that module AT COLLECTION,
+# and ``app/database.py`` creates the async engine at import time
+# (``create_async_engine(settings.DATABASE_URL)``). The Beobachter re-runs the
+# acceptance in a throwaway worktree against its own venv, which has neither the
+# real ``.env`` DATABASE_URL nor the async DB driver — so collection dies before
+# a single test runs (live probe Karte 4 't_cdc32d75', erwartung=done: the unit
+# test itself uses NO DB fixture and passes 4/4 for coder AND reviewer in the
+# task venv, Richter confirms the criterion met, yet the Beobachter's
+# ``cd backend && pytest tests/test_todo_priority.py`` is rc=2 ERROR —
+# ``app/database.py:49 create_async_engine(...)`` → ``ModuleNotFoundError: No
+# module named 'aiosqlite'``). That is a pure provisioning gap exactly like F31,
+# not a defect, so a reviewer ``done`` is "done ohne vollständige Abnahme"
+# (branch=True, reviewer=ok, ergebnis_passt=True, shell=ROT → Regel a never
+# greens) and the honest terminal is the MERGER. Three signals are required so a
+# truly-static pytest card (pure helper, no app-package import, no DB framing)
+# keeps the honest ``done`` path: a pytest acceptance AND a target inside the app
+# package (``_APP_PACKAGE_PATH_RE``) AND the DB-less/DB-bound framing that marks
+# the import chain as engine-booting. All three are written into the thread by
+# the orchestrator/specifier/coder (the ABNAHMEKRITERIUM names the pytest command
+# and the ``backend/app/…`` path; the card frames it as "ohne (laufende)
+# Datenbank / ohne DB-Fixture"), so the reviewer sees them at completion.
+_PYTEST_ACCEPTANCE_RE = re.compile(r"\bpytest\b", re.IGNORECASE)
+_DB_ENGINE_NEXUS_RE = re.compile(
+    r"(?:ohne\s+(?:laufende\s+)?(?:datenbank|db)\b"
+    r"|ohne\s+db[-\s]?fixture|keine?\s+db[-\s]?fixture"
+    r"|no\s+db[-\s]?fixture|without\s+(?:a\s+)?(?:database|db)\b"
+    r"|\bpostgres\b|\bpostgresql\b|\brls\b|\baiosqlite\b"
+    r"|async[-\s]?engine|create_async_engine|\bsqlalchemy\b"
+    r"|\bdatabase_url\b|datenbank[-\s]?fixture)",
+    re.IGNORECASE,
+)
+
 
 def _is_reviewer_profile(profile: Optional[str]) -> bool:
     """True when the current worker profile is a code reviewer.
@@ -410,6 +447,18 @@ def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bo
     # the specifier quoted the import command (which lives only in the
     # Beobachter-side ``fertig_heisst.shell`` and never reaches the factory).
     if _APP_PACKAGE_PATH_RE.search(blob) and _IMPORT_HYGIENE_RE.search(blob):
+        return True
+    # F21 (this befund): a DB-less backend pytest targeting the importable app
+    # package. Importing the module-under-test boots app.database's async engine
+    # at collection, which the Beobachter's env-less check venv can't provision
+    # (no aiosqlite / no real DATABASE_URL) → collection rc=2, a pure env gap.
+    # Route to the merger like F31. All three signals are required so a purely
+    # static pytest card keeps the honest Regel-a done path.
+    if (
+        _PYTEST_ACCEPTANCE_RE.search(blob)
+        and _APP_PACKAGE_PATH_RE.search(blob)
+        and _DB_ENGINE_NEXUS_RE.search(blob)
+    ):
         return True
     return False
 
