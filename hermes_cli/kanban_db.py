@@ -5167,6 +5167,88 @@ def handoff_task(
     to_profile = (to_profile or "").strip()
     if not to_profile:
         raise ValueError("handoff target profile is required")
+    # F43 scope-recut convergence ceiling: a card bounced back to the
+    # orchestrator too many times (an open-ended "alle"/"vollständig" scope the
+    # factory cannot mechanically close) is escalated ONCE to the human with a
+    # prepared scope Zielfrage instead of re-arming the recon/re-cut spiral. The
+    # check sits BEFORE the forward-handoff write so the (N+1)th hand-back never
+    # wakes the orchestrator; it only applies to hand-backs targeting the
+    # orchestrator and never to the normal forward pipeline (→specifier/coder/
+    # reviewer). Scoped to cards that are actually in a handoffable state.
+    _to_norm = to_profile.lower()
+    if _to_norm == "orchestrator" or _to_norm.endswith("-orchestrator"):
+        if _scope_recut_count(conn, task_id) >= _SCOPE_RECUT_CEILING:
+            with write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input'
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="scope-recut convergence ceiling → blocked@till",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="scope-recut convergence ceiling → blocked@till",
+                    )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Umfang nicht abschließbar: Diese Karte ist nach "
+                        f"{_SCOPE_RECUT_CEILING} Umfangs-Neuschnitten erneut an den "
+                        "Orchestrator zurückgereicht worden — jede als vollständig "
+                        "bezeichnete Inventur der englischen UI-Texte wird von der "
+                        "nächsten Runde widerlegt, weil der verlangte Umfang ('alle "
+                        "verbleibenden Begriffe') keinen abzählbaren Endpunkt hat und "
+                        "sich nicht fabrik-intern festlegen lässt. Das ist eine "
+                        "Umfangs- und Freigabe-Entscheidung des Inhabers, nicht der "
+                        "Fabrik.\n\nENTSCHEIDUNG BENÖTIGT: Soll der aktuell erreichte "
+                        "Stand so abgenommen und freigegeben werden, oder soll der "
+                        "genaue Fertig-Umfang festgelegt werden — also welche "
+                        "Ansichten und welche Begriffe als abgeschlossen gelten und "
+                        "welche bewusst im Original bleiben?",
+                        int(time.time()),
+                    ),
+                )
+                # Sticky block event: without it recompute_ready promotes the
+                # parked card back to ready@till — an unspawnable limbo
+                # (mirrors the F34/F41 escalation).
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"kind": "needs_input",
+                     "reason": "scope-recut convergence ceiling: Umfang nicht "
+                               "fabrik-intern abschließbar"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "scope_recut_ceiling",
+                    {"recuts": _scope_recut_count(conn, task_id),
+                     "cap": _SCOPE_RECUT_CEILING,
+                     "routed_to": "till",
+                     "blocked_handoff_to": to_profile},
+                    run_id=run_id,
+                )
+            return True
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, assignee FROM tasks WHERE id = ?",
@@ -9558,6 +9640,66 @@ def _coder_rebuild_count(conn: sqlite3.Connection, task_id: str) -> int:
             to = ""
         to = to.strip().lower()
         if to == "coder" or to.endswith("-coder"):
+            n += 1
+    return n
+
+
+# F43 scope-recut convergence ceiling for the orchestrator hand-back bounce.
+#
+# F41 catches the coder-lane bounce (``handoff``→coder + ``review_rejected``),
+# but an orthogonal non-convergence loop lives one level up at the orchestrator.
+# A coder/reviewer that cannot satisfy an open-ended "alle"/"vollständig"
+# acceptance criterion hands the card BACK to the orchestrator (``handoff`` whose
+# ``to`` is the orchestrator); the orchestrator then re-cuts the scope — links yet
+# another recon/audit/ledger child, parks the card in ``todo`` with
+# ``block_kind='dependency'`` until it finishes, re-sharpens the criterion — and
+# hands the card forward again. None of those are FAILED runs, and the card rarely
+# reaches the coder lane, so ``_coder_rebuild_count`` stays low (≤2) and the F41
+# ceiling never trips. The card ping-pongs orchestrator↔coder/reviewer, blows the
+# 1.0h ``klein`` frist while parked in ``todo``, and the Beobachter rightly flags
+# 'rot-stuck' ("Karte haengt in todo").
+#
+# Live t_70d295c6 ("übersetze ALLE verbleibenden englischen UI-Worte"): 3 hand-backs
+# to the orchestrator + 6 linked recon/audit children in ~50 min, each inventory
+# ("vollständig geschlossene 16-/25-/32-Dateien-Menge") promptly falsified by the
+# next round because the completeness of "alle verbleibenden Begriffe" has no
+# countable endpoint and cannot be decided fabrik-internally — it is an owner
+# scope/Freigabe decision (F39: never self-decide a Zielentscheidung — escalate it
+# with the current state + the open options).
+#
+# Each ``handoff`` whose target is the orchestrator marks one scope re-cut round.
+# The first two are allowed (a genuine coder HALT the orchestrator resolves once,
+# plus one follow-up); a card attempting a THIRD hand-back to the orchestrator has
+# provably failed to close the scope through re-cutting, so that bounce is
+# converted — worker-side, at the exact moment it is attempted, comfortably before
+# the frist — into a single human escalation (``blocked`` @ ``till`` with a prepared
+# scope Zielfrage) instead of re-arming the spiral. Mirrors F41's escalation so the
+# Beobachter greens it rule b (legitime Zielfrage).
+_SCOPE_RECUT_CEILING = 2
+
+
+def _scope_recut_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many times ``task_id`` has already been handed back to the orchestrator.
+
+    The forward pipeline is orchestrator → specifier → coder → reviewer; a
+    ``handoff`` whose ``to`` is the orchestrator is therefore always an upward
+    hand-BACK (a coder/reviewer bouncing the card up for a scope re-decision),
+    never a routine forward step. The count of such events is the number of
+    scope re-cut rounds the card has already burned, driving
+    :data:`_SCOPE_RECUT_CEILING`.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff'",
+        (task_id,),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        try:
+            to = str((json.loads(r["payload"] or "{}") or {}).get("to") or "")
+        except Exception:
+            to = ""
+        to = to.strip().lower()
+        if to == "orchestrator" or to.endswith("-orchestrator"):
             n += 1
     return n
 

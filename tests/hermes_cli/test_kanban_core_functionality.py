@@ -4805,3 +4805,67 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# F43 scope-recut convergence ceiling (orchestrator hand-back bounce)
+# ---------------------------------------------------------------------------
+
+def _handback(conn, tid):
+    """Put the card in running and hand it back to the orchestrator."""
+    conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+    return kb.handoff_task(conn, tid, "orchestrator", note=None, author="voicera-coder")
+
+
+def test_scope_recut_ceiling_allows_early_handbacks_then_escalates(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="alle UI-Worte", assignee="orchestrator")
+
+        # The first _SCOPE_RECUT_CEILING hand-backs are legitimate scope re-cuts:
+        # each must flow forward normally (card wakes the orchestrator again).
+        for i in range(kb._SCOPE_RECUT_CEILING):
+            assert _handback(conn, tid) is True
+            t = kb.get_task(conn, tid)
+            assert t.status == "ready" and t.assignee == "orchestrator", (
+                f"hand-back #{i + 1} should flow forward, got {t.status}@{t.assignee}"
+            )
+
+        # The next hand-back trips the ceiling: escalate to blocked@till.
+        assert _handback(conn, tid) is True
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked", t.status
+        assert t.assignee == "till", t.assignee
+        assert t.block_kind == "needs_input", t.block_kind
+
+        # Sticky block + ceiling event recorded; a Zielfrage comment is present.
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+            )
+        ]
+        assert "scope_recut_ceiling" in kinds
+        assert "blocked" in kinds
+        bodies = [
+            r["body"]
+            for r in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ?", (tid,)
+            )
+        ]
+        assert any("ENTSCHEIDUNG BENÖTIGT" in b for b in bodies), bodies
+
+
+def test_scope_recut_ceiling_ignores_forward_handoffs(kanban_home):
+    """Forward pipeline handoffs (→specifier/coder/reviewer) never trip."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="normal flow", assignee="orchestrator")
+        for role in ("specifier", "voicera-coder", "voicera-reviewer",
+                     "specifier", "voicera-coder", "voicera-reviewer"):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+            assert kb.handoff_task(conn, tid, role) is True
+            t = kb.get_task(conn, tid)
+            assert t.status == "ready" and t.assignee == role, (
+                f"forward handoff to {role} must not escalate; got "
+                f"{t.status}@{t.assignee}"
+            )
+        assert kb.get_task(conn, tid).status == "ready"
