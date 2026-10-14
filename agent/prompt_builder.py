@@ -360,7 +360,7 @@ KANBAN_GUIDANCE = (
     "${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_TASK}` from the main repo, then "
     "cd there. For a project-linked task the workspace is a fresh "
     "`<repo>/.worktrees/<task-id>` and `$HERMES_KANBAN_BRANCH` a deterministic "
-    "`<project-slug>/<task-id>` — the main repo is two levels up, so run "
+    "`wt/<task-id>` branch — the main repo is two levels up, so run "
     "`git worktree add` from there.\n"
     "- **Deliverables.** Files a human wants go in "
     "`kanban_complete(artifacts=[<absolute paths>])` (top-level param; paths in "

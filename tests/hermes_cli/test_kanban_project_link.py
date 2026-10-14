@@ -1,5 +1,5 @@
 """Kanban <-> Projects integration: project-linked tasks get a deterministic
-worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
+worktree path and a persisted D/F-safe ``wt/<task-id>`` branch."""
 
 from __future__ import annotations
 
@@ -33,13 +33,83 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
     task = kb.get_task(kanban_conn, tid)
 
+    assert task is not None
     assert task.project_id == proj.id
     assert task.workspace_kind == "worktree"
     # Worktree dir anchored under the project's primary repo, keyed on task id.
     assert task.workspace_path == os.path.join(proj.primary_path, ".worktrees", tid)
-    # Deterministic branch: <slug>/<task-id>-<title-slug>. NOT a random wt/...
-    assert task.branch_name == f"{proj.slug}/{tid}-add-login"
-    assert not task.branch_name.startswith("wt/")
+    # The fixed namespace cannot collide with a top-level project-slug branch.
+    assert task.branch_name == f"wt/{tid}-add-login"
+
+
+def test_project_linked_dispatch_avoids_project_slug_ref_collision(
+    kanban_conn, tmp_path, all_assignees_spawnable,
+):
+    repo = tmp_path / "voicera-os"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-b", "main"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+    (repo / "README.md").write_text("test\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+
+    proj = _make_project(name="voicera-os", repo=str(repo))
+    assert proj is not None
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", proj.slug],
+        check=True,
+        capture_output=True,
+    )
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.id, workspace))
+
+    tid = kb.create_task(
+        kanban_conn,
+        title="Collision probe",
+        assignee="hermes-coder",
+        project_id=proj.id,
+        max_retries=1,
+    )
+    result = kb.dispatch_once(kanban_conn, spawn_fn=fake_spawn)
+    task = kb.get_task(kanban_conn, tid)
+    events = kb.list_events(kanban_conn, tid)
+    runs = kb.list_runs(kanban_conn, tid)
+
+    expected_workspace = repo / ".worktrees" / tid
+    expected_branch = f"wt/{tid}-collision-probe"
+    checked_out_branch = subprocess.run(
+        ["git", "-C", str(expected_workspace), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert task is not None
+    assert task.status == "running"
+    assert task.branch_name == expected_branch
+    assert expected_workspace.is_dir()
+    assert checked_out_branch == expected_branch
+    assert result.spawned == [(tid, "hermes-coder", str(expected_workspace))]
+    assert spawned == [(tid, str(expected_workspace))]
+    assert not ({"spawn_failed", "gave_up"} & {event.kind for event in events})
+    assert not ({"spawn_failed", "gave_up"} & {run.outcome for run in runs})
 
 
 def test_explicit_branch_overrides_project_default(kanban_conn):
