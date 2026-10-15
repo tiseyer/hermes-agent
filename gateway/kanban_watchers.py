@@ -272,14 +272,22 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
-                                )
+                                # Serialize the cursor-claim WRITE against the
+                                # dispatcher and every other writer. The notifier
+                                # runs in its own thread/task and used to commit
+                                # WAL frames with no cross-process lock — the
+                                # unserialized second writer behind the recurring
+                                # multi-writer corruption (docs §13). Same lock
+                                # file (<db>.dispatch.lock) as _dispatch_tick_lock.
+                                with _kb.write_serialize_lock(_kb.kanban_db_path(slug)):
+                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        kinds=TERMINAL_KINDS,
+                                    )
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
@@ -588,14 +596,15 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.advance_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
-            )
+            with _kb.write_serialize_lock(_kb.kanban_db_path(board)):
+                _kb.advance_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    new_cursor=cursor,
+                )
         finally:
             conn.close()
 
@@ -603,13 +612,14 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.remove_notify_sub(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-            )
+            with _kb.write_serialize_lock(_kb.kanban_db_path(board)):
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
         finally:
             conn.close()
 
@@ -624,15 +634,16 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
+            with _kb.write_serialize_lock(_kb.kanban_db_path(board)):
+                _kb.rewind_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=claimed_cursor,
+                    old_cursor=old_cursor,
+                )
         finally:
             conn.close()
 
