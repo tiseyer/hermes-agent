@@ -4705,6 +4705,40 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _dependency_parent_satisfied(
+    conn: sqlite3.Connection, parent_row: sqlite3.Row,
+) -> bool:
+    """True when a dependency parent no longer gates its child's promotion.
+
+    The default gate is terminal state: a parent is satisfied once it is
+    ``done``/``archived``.
+
+    F41 (todo-dependency starvation): a GO-gate Freigabe/merge parent
+    (``category == 'go_noetig'``) never reaches ``done``/``archived`` on the
+    factory's own — once the human GO is given it rests at ``ready @ merger``
+    (a technik merger terminal, F46) or stays ``blocked@till`` (F40). A work
+    card sequenced behind such a parent would therefore starve in ``todo``
+    until the Beobachter's frist trips ``rot-stuck`` (live repro: Karte 33
+    ``t_c2a3f4da`` waited on ``t_d991a49d`` = "Freigabe: Frontend-Lint-
+    Konfiguration übernehmen"). The human's explicit unblock
+    (:func:`_go_gate_released`) IS the decision the child was waiting on, so a
+    GO-released ``go_noetig`` parent counts as satisfied. A ``go_noetig`` parent
+    still awaiting GO (held, not released) keeps gating the child — the
+    decision genuinely isn't made yet.
+    """
+    status = parent_row["pstatus"]
+    if status in ("done", "archived"):
+        return True
+    category = (
+        (parent_row["pcategory"] or "")
+        if "pcategory" in parent_row.keys()
+        else ""
+    )
+    if category == "go_noetig" and _go_gate_released(conn, parent_row["pid"]):
+        return True
+    return False
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4754,7 +4788,8 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id AS pid, t.status AS pstatus, t.category AS pcategory "
+                "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
@@ -4765,7 +4800,7 @@ def recompute_ready(
             # therefore follow the same normal promotion path as todos whose
             # parents are already terminal. ``backlog`` is deliberately not
             # in ``todo_rows`` above, so no dispatcher sweep can activate it.
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(_dependency_parent_satisfied(conn, p) for p in parents):
                 if row["child_role"] == "human_check" and cur_status == "todo":
                     # S1: a planned Till step whose predecessors are finished
                     # is now due — it becomes ``human`` (Till's inbox), NEVER

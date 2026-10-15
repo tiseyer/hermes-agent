@@ -162,6 +162,72 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_dependency_go_released_parent_promotes_child(kanban_home: Path) -> None:
+    """A child gated on a GO-released go_noetig parent promotes without `done`.
+
+    F41 (todo-dependency starvation): a work card sequenced behind a Freigabe/
+    merge parent (``category='go_noetig'``) must not starve in ``todo``. Such a
+    parent never reaches ``done``/``archived`` — once the human GO is given it
+    rests at ``ready @ merger`` (F46). recompute_ready must treat the explicit
+    unblock (the human GO) as satisfying the dependency; otherwise the child
+    rots in ``todo`` until the Beobachter trips ``rot-stuck`` (live repro:
+    Karte 33 t_c2a3f4da ↦ t_d991a49d).
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="Freigabe: config", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait Freigabe", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        # Parent is a GO-gated Freigabe card parked at blocked@till, then the
+        # human gives GO (unblock) — it rests at ready, never reaching `done`.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready' WHERE id=?", (parent,)
+            )
+        kb.claim_task(conn, parent, claimer="worker")
+        assert kb.block_task(conn, parent, reason="Merge-GO nötig",
+                             kind="needs_input")
+        # The GO-gate park stamps the durable 'needs human GO' marker.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET category='go_noetig' WHERE id=?", (parent,)
+            )
+        assert kb.unblock_task(conn, parent)
+        # Parent is NOT done — but go_noetig + GO-released ⇒ child promotes.
+        assert kb.get_task(conn, parent).status != "done"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_dependency_go_held_parent_keeps_child_waiting(kanban_home: Path) -> None:
+    """A go_noetig parent still AWAITING GO keeps gating the child.
+
+    The release signal is the human's explicit unblock. A Freigabe card parked
+    at blocked@till that nobody has unblocked yet is an unmade decision — the
+    child must keep waiting, not jump ahead.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="Freigabe: config", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait Freigabe", kind="dependency")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready' WHERE id=?", (parent,)
+            )
+        kb.claim_task(conn, parent, claimer="worker")
+        assert kb.block_task(conn, parent, reason="Merge-GO nötig",
+                             kind="needs_input")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET category='go_noetig' WHERE id=?", (parent,)
+            )
+        # No unblock yet → GO not given → child stays in todo.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+
 # ---------------------------------------------------------------------------
 # F43 dependency-recut convergence ceiling
 # ---------------------------------------------------------------------------
