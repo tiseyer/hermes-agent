@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.support.kanban_routing import seed_canonical
 
 
 @pytest.fixture
@@ -23,6 +24,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seed_canonical(home)
     kb.init_db()
     return home
 
@@ -199,9 +201,9 @@ def test_repository_profile_missing_push_target_fails_closed(
     kanban_home, role_profiles_exist, monkeypatch,
 ):
     """An empty push_target is a fail-closed config error, like base_ref."""
-    profile = kb._REPOSITORY_PROFILES["hermes"]
+    profile = kb._repository_profiles()["hermes"]
     monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
+        kb._repository_profiles(),
         "hermes",
         kb.RepositoryProfile(
             name=profile.name,
@@ -226,16 +228,16 @@ def test_repository_profile_missing_push_target_fails_closed(
 
 def test_all_registered_profiles_have_push_target(kanban_home):
     """Every profile in the registry carries a non-empty push_target."""
-    for name, profile in kb._REPOSITORY_PROFILES.items():
+    for name, profile in kb._repository_profiles().items():
         assert profile.push_target.strip(), f"{name} missing push_target"
 
 
 def test_repository_profile_missing_required_field_fails_closed(
     kanban_home, role_profiles_exist, monkeypatch,
 ):
-    profile = kb._REPOSITORY_PROFILES["hermes"]
+    profile = kb._repository_profiles()["hermes"]
     monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
+        kb._repository_profiles(),
         "hermes",
         kb.RepositoryProfile(
             name=profile.name,
@@ -266,9 +268,9 @@ def test_dispatch_blocks_for_missing_repository_profile_field(
     kanban_home, role_profiles_exist, monkeypatch, tmp_path,
 ):
     """A malformed declared profile is needs_input, never a retry/default."""
-    profile = kb._REPOSITORY_PROFILES["hermes"]
+    profile = kb._repository_profiles()["hermes"]
     monkeypatch.setitem(
-        kb._REPOSITORY_PROFILES,
+        kb._repository_profiles(),
         "hermes",
         kb.RepositoryProfile(
             name=profile.name,

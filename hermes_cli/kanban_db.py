@@ -2863,7 +2863,7 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     if repository is not None:
         repository = str(repository).strip().lower()
-        if repository not in _REPOSITORY_PROFILES:
+        if repository not in _repository_profiles():
             repository = _repository_profile_prefix(f"Repository: {repository}", None)
         if repository is None:
             raise ValueError("repository must name a configured repository profile")
@@ -6231,7 +6231,7 @@ def block_task(
             _pair = resolve_task_repo_profiles(conn, task_id)
             reviewer = (
                 _pair[1] if _pair
-                else _TENANT_REVIEWER_MAP.get(task_tenant, "reviewer")
+                else _tenant_reviewer_map().get(task_tenant, "reviewer")
             )
             cur_assignee = (
                 cur_row["assignee"] if "assignee" in cur_row.keys() else None
@@ -9193,12 +9193,10 @@ def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "unblocked"
 
 
-# Tenant → reviewer profile routing. Used by the review block path and
-# the loop-detection diagnosis routing so both always agree.
-_TENANT_REVIEWER_MAP = {
-    "goya": "goya-reviewer",
-    "voicera": "voicera-reviewer",
-}
+# Tenant/repository routing is operator configuration.  Exactly three maps are
+# shared by every role profile in one Hermes instance: repository_profiles,
+# tenant_reviewers, and tenant_workdirs.  They are loaded from the instance
+# root config below rather than from the active role profile's config.
 
 # ---------------------------------------------------------------------------
 # Repo → role-profile resolution (goal decompose-repo-routing, Aug 2026)
@@ -9233,98 +9231,141 @@ class RepositoryProfileError(ValueError):
     """A declared repository card cannot be safely integrated as configured."""
 
 
-# Repository profiles are the single source for both role routing and git
-# integration.  A task declaration is intentionally resolved to one of these
-# profiles rather than inferring base/target branches from its local clone.
-_REPOSITORY_PROFILES = {
-    "hermes": RepositoryProfile(
-        name="hermes",
-        coder="hermes-coder",
-        reviewer="hermes-reviewer",
-        base_ref="fork/main",
-        merge_target="main",
-        # upstream (origin) is NousResearch, read-only; workers push to the
-        # personal fork (tiseyer/hermes-agent). See fork-push rule 3be97e69f5.
-        push_target="fork",
-    ),
-    "goya": RepositoryProfile(
-        name="goya",
-        coder="goya-coder",
-        reviewer="goya-reviewer",
-        base_ref="origin/develop",
-        merge_target="develop",
-        push_target="origin",
-    ),
-    "voicera": RepositoryProfile(
-        name="voicera",
-        coder="voicera-coder",
-        reviewer="voicera-reviewer",
-        base_ref="origin/develop",
-        merge_target="develop",
-        push_target="origin",
-    ),
-    # ams-erp: main-based, no develop branch (verified via ls-remote against
-    # git@github-ams-erp:tiseyer/ams-erp.git, 2026-09-24 — only main + feature
-    # branches exist). Values confirmed by Till.
-    "ams-erp": RepositoryProfile(
-        name="ams-erp",
-        coder="ams-erp-coder",
-        reviewer="ams-erp-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-    # voicera-website: production website, main-based, no develop branch
-    # (verified via ls-remote against tiseyer/voicera-website, 2026-09-24 —
-    # only main + feature/wartungsseite exist). main IS production; confirmed
-    # by Till. NOTE: site is currently behind a Wartungsseite — merges to
-    # main happen ONLY with an explicit per-card Till GO, and this profile
-    # must be re-checked before the public launch.
-    "voicera-website": RepositoryProfile(
-        name="voicera-website",
-        coder="voicera-website-coder",
-        reviewer="voicera-website-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-    # life-os: Vercel-hosted, main = production, feature branches = preview
-    # (Till, 2026-09-24). ls-remote git@github-life-os:tiseyer/life-os.git
-    # shows main + develop; the main-based Vercel flow is the chosen model
-    # (develop exists but is intentionally not the integration target here).
-    "life-os": RepositoryProfile(
-        name="life-os",
-        coder="life-os-coder",
-        reviewer="life-os-reviewer",
-        base_ref="origin/main",
-        merge_target="main",
-        push_target="origin",
-    ),
-}
+@dataclass(frozen=True)
+class _RoutingConfig:
+    """Routing tables derived from one Hermes instance root config."""
 
-# Known role-profile prefixes for tenant defaults (v1, extendable).
-_REPO_PROFILE_PREFIXES = tuple(_REPOSITORY_PROFILES)
+    profiles: dict[str, RepositoryProfile]
+    tenant_reviewers: dict[str, str]
+    tenant_workdirs: dict[str, str]
+    signature_map: tuple[tuple[str, str], ...]
+    prefixes: tuple[str, ...]
 
-# Signature → profile prefix, matched (case-insensitively) against the VALUE
-# of an explicit declaration line. Ordered longest-first so "hermes-agent"
-# style signatures win over any shorter overlap.
-_REPO_SIGNATURE_MAP = (
-    ("hermes-agent-framework", "hermes"),
-    (".hermes/hermes-agent", "hermes"),
-    ("hermes-agent", "hermes"),
-    ("hermes_agent", "hermes"),
-    ("ams-erp", "ams-erp"),
-    ("ams_erp", "ams-erp"),
-    ("life-os", "life-os"),
-    ("life_os", "life-os"),
-    # voicera-website MUST precede the bare "voicera" signature so a website
-    # declaration does not collapse into the voicera-os profile.
-    ("voicera-website", "voicera-website"),
-    ("voicera-os", "voicera"),
-    ("voicera", "voicera"),
-    ("goya-v2", "goya"),
-    ("goya", "goya"),
-)
+
+_ROUTING_CONFIG_CACHE: dict[str, _RoutingConfig] = {}
+
+
+def _routing_config_path() -> Path:
+    """Return this context's instance-root config, never a role-profile copy."""
+    from hermes_constants import (
+        get_default_hermes_root,
+        get_hermes_home_override,
+    )
+
+    override = get_hermes_home_override()
+    if override:
+        active_home = Path(override)
+        root = (
+            active_home.parent.parent
+            if active_home.parent.name == "profiles"
+            else active_home
+        )
+    else:
+        root = get_default_hermes_root()
+    return (root / "config.yaml").resolve()
+
+
+def _normalized_string_map(raw: Any) -> dict[str, str]:
+    """Normalize an operator map, dropping malformed/empty entries."""
+    result: dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return result
+    for raw_key, raw_value in raw.items():
+        key = str(raw_key).strip().lower()
+        value = str(raw_value).strip()
+        if key and value:
+            result[key] = value
+    return result
+
+
+def _load_routing_config() -> _RoutingConfig:
+    """Load the three root-only Kanban routing maps, failing closed."""
+    import yaml
+
+    try:
+        config_path = _routing_config_path()
+        cache_key = str(config_path)
+    except Exception:
+        config_path = None
+        cache_key = ""
+    cached = _ROUTING_CONFIG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError, AttributeError):
+        raw_config = {}
+    kanban_config = raw_config.get("kanban", {}) if isinstance(raw_config, dict) else {}
+    if not isinstance(kanban_config, dict):
+        kanban_config = {}
+
+    profiles: dict[str, RepositoryProfile] = {}
+    signatures: list[tuple[str, str]] = []
+    raw_profiles = kanban_config.get("repository_profiles", {})
+    if isinstance(raw_profiles, dict):
+        for raw_name, spec in raw_profiles.items():
+            if not isinstance(spec, dict):
+                continue
+            name = str(raw_name).strip().lower()
+            if not name:
+                continue
+            profiles[name] = RepositoryProfile(
+                name=name,
+                coder=str(spec.get("coder", "") or "").strip(),
+                reviewer=str(spec.get("reviewer", "") or "").strip(),
+                base_ref=str(spec.get("base_ref", "") or "").strip(),
+                merge_target=str(spec.get("merge_target", "") or "").strip(),
+                push_target=str(spec.get("push_target", "") or "").strip(),
+            )
+            raw_signatures = spec.get("signatures", ())
+            if isinstance(raw_signatures, str):
+                raw_signatures = (raw_signatures,)
+            if isinstance(raw_signatures, (list, tuple)):
+                for raw_signature in raw_signatures:
+                    signature = str(raw_signature).strip().lower()
+                    if signature:
+                        signatures.append((signature, name))
+    signatures.sort(key=lambda item: (-len(item[0]), item[0]))
+
+    result = _RoutingConfig(
+        profiles=profiles,
+        tenant_reviewers=_normalized_string_map(
+            kanban_config.get("tenant_reviewers", {})
+        ),
+        tenant_workdirs=_normalized_string_map(
+            kanban_config.get("tenant_workdirs", {})
+        ),
+        signature_map=tuple(signatures),
+        prefixes=tuple(profiles),
+    )
+    _ROUTING_CONFIG_CACHE[cache_key] = result
+    return result
+
+
+def _reset_routing_config_cache() -> None:
+    """Drop derived routing tables after an in-place config edit (test hook)."""
+    _ROUTING_CONFIG_CACHE.clear()
+
+
+def _repository_profiles() -> dict[str, RepositoryProfile]:
+    return _load_routing_config().profiles
+
+
+def _tenant_reviewer_map() -> dict[str, str]:
+    return _load_routing_config().tenant_reviewers
+
+
+def _tenant_workdir_map() -> dict[str, str]:
+    return _load_routing_config().tenant_workdirs
+
+
+def _repo_signature_map() -> tuple[tuple[str, str], ...]:
+    return _load_routing_config().signature_map
+
+
+def _repo_profile_prefixes() -> tuple[str, ...]:
+    return _load_routing_config().prefixes
 
 # Declaration lines. Leading markdown litter ("- ", "> ", "* ") is allowed;
 # the keyword must start the line so prose mentions ("wir sollten das repo
@@ -9358,16 +9399,16 @@ def _declared_repository_profile(text: Optional[str]) -> Optional[RepositoryProf
         if role_hit:
             prefix = role_hit.group(1)
         else:
-            for sig, sig_prefix in _REPO_SIGNATURE_MAP:
+            for sig, sig_prefix in _repo_signature_map():
                 if sig in low:
                     prefix = sig_prefix
                     break
-        if prefix is None or prefix not in _REPOSITORY_PROFILES:
+        if prefix is None or prefix not in _repository_profiles():
             raise RepositoryProfileError(
                 f"explicit repository declaration {val.strip()!r} does not name "
                 "a configured repository profile"
             )
-        resolved = _validated_repository_profile(_REPOSITORY_PROFILES[prefix])
+        resolved = _validated_repository_profile(_repository_profiles()[prefix])
         if declared is not None and declared.name != resolved.name:
             raise RepositoryProfileError(
                 "conflicting explicit repository declarations: "
@@ -9382,7 +9423,7 @@ def _repository_profile_prefix(text: Optional[str], tenant: Optional[str]) -> Op
     declared = _declared_repository_profile(text)
     if declared is not None:
         return declared.name
-    return tenant if tenant in _REPOSITORY_PROFILES else None
+    return tenant if tenant in _repository_profiles() else None
 
 
 def _validated_repository_profile(profile: RepositoryProfile) -> RepositoryProfile:
@@ -9404,7 +9445,7 @@ def _repository_profile_from_name(name: Optional[str]) -> Optional[RepositoryPro
     """Resolve a stored canonical repository name without tenant fallback."""
     if not name:
         return None
-    profile = _REPOSITORY_PROFILES.get(name)
+    profile = _repository_profiles().get(name)
     if profile is None:
         return None
     return _validated_repository_profile(profile)
@@ -9422,7 +9463,7 @@ def resolve_repository_profile(
     prefix = _repository_profile_prefix(text, tenant)
     if prefix is None:
         return None
-    profile = _REPOSITORY_PROFILES.get(prefix)
+    profile = _repository_profiles().get(prefix)
     if profile is None:
         return None
     return _validated_repository_profile(profile)
@@ -9471,7 +9512,7 @@ def resolve_repo_profiles(
     Returns ``(coder_profile, reviewer_profile, source)`` where source is
     ``"declared"`` (explicit declaration found in the text — both profiles
     verified to exist) or ``"tenant"`` (tenant-default pair, existence NOT
-    required to mirror the legacy ``_TENANT_REVIEWER_MAP`` behavior), or
+    required to mirror the configured tenant-reviewer fallback behavior), or
     ``None`` when neither applies (caller falls back as before).
 
     An explicit declaration must resolve to configured, installed role profiles;
@@ -9494,7 +9535,7 @@ def resolve_repo_profiles(
                 f"{pair[0]!r} and {pair[1]!r}"
             )
         return (pair[0], pair[1], "declared")
-    if tenant and tenant in _REPO_PROFILE_PREFIXES:
+    if tenant and tenant in _repo_profile_prefixes():
         return (f"{tenant}-coder", f"{tenant}-reviewer", "tenant")
     return None
 
@@ -10292,7 +10333,7 @@ def _dispatch_once_locked(
                     continue
                 reviewer = (
                     _pair[1] if _pair
-                    else _TENANT_REVIEWER_MAP.get(
+                    else _tenant_reviewer_map().get(
                         _loop_task.tenant if _loop_task else None, "reviewer",
                     )
                 )
