@@ -147,3 +147,74 @@ def test_missing_or_malformed_root_config_ignores_profile_routing(
     monkeypatch.setenv("HERMES_HOME", str(malformed_profile))
     kb._reset_routing_config_cache()
     assert _routing_snapshot() == (set(), {}, {})
+
+
+def test_well_formed_yaml_with_non_string_routing_values_fails_closed(
+    tmp_path, monkeypatch,
+):
+    """YAML collections/nulls must not become usable routing strings."""
+    root = tmp_path / "typed-malformed-root"
+    profile_home = root / "profiles" / "worker"
+    _write_routing_config(
+        profile_home,
+        profile_name="profile-only",
+        reviewer="profile-reviewer",
+        workdir="/srv/profile-only",
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "kanban": {
+                    "repository_profiles": {
+                        "typed-malformed": {
+                            "coder": ["typed-coder"],
+                            "reviewer": {"profile": "typed-reviewer"},
+                            "base_ref": None,
+                            "merge_target": 7,
+                            "push_target": False,
+                            "signatures": [None, ["typed"], {"repo": "typed"}],
+                        },
+                        123: {
+                            "coder": "numeric-key-coder",
+                            "reviewer": "numeric-key-reviewer",
+                            "base_ref": "origin/main",
+                            "merge_target": "main",
+                            "push_target": "origin",
+                        },
+                    },
+                    "tenant_reviewers": {
+                        "null-reviewer": None,
+                        "collection-reviewer": ["reviewer"],
+                        123: "numeric-key-reviewer",
+                    },
+                    "tenant_workdirs": {
+                        "collection-workdir": ["/srv/workdir"],
+                        "mapping-workdir": {"path": "/srv/workdir"},
+                        456: "/srv/numeric-key",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    kb._reset_routing_config_cache()
+
+    routing = kb._load_routing_config()
+    assert set(routing.profiles) == {"typed-malformed"}
+    malformed = routing.profiles["typed-malformed"]
+    assert (
+        malformed.coder,
+        malformed.reviewer,
+        malformed.base_ref,
+        malformed.merge_target,
+        malformed.push_target,
+    ) == ("", "", "", "", "")
+    assert routing.signature_map == ()
+    assert routing.tenant_reviewers == {}
+    assert routing.tenant_workdirs == {}
+    with pytest.raises(kb.RepositoryProfileError, match="base_ref"):
+        kb.resolve_repository_profile(None, "typed-malformed")

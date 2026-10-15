@@ -9265,14 +9265,22 @@ def _routing_config_path() -> Path:
     return (root / "config.yaml").resolve()
 
 
+def _normalized_string(raw: Any, *, lowercase: bool = False) -> str:
+    """Return a stripped YAML string without coercing other scalar types."""
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    return value.lower() if lowercase else value
+
+
 def _normalized_string_map(raw: Any) -> dict[str, str]:
     """Normalize an operator map, dropping malformed/empty entries."""
     result: dict[str, str] = {}
     if not isinstance(raw, dict):
         return result
     for raw_key, raw_value in raw.items():
-        key = str(raw_key).strip().lower()
-        value = str(raw_value).strip()
+        key = _normalized_string(raw_key, lowercase=True)
+        value = _normalized_string(raw_value)
         if key and value:
             result[key] = value
     return result
@@ -9307,23 +9315,23 @@ def _load_routing_config() -> _RoutingConfig:
         for raw_name, spec in raw_profiles.items():
             if not isinstance(spec, dict):
                 continue
-            name = str(raw_name).strip().lower()
+            name = _normalized_string(raw_name, lowercase=True)
             if not name:
                 continue
             profiles[name] = RepositoryProfile(
                 name=name,
-                coder=str(spec.get("coder", "") or "").strip(),
-                reviewer=str(spec.get("reviewer", "") or "").strip(),
-                base_ref=str(spec.get("base_ref", "") or "").strip(),
-                merge_target=str(spec.get("merge_target", "") or "").strip(),
-                push_target=str(spec.get("push_target", "") or "").strip(),
+                coder=_normalized_string(spec.get("coder")),
+                reviewer=_normalized_string(spec.get("reviewer")),
+                base_ref=_normalized_string(spec.get("base_ref")),
+                merge_target=_normalized_string(spec.get("merge_target")),
+                push_target=_normalized_string(spec.get("push_target")),
             )
             raw_signatures = spec.get("signatures", ())
             if isinstance(raw_signatures, str):
                 raw_signatures = (raw_signatures,)
             if isinstance(raw_signatures, (list, tuple)):
                 for raw_signature in raw_signatures:
-                    signature = str(raw_signature).strip().lower()
+                    signature = _normalized_string(raw_signature, lowercase=True)
                     if signature:
                         signatures.append((signature, name))
     signatures.sort(key=lambda item: (-len(item[0]), item[0]))
