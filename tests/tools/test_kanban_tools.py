@@ -1046,6 +1046,125 @@ def test_block_allowed_for_specifier_prepared_go_on_reached_state(monkeypatch, w
     assert d.get("ok") is True
 
 
+_TECHNIK_BODY = (
+    "Generierungs-Artefakt: in SUMMARY- und PLAN-Dateien des S3-Backups taucht "
+    "ein verwaistes </content>-Tag auf. Ursache im Erzeuger finden und beheben.\n\n"
+    "Technik-Entscheidung (selbst treffen, im Kommentar begründen): Ob per Regex, "
+    "Parser oder Prompt-Aenderung am Erzeuger entscheidet die Fabrik selbst."
+)
+
+
+def test_block_rejected_for_technik_card_rueckfrage(monkeypatch, worker_env):
+    """F48: a technik card (body carries the 'Technik-Entscheidung (selbst
+    treffen …)' contract marker) must never be escalated with a Rückfrage — the
+    observer marks ANY blocked technik card ROT (rot-technik-rueckfrage, no
+    Zielfrage-Richter). Live probe Karte 19 't_18b885af' ('S3-Backup: Streu-Tag
+    </content> aus SUMMARY/PLAN entfernen'): the specifier blocked needs_input
+    with a goal-redefinition Rückfrage. The gate rejects it and steers the
+    fabric to decide the method itself and build to done."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen",
+            body=_TECHNIK_BODY, assignee="specifier", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("BRAUCHE KLÄRUNG: Soll das Ziel weiterhin „neue fehlerhafte "
+                  "PLAN-/SUMMARY-Artefakte am Erzeuger verhindern“ lauten und der "
+                  "externe Generator zugänglich gemacht werden, oder soll die "
+                  "Karte nur auf die einmalige Bereinigung der 23 Repo-Treffer "
+                  "umgeschnitten beziehungsweise geschlossen werden?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe Frage oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "TECHNIK card" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejected_for_technik_card_any_role(monkeypatch, worker_env):
+    """F48 is not role-scoped: a coder/reviewer Rückfrage on a technik card is
+    equally ROT, so the gate fires for every factory role."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="asyncio Event-Loop-Bug in Celery-Scheduled-Tasks",
+            body=_TECHNIK_BODY, assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block(
+        {"reason": "welche Lösung soll ich wählen?", "kind": "capability"}
+    )
+    d = json.loads(out)
+    assert "error" in d
+    assert "TECHNIK card" in d["error"]
+
+
+def test_block_allowed_for_technik_card_dependency_kind(monkeypatch, worker_env):
+    """F48 is scoped to the human-escalation kinds: `dependency` is machine
+    routing (→ todo), not a Rückfrage, so it stays ungated even on a technik
+    card (mirrors the observer, which only trips on a human blocked status)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="S3-Backup: Streu-Tag entfernen",
+            body=_TECHNIK_BODY, assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block(
+        {"reason": "file-conflict with running t_x", "kind": "dependency"}
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_block_allowed_for_non_technik_card(monkeypatch, worker_env):
+    """F48 must not catch an ordinary card without the technik marker: a genuine
+    human escalation on a non-technik card still blocks normally (checked with a
+    coder role, which carries no other human-block gate)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="coder hit a genuine external wall",
+            body="Normale Aufgabe ohne Technik-Entscheidungsmarker.",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a decision from Till", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_block_rejected_for_coder_internal_triage_comment(monkeypatch, worker_env):
     """F28: the repo coder may not escalate internal work-coordination. Live
     probe card t_9b6d4067 ('Ungenutzte Funktion leereTexte entfernen', klein,

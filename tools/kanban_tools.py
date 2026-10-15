@@ -665,6 +665,33 @@ def _block_is_unprepared_scope_demand(blob: str) -> bool:
     )
 
 
+# F48: a TECHNIK card (the Beobachter's ``k.art == "technik"``) must NEVER be
+# escalated with a Rückfrage. The observer's rule is categorical and has no
+# Zielfrage-Richter: ``k.art == "technik" and status == blocked`` → ROT
+# ("rot-technik-rueckfrage", befund "Frage haette die Fabrik selbst loesen
+# muessen"), regardless of who blocked, what kind, or whether a "?" is present.
+# A technik card is by definition a decision the fabric makes ITSELF and
+# justifies in a comment — there is no legitimate human-question path, so no
+# blocked technik card can ever go green (only done (a) or ready/review (c)).
+# The fabric injects the technik contract verbatim into the task body via
+# ``karte_body_fuer_fabrik()``: "Technik-Entscheidung (selbst treffen, im
+# Kommentar begründen): …". So a worker can recognise a technik card from its
+# own body without any board metadata. Live probe Karte 19 't_18b885af'
+# ("S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen", art=technik):
+# the specifier blocked needs_input with a goal-redefinition Rückfrage ("Soll
+# das Ziel weiterhin … lauten … oder nur die 23 Treffer bereinigen / wegen
+# falscher S3-Producer-Prämisse schliessen?") → rot-technik-rueckfrage. The F44
+# scope gate above is translation/enumeration-specific and does not catch this
+# shape; this gate mirrors the observer's technik rule directly at the worker.
+_TECHNIK_CARD_MARKER = "Technik-Entscheidung (selbst treffen"
+
+
+def _is_technik_card(body: str) -> bool:
+    """True when the card carries the Beobachter's technik-contract marker that
+    ``karte_body_fuer_fabrik`` injects into every ``art == "technik"`` card."""
+    return bool(body) and _TECHNIK_CARD_MARKER in body
+
+
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
 
@@ -1524,6 +1551,49 @@ def _handle_block(args: dict, **kw) -> str:
                 f"If the task is actually finished or cannot proceed for "
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
+            )
+        # Technik-card Rückfrage gate (F48). A technik card (body carries the
+        # "Technik-Entscheidung (selbst treffen …)" contract marker the fabric
+        # injects for every art=technik card) must NEVER be escalated with a
+        # Rückfrage: the Beobachter marks ANY blocked technik card ROT
+        # ("rot-technik-rueckfrage", befund "Frage haette die Fabrik selbst
+        # loesen muessen") with no Zielfrage-Richter and no legitimate human
+        # path. The technik_hinweis spells out exactly which decision the fabric
+        # owns (e.g. "Ob per Regex, Parser oder Prompt-Aenderung am Erzeuger
+        # entscheidet die Fabrik selbst"); a question about it is categorically
+        # illegitimate. So reject the human-block for EVERY factory role (not
+        # just the scope-owning two — a coder/reviewer Rückfrage on a technik
+        # card is equally ROT), scoped to the human-escalation kinds so genuine
+        # machine routing (``dependency`` → todo) stays untouched. Worker-side
+        # (re-imported per spawn), live on the next spawn without a gateway
+        # restart (cf. F19). Live probe Karte 19 't_18b885af'.
+        if (
+            task
+            and kind in _HUMAN_BLOCK_KINDS
+            and _is_technik_card(task.body or "")
+        ):
+            conn.close()
+            return tool_error(
+                "this is a TECHNIK card — the body carries the 'Technik-"
+                "Entscheidung (selbst treffen, im Kommentar begründen)' "
+                "contract. ANY Rückfrage/human block on a technik card is "
+                "categorically ROT at the observer (rot-technik-rueckfrage, "
+                "'Frage haette die Fabrik selbst loesen muessen'): there is no "
+                "Zielfrage-Richter and no legitimate human-question path, so a "
+                "blocked technik card can NEVER go green. The decision the card "
+                "names (e.g. per Regex, Parser oder Prompt-Änderung am Erzeuger) "
+                "is yours to make and justify in a kanban comment — not the "
+                "owner's. Even when recon suggests the premise is off (the "
+                "generator looks external / the source seems inaccessible), the "
+                "in-repo artefact-WRITE boundary that persists the SUMMARY/PLAN "
+                "files is reachable: pick the method yourself, write the test "
+                "from fertig_heisst (a sample artefact that is RED before the "
+                "fix and GREEN after), apply the guard/filter at that boundary, "
+                "and drive the ONE card to done — orchestrator/specifier via "
+                "kanban_handoff to the <repo>-coder, coder pushes wt/<id> and "
+                "hands to the reviewer who completes it. Do NOT re-cut the goal "
+                "with a human question, and do NOT ask the owner to decide which "
+                "goal applies; resolve it and finish."
             )
         # Unprepared-scope-demand block gate (F44, sibling of the F23/F24/F43
         # scope gates). A specifier or orchestrator that cannot mechanically
