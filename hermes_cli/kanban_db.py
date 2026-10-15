@@ -1625,6 +1625,32 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+class KanbanWriteHalted(RuntimeError):
+    """Raised when a board-scoped write-halt flag (``<db>.halt``) is present.
+
+    The kanban canary (``kanban_canary.sh``) drops this flag on detected
+    corruption so that EVERY serialised writer — CLI subcommands, the
+    voicera-api bridge, and the in-process worker tools — refuses to touch
+    the file instead of piling more WAL frames onto an already-malformed DB.
+    Closes the 2026-10-14 post-halt re-corruption (docs §11/§12): after the
+    first alarm, un-halted writers kept committing and re-quarantined the DB
+    in a second burst. Cleared by removing the flag file.
+    """
+
+
+def dispatch_halt_path(db_path: Path) -> Path:
+    """Path of the board-scoped write-halt flag for *db_path* (``<db>.halt``)."""
+    return db_path.with_name(db_path.name + ".halt")
+
+
+def dispatch_halt_active(db_path) -> bool:
+    """True when the board's ``<db>.halt`` flag exists (canary corruption guard)."""
+    try:
+        return dispatch_halt_path(Path(db_path)).exists()
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def write_serialize_lock(db_path: Path, timeout: float = 10.0):
     """Blocking cross-process single-writer lock for EXTERNAL writers.
@@ -1645,7 +1671,16 @@ def write_serialize_lock(db_path: Path, timeout: float = 10.0):
 
     Yields ``True`` when the lock is held, ``False`` when it proceeded without
     it (timeout, open failure, or unavailable primitive).
+
+    Refuses outright (raises :class:`KanbanWriteHalted`) when the board's
+    ``<db>.halt`` flag is present, so a canary-detected corruption stops every
+    serialised writer from touching the file instead of re-quarantining it.
     """
+    if dispatch_halt_active(db_path):
+        raise KanbanWriteHalted(
+            f"kanban writes halted: {dispatch_halt_path(db_path).name} present "
+            f"(canary corruption guard) — remove the flag to resume writes."
+        )
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
     acquired = False
@@ -8925,6 +8960,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    halted: bool = False
+    """True when this tick was skipped because the board's ``<db>.halt`` flag
+    is present (canary corruption guard, docs §12). No spawn and no DB writes
+    happen while halted; the daemon keeps looping and auto-resumes the tick
+    once the flag is removed."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11504,6 +11544,11 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+# Per-db-path dedup for the "dispatch halted" warning so a long canary halt
+# logs once per transition instead of every tick. Cleared when the flag clears.
+_DISPATCH_HALT_LOGGED: "dict[str, bool]" = {}
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -11552,6 +11597,22 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    # Canary corruption guard (docs §12): a board whose ``<db>.halt`` flag is
+    # set must not spawn or write this tick — the first guard after the
+    # dispatcher's own single-writer lock. The daemon keeps looping and
+    # resumes automatically once the flag is cleared. Logged once per
+    # transition so a long halt does not spam the journal.
+    if dispatch_halt_active(db_path):
+        key = str(db_path)
+        if not _DISPATCH_HALT_LOGGED.get(key):
+            _log.warning(
+                "kanban dispatch halted: %s present — skipping ticks "
+                "(no spawn, no DB writes) until the flag is removed.",
+                dispatch_halt_path(db_path).name,
+            )
+            _DISPATCH_HALT_LOGGED[key] = True
+        return DispatchResult(halted=True)
+    _DISPATCH_HALT_LOGGED.pop(str(db_path), None)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)

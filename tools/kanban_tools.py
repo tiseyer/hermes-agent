@@ -28,6 +28,8 @@ through the board.
 """
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import logging
 import os
@@ -195,6 +197,48 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
+def _write_locked(handler):
+    """Serialise a board-MUTATING tool handler on ``<db>.dispatch.lock``.
+
+    These tools run IN the worker's Python process and write ``kanban.db``
+    directly via ``kanban_db`` (see module docstring) — a third writer class
+    next to the gateway dispatcher and the voicera-api bridge. Before the
+    2026-10-14 fast-follow (docs §12) they took no cross-process lock, so a
+    worker's ``kanban_comment``/``complete``/… could commit WAL frames
+    concurrently with the dispatcher and corrupt the file. We now take the
+    SAME ``write_serialize_lock`` the CLI dispatch (``kanban.py``) and the
+    bridge already use.
+
+    Wrapped at the registry boundary (not inside each handler) so the lock
+    covers only the tool-call entry point: a handler that internally calls
+    another ``kanban_db`` helper cannot re-enter the flock on a second fd and
+    self-deadlock. The worker never holds ``_dispatch_tick_lock`` (that is the
+    gateway), so there is no cross-lock deadlock either — this mirrors the
+    CLI wrapper that has run in production since 2026-10-14.
+
+    If the board's ``<db>.halt`` canary flag is set, ``write_serialize_lock``
+    raises ``KanbanWriteHalted``; we surface that as a structured tool error
+    so the worker gets a clean refusal instead of crashing or corrupting.
+    """
+    @functools.wraps(handler)
+    def _locked(args, **kw):
+        from hermes_cli import kanban_db as kb
+        board = args.get("board") if isinstance(args, dict) else None
+        cm = contextlib.nullcontext()
+        if hasattr(kb, "write_serialize_lock"):
+            try:
+                cm = kb.write_serialize_lock(kb.kanban_db_path(board=board))
+            except Exception:
+                cm = contextlib.nullcontext()
+        halt_exc = getattr(kb, "KanbanWriteHalted", ())
+        try:
+            with cm:
+                return handler(args, **kw)
+        except halt_exc as exc:  # type: ignore[misc]
+            return tool_error(str(exc))
+    return _locked
+
+
 # 'review' is deliberately allowed: the review handoff is not an escape
 # hatch from the goal loop — it routes to the reviewer whose approval
 # goes through the done-verification gate. Rejecting it forced coders
@@ -270,6 +314,43 @@ _CODER_SPEC_DEFECT_RE = re.compile(
     r"|\bwiderspr|\bfehlerhaft|\bstimmt\s+nicht\b|\bnicht\s+korrekt\b"
     r"|erneut\s+an\s+den\s+coder"
     r"|zur[üu]ck\s+an\s+(?:den\s+)?(?:specifier|spezifizierer)",
+    re.IGNORECASE,
+)
+
+# F47 recurrence (Karte 20, t_613a9edd 'Test-Werkzeuge im Frontend auf
+# Patch-Stand heben', klein, erwartung=done): voicera-coder hit two
+# self-identified, WITHIN-SCOPE tooling obstacles and blocked the card with a
+# HALT that is a technical conflict report, not a business Zielfrage — so the
+# observer saw the question-less blocked done-card as
+# rot-infra-eskalation-ohne-frage (the F37 2a symptom, here from a build-
+# toolchain wall). The two obstacles:
+#   1. The range selector ``postcss@^8.5.29`` resolved to the newest in-range
+#      patch (8.5.30) instead of the exact lock the criterion names. The fix
+#      the coder NAMED in its own falsification — ``npm install postcss@8.5.29``
+#      (exact CLI selector still writes the caret manifest spec but locks the
+#      exact version) — is the correct in-scope technique, not an "Ausweichen".
+#   2. A stale install tree tripped an npm Arborist resolver crash
+#      (``TypeError: Cannot read properties of null (reading 'edgesOut')``),
+#      which a clean ``npm ci`` (rebuild node_modules from the lockfile) clears.
+# The coder refused to try either, reading the Bauauftrag's "nicht ausweichen"
+# HALT over-literally. A package-manager resolver crash, a peer-dep/lockfile
+# conflict, or a caret-vs-exact version-resolution mismatch is BUILD TECHNIQUE
+# the coder adjusts itself within the given scope — never a human decision
+# (Till never sees npm resolver output and cannot answer it). Mirror the
+# observer's necessary condition in code: a coder human-block whose content is
+# a pure build/dependency-tooling wall (the ``_BUILD_GATED_RE`` domain AND the
+# resolve/install-failure vocabulary below) with NO business Zielfrage anywhere
+# (``_letzte_frage`` empty) is rejected and steered back to the coder's own
+# build, not parked at a human. The two signals are AND-ed (like F32/F37) and
+# gated on the empty-Zielfrage precondition so a genuine business/Freigabe
+# block that merely mentions a tool keeps its human-wall path. Scoped to repo
+# coders + human-escalation kinds, worker-side (re-imported per spawn), live on
+# the next coder spawn with no gateway restart (cf. F19).
+_CODER_TOOLING_WALL_RE = re.compile(
+    r"\barborist\b|edgesout|\bresolver\b|resolv\w*fehler"
+    r"|peer[-\s]?dep|legacy-peer-deps|lockfile|package[-\s]?lock"
+    r"|caret|zielversion|nicht\s+exakt|exakt\s+auf"
+    r"|cannot\s+read\s+propert|\btypeerror\b",
     re.IGNORECASE,
 )
 
@@ -2065,6 +2146,53 @@ def _handle_block(args: dict, **kw) -> str:
                     "completes the card. Only block for a genuine business/"
                     "Freigabe decision that is Till's to make."
                 )
+            # F47 recurrence (Karte 20, t_613a9edd): a coder human-block whose
+            # content is a pure BUILD/DEPENDENCY-TOOLING wall — a package
+            # resolver crash, a peer-dep/lockfile conflict, or a caret-vs-exact
+            # version-resolution mismatch — with NO business Zielfrage anywhere
+            # (``frage`` empty, the observer's ``_letzte_frage`` condition for
+            # rot-infra-eskalation-ohne-frage). Such an obstacle is build
+            # technique the coder resolves itself within scope, not a human
+            # escalation. Two signals AND-ed (build domain + resolve/install
+            # failure) so a genuine business block that merely mentions a tool,
+            # or a question-bearing Zielfrage, keeps its human-wall path.
+            if (
+                not frage
+                and _BUILD_GATED_RE.search(spec_blob)
+                and _CODER_TOOLING_WALL_RE.search(spec_blob)
+            ):
+                conn.close()
+                return tool_error(
+                    "this is a within-scope BUILD/DEPENDENCY-TOOLING obstacle, "
+                    "not a human escalation. The card carries no business "
+                    "Zielfrage (no \"?\"), so the observer reads the "
+                    "question-less blocked done-card as "
+                    "rot-infra-eskalation-ohne-frage (\"Worker beenden sich "
+                    "rc=0 ohne terminalen kanban_complete/kanban_block\"). A "
+                    "package resolver crash, a peer-dep or lockfile conflict, "
+                    "or a caret-vs-exact version-resolution mismatch is build "
+                    "TECHNIQUE you adjust yourself within the given scope — it "
+                    "is NOT a Soll/Ist-Abweichung to HALT on and NOT a decision "
+                    "for Till (he never sees npm resolver output and cannot "
+                    "answer it). Resolve it on your own wt/<id>: pin with the "
+                    "EXACT CLI version selector (e.g. `npm install "
+                    "postcss@8.5.29`, which still writes the caret manifest "
+                    "spec `^8.5.29` but locks the exact 8.5.29) instead of "
+                    "letting a range selector pick the newest in-range patch; "
+                    "if a stale tree trips an Arborist resolver crash "
+                    "(`Cannot read properties of null (reading 'edgesOut')`), "
+                    "run a clean `npm ci` first to rebuild node_modules from "
+                    "the lockfile, then re-run the exact-selector install. Do "
+                    "NOT reach for a forbidden shortcut (--legacy-peer-deps, an "
+                    "extra package change, test weakening) — the exact selector "
+                    "is the correct in-scope method, not an Ausweichen. Build, "
+                    "commit, push wt/<id>, and hand to the reviewer "
+                    "(kanban_block(kind=\"review\")); a build-gated frontend "
+                    "card then terminates at the merger, which reproduces the "
+                    "real npm ci/tsc/build in the checkout. Only block for a "
+                    "genuine business/Freigabe decision that is Till's to make, "
+                    "stated as a question in a comment."
+                )
         try:
             ok = kb.block_task(
                 conn, tid,
@@ -3527,7 +3655,7 @@ registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
-    handler=_handle_complete,
+    handler=_write_locked(_handle_complete),
     check_fn=_check_kanban_mode,
     emoji="✔",
 )
@@ -3536,7 +3664,7 @@ registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
-    handler=_handle_block,
+    handler=_write_locked(_handle_block),
     check_fn=_check_kanban_mode,
     emoji="⏸",
 )
@@ -3545,7 +3673,7 @@ registry.register(
     name="kanban_handoff",
     toolset="kanban",
     schema=KANBAN_HANDOFF_SCHEMA,
-    handler=_handle_handoff,
+    handler=_write_locked(_handle_handoff),
     check_fn=_check_kanban_mode,
     emoji="➡",
 )
@@ -3554,7 +3682,7 @@ registry.register(
     name="kanban_heartbeat",
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
-    handler=_handle_heartbeat,
+    handler=_write_locked(_handle_heartbeat),
     check_fn=_check_kanban_mode,
     emoji="💓",
 )
@@ -3563,7 +3691,7 @@ registry.register(
     name="kanban_comment",
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
-    handler=_handle_comment,
+    handler=_write_locked(_handle_comment),
     check_fn=_check_kanban_mode,
     emoji="💬",
 )
@@ -3572,7 +3700,7 @@ registry.register(
     name="kanban_attach",
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
-    handler=_handle_attach,
+    handler=_write_locked(_handle_attach),
     check_fn=_check_kanban_mode,
     emoji="📎",
 )
@@ -3581,7 +3709,7 @@ registry.register(
     name="kanban_attach_url",
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
-    handler=_handle_attach_url,
+    handler=_write_locked(_handle_attach_url),
     check_fn=_check_kanban_mode,
     emoji="📎",
 )
@@ -3599,7 +3727,7 @@ registry.register(
     name="kanban_create",
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
-    handler=_handle_create,
+    handler=_write_locked(_handle_create),
     check_fn=_check_kanban_mode,
     emoji="➕",
 )
@@ -3608,7 +3736,7 @@ registry.register(
     name="kanban_unblock",
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
-    handler=_handle_unblock,
+    handler=_write_locked(_handle_unblock),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
@@ -3617,7 +3745,7 @@ registry.register(
     name="kanban_link",
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
-    handler=_handle_link,
+    handler=_write_locked(_handle_link),
     check_fn=_check_kanban_mode,
     emoji="🔗",
 )
