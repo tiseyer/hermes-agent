@@ -273,6 +273,18 @@ def test_dependency_go_released_then_parent_reblocks_other_gate_promotes_child(
         # GO decision stands despite the later push-gate block ⇒ child promotes.
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
+        # …and the structural spawn gate must AGREE with the promotion path.
+        # Before the fix, get_spawn_rejection_reason used a raw
+        # status-NOT-IN-('done','archived') check and returned
+        # "parents_not_done" for the GO-released-then-reblocked parent, so the
+        # dispatcher's claim path demoted the child ready→todo every tick while
+        # recompute_ready re-promoted it — a todo↔ready bounce that never spawns
+        # and tripped the Beobachter's rot-stuck frist (live repro: Karte 33
+        # t_5772dbbd behind t_d991a49d).
+        assert kb.get_spawn_rejection_reason(conn, child) is None
+        # The atomic claim must succeed and keep the child out of todo.
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.get_task(conn, child).status == "running"
 
 
 def test_dependency_go_reheld_keeps_child_waiting(kanban_home: Path) -> None:

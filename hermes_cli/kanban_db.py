@@ -4877,13 +4877,28 @@ def get_spawn_rejection_reason(
     # Roots are visible projections of work children, never workers.
     if row["family_root_id"] == task_id:
         return "family_root"
-    undone = conn.execute(
-        "SELECT 1 FROM task_links l "
+    # A parent gates its child until it is *satisfied*. "Satisfied" is NOT the
+    # same as "done/archived": a GO-gate Freigabe/merge parent (category
+    # ``go_noetig``) never reaches a terminal column on the factory's own, yet
+    # the human GO it carries IS the decision the child waited on (F41). Use the
+    # exact predicate ``recompute_ready`` promotes on — :func:`_dependency_parent_satisfied`
+    # — so this gate and the promotion path can never disagree. The raw
+    # ``status NOT IN ('done','archived')`` check used to here answered
+    # "parents_not_done" for a GO-released ``go_noetig`` parent that re-blocked
+    # on an unrelated downstream gate (push-approval ``capability``), while
+    # ``recompute_ready`` kept the child in ``ready``; the dispatcher's claim
+    # path then demoted it ready→todo every tick and recompute re-promoted it —
+    # a todo↔ready bounce that never spawns and trips the Beobachter's
+    # ``rot-stuck`` frist (live repro: Karte 33 ``t_5772dbbd`` behind
+    # ``t_d991a49d`` "Freigabe: Frontend-Lint-Konfiguration übernehmen").
+    parents = conn.execute(
+        "SELECT p.id AS pid, p.status AS pstatus, p.category AS pcategory "
+        "FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "WHERE l.child_id = ?",
         (task_id,),
-    ).fetchone()
-    if undone:
+    ).fetchall()
+    if not all(_dependency_parent_satisfied(conn, p) for p in parents):
         return "parents_not_done"
     return None
 
