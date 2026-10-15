@@ -414,6 +414,42 @@ _DB_ENGINE_NEXUS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# F49 (befund carried the stale label F46; the real card is the Karte-19 recurrence
+# after F47/F48, task t_d5ca2c82). A reviewer completed a repo work card `done`
+# while the full acceptance surface could NOT be verified read-only because a
+# required container/backend-integration environment is missing — the coder/reviewer
+# themselves admit it in the thread (live probe: coder "der vollständige `make test`
+# … stoppt am Backend-Schritt, weil auf diesem Worker kein docker-Binary vorhanden
+# ist (`make: docker: No such file or directory`, Exit 127)"; reviewer "Docker fehlt
+# auf dem Reviewer-Worker, daher kein vollständiges make test"). The Beobachter's own
+# `fertig_heisst.shell` for the card is `cd backend && pytest -k …`, which ALSO dies
+# in the env-less check-worktree — collecting `backend/tests/` boots `app.database`'s
+# async engine, ModuleNotFoundError aiosqlite — so Regel a can never green (shell=ROT
+# every re-check) exactly as in F21/F30/F31. This is the same "done ohne vollständige
+# Abnahme" class, but the gap is a DOCKER/compose/backend-service one that the F30
+# (frontend), F31 (app-import) and F21 (DB-less pytest) signals don't carry; the
+# acceptance command itself (`cd backend && pytest`) never reaches the factory (it is
+# Beobachter-side `fertig_heisst.shell`), so the only reliable signal is the factory's
+# own admission that it could not run the full/backend acceptance read-only. Two
+# co-occurring signals are required (like F21) so an ordinary card that merely names
+# docker in passing keeps the honest Regel-a `done` path: a container/backend-
+# integration token AND an explicit unavailability of that environment.
+_CONTAINER_INTEGRATION_RE = re.compile(
+    r"(?:\bdocker\b|docker[-\s]?compose\b|\bmake\s+test\b"
+    r"|backend[-\s]?schritt|backend\s+step|\btestcontainers?\b|\baiosqlite\b)",
+    re.IGNORECASE,
+)
+_INTEGRATION_UNAVAILABLE_RE = re.compile(
+    r"(?:no\s+such\s+file|command\s+not\s+found|\bexit\s*(?:code\s*)?127\b"
+    r"|no\s+module\s+named\s+['\"]?aiosqlite"
+    r"|kein(?:e|en)?\s+(?:docker|vollst(?:ae|ä)ndige[rs]?\s+make[-\s]?test)"
+    r"|docker[^\n]{0,24}(?:fehlt|nicht\s+(?:vorhanden|verf(?:ue|ü)gbar|installiert))"
+    r"|(?:fehlt|nicht\s+(?:vorhanden|verf(?:ue|ü)gbar|installiert))[^\n]{0,24}docker"
+    r"|kein\s+vollst(?:ae|ä)ndige[rs]?\s+make[-\s]?test"
+    r"|(?:make\s+test|backend)[^\n]{0,30}(?:stopp|abbr|unvollst(?:ae|ä)ndig))",
+    re.IGNORECASE,
+)
+
 
 def _is_reviewer_profile(profile: Optional[str]) -> bool:
     """True when the current worker profile is a code reviewer.
@@ -458,6 +494,19 @@ def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bo
         _PYTEST_ACCEPTANCE_RE.search(blob)
         and _APP_PACKAGE_PATH_RE.search(blob)
         and _DB_ENGINE_NEXUS_RE.search(blob)
+    ):
+        return True
+    # F49: the full/backend acceptance surface is container/integration-gated and
+    # the factory's own thread admits it could not be verified read-only (no docker
+    # binary → `make test` aborts at the backend step, Exit 127; or the backend
+    # pytest collection boots the DB engine the env-less venv can't provision). The
+    # Beobachter re-runs the env-gated acceptance (`cd backend && pytest …`) and gets
+    # the identical gap, so Regel a stays ROT — the honest terminal is the merger
+    # (real checkout WITH docker/compose and the real .env). Two signals so a card
+    # that merely mentions docker keeps the honest done path.
+    if (
+        _CONTAINER_INTEGRATION_RE.search(blob)
+        and _INTEGRATION_UNAVAILABLE_RE.search(blob)
     ):
         return True
     return False

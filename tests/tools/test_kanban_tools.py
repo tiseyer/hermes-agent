@@ -3917,6 +3917,90 @@ def test_card_not_build_gated_for_static_helper_pytest():
     ) is False
 
 
+# ---------------------------------------------------------------------------
+# F49: the full/backend acceptance is container/integration-gated and the factory
+# admits it could not verify it read-only (no docker → `make test` aborts at the
+# backend step, Exit 127). The Beobachter's `cd backend && pytest` acceptance dies
+# the same way, so Regel a stays ROT — route to the merger like F21/F30/F31.
+# ---------------------------------------------------------------------------
+
+def test_card_is_build_gated_docker_integration_gap():
+    """The live probe t_d5ca2c82 (Karte 19 recurrence): the factory built a real
+    fix but the full `make test` could not run because the worker has no docker
+    binary, and the reviewer admits the same — a self-`done` is 'done ohne
+    vollständige Abnahme'. Must route to the merger."""
+    from tools import kanban_tools as kt
+    title = "S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen"
+    body = (
+        "Generierungs-Artefakt in SUMMARY/PLAN. Technik-Entscheidung (selbst "
+        "treffen, im Kommentar begruenden): per Regex, Parser oder Prompt."
+    )
+    comments = [
+        "Offen/unverifiziert: der vollstaendige `make test` stoppt am "
+        "Backend-Schritt, weil kein docker-Binary vorhanden ist "
+        "(`make: docker: No such file or directory`, Exit 127).",
+        "Docker fehlt auf dem Reviewer-Worker, daher kein vollstaendiges "
+        "make test; nur der fokussierte Gate-Lauf wurde reproduziert.",
+    ]
+    assert kt._card_is_build_gated(title, body, comments) is True
+
+
+def test_card_not_build_gated_for_incidental_docker_mention():
+    """A card that merely names docker/make-test in passing, with every test green
+    and no unavailability admission, keeps the honest Regel-a `done` path — both
+    F49 signals are required."""
+    from tools import kanban_tools as kt
+    assert kt._card_is_build_gated(
+        "Doku: Entwickler-Setup",
+        "Beschreibe wie man `docker compose up` und `make test` lokal startet.",
+        ["REVIEW GRUEN: Doku ergaenzt, alle Tests gruen, make test 12 passed"],
+    ) is False
+
+
+def test_reviewer_routes_docker_gated_card_to_merger(monkeypatch, worker_env):
+    """End-to-end (F49): the reviewer completing the container/integration-gated
+    card hands the branch to `ready @ merger` instead of a doomed self-`done`."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen",
+            body=(
+                "Generierungs-Artefakt in SUMMARY/PLAN. Technik-Entscheidung "
+                "(selbst treffen, im Kommentar begruenden)."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/review",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=(
+                "Offen/unverifiziert: der vollstaendige `make test` stoppt am "
+                "Backend-Schritt, weil kein docker-Binary vorhanden ist "
+                "(`make: docker: No such file or directory`, Exit 127)."
+            ),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRUEN - fokussierter Gate-Lauf 9 passed"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("assignee") == "merger"
+    assert d.get("status") == "ready"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.assignee == "merger"
+    finally:
+        conn.close()
+
+
 def test_reviewer_routes_db_less_backend_pytest_to_merger(monkeypatch, worker_env):
     """End-to-end: the reviewer completing the env-gated DB-less pytest card does
     not land `done` (which would be shell=ROT every re-check); it hands the
