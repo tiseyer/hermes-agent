@@ -3920,6 +3920,79 @@ def test_block_allowed_for_coder_business_wall_mentioning_criterion(monkeypatch,
     assert d.get("ok") is True
 
 
+def test_block_rejected_for_coder_build_tooling_wall(monkeypatch, worker_env):
+    """F47 recurrence (Karte 20, t_613a9edd 'Test-Werkzeuge im Frontend auf
+    Patch-Stand heben', erwartung=done): voicera-coder blocked a done-card with a
+    HALT that is a pure build/dependency-tooling report — a caret selector
+    (``postcss@^8.5.29``) resolving to the newest in-range patch instead of the
+    exact lock, plus an npm Arborist resolver crash (``Cannot read properties of
+    null (reading 'edgesOut')``). No '?' anywhere, so the beobachter extracts no
+    frage and classes the question-less blocked done-card as
+    rot-infra-eskalation-ohne-frage. A resolver crash / version-resolution
+    mismatch is within-scope build technique (exact CLI selector + clean
+    ``npm ci``), never a human decision. The gate rejects the block and steers
+    the coder to resolve it and proceed to the reviewer (keeping the card
+    running)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Test-Werkzeuge im Frontend auf Patch-Stand heben",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": ("HALT: Der Lockfile-Update-Aufruf fuer postcss@^8.5.29 loeste "
+                   "wegen des Caret-Selectors auf 8.5.30 statt exakt 8.5.29 auf; "
+                   "der Dev-Aufruf brach mit einem npm-Arborist-Resolverfehler "
+                   "TypeError: Cannot read properties of null (reading "
+                   "'edgesOut') ab."),
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "BUILD/DEPENDENCY-TOOLING" in d["error"]
+    assert "npm ci" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_for_coder_business_wall_mentioning_npm(monkeypatch, worker_env):
+    """F47 must not swallow a genuine business block that merely mentions a build
+    tool: a real Freigabe question (carries a '?') still passes to the
+    beobachter's richter even when it references npm/frontend."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Frontend-Tooling heben",
+            assignee="voicera-coder", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=("Build gruen, npm ci sauber. Brauche Klaerung: soll das neue "
+                  "Frontend-Paket fuer die Live-Kundeninstanz WiCo freigegeben "
+                  "werden?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need a Freigabe decision from Till", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 # ---------------------------------------------------------------------------
 # F21: a DB-less backend pytest targeting the importable app package is
 # env-gated in the Beobachter venv (collection boots app.database's async
