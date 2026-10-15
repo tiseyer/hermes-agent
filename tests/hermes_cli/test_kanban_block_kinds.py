@@ -228,6 +228,87 @@ def test_dependency_go_held_parent_keeps_child_waiting(kanban_home: Path) -> Non
         assert kb.get_task(conn, child).status == "todo"
 
 
+def test_dependency_go_released_then_parent_reblocks_other_gate_promotes_child(
+    kanban_home: Path,
+) -> None:
+    """GO released, parent later re-blocks on an UNRELATED gate ⇒ child promotes.
+
+    F41 recurrence (live repro: child t_e5183b37 ↦ parent t_d991a49d): the
+    go_noetig parent's GO was granted (unblock), then the parent re-blocked on
+    a *different* downstream gate — a ``capability`` push-approval block
+    ("Push-Gate verlangt externe Approval"). The strict last-event predicate
+    flipped back to ``blocked`` and the child starved in ``todo`` until the
+    Beobachter tripped ``rot-stuck``. The child's dependency was the GO
+    *decision*, which was made; a subsequent non-go_noetig re-block on the
+    parent must not re-gate it.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="Freigabe: config", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait Freigabe", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', category='go_noetig' "
+                "WHERE id=?", (parent,)
+            )
+            # The GO gate stamps category in the block-event payload (as the
+            # F45 reroute does live), so the decision-aware predicate can find
+            # it among later, unrelated blocks.
+            kb._append_event(
+                conn, parent, "blocked",
+                {"kind": "needs_input", "category": "go_noetig",
+                 "reason": "Merge-GO nötig"},
+            )
+        assert kb.unblock_task(conn, parent)
+        # Parent now hits a SEPARATE downstream gate on its own execution.
+        kb.claim_task(conn, parent, claimer="worker")
+        assert kb.block_task(
+            conn, parent,
+            reason="Push-Gate verlangt externe Approval für git push",
+            kind="capability",
+        )
+        assert kb.get_task(conn, parent).status != "done"
+        # GO decision stands despite the later push-gate block ⇒ child promotes.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_dependency_go_reheld_keeps_child_waiting(kanban_home: Path) -> None:
+    """A FRESH go_noetig re-hold after an unblock re-gates the child.
+
+    Distinguishes the decision-aware predicate from "any later unblock wins":
+    if the parent's most recent ``go_noetig`` block has no ``unblocked`` after
+    it, the new GO is genuinely unmade and the child must keep waiting.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="Freigabe: config", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait Freigabe", kind="dependency")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', category='go_noetig' "
+                "WHERE id=?", (parent,)
+            )
+            # First GO granted …
+            kb._append_event(
+                conn, parent, "blocked",
+                {"kind": "needs_input", "category": "go_noetig"},
+            )
+        assert kb.unblock_task(conn, parent)
+        # … then a NEW go_noetig hold with no unblock since → decision unmade.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (parent,))
+            kb._append_event(
+                conn, parent, "blocked",
+                {"kind": "needs_input", "category": "go_noetig"},
+            )
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+
 # ---------------------------------------------------------------------------
 # F43 dependency-recut convergence ceiling
 # ---------------------------------------------------------------------------

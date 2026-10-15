@@ -4720,10 +4720,12 @@ def _dependency_parent_satisfied(
     card sequenced behind such a parent would therefore starve in ``todo``
     until the Beobachter's frist trips ``rot-stuck`` (live repro: Karte 33
     ``t_c2a3f4da`` waited on ``t_d991a49d`` = "Freigabe: Frontend-Lint-
-    Konfiguration übernehmen"). The human's explicit unblock
-    (:func:`_go_gate_released`) IS the decision the child was waiting on, so a
-    GO-released ``go_noetig`` parent counts as satisfied. A ``go_noetig`` parent
-    still awaiting GO (held, not released) keeps gating the child — the
+    Konfiguration übernehmen"). The human's explicit GO unblock
+    (:func:`_go_gate_decision_released`) IS the decision the child was waiting
+    on, so a GO-released ``go_noetig`` parent counts as satisfied — even if the
+    parent later re-blocks on an UNRELATED downstream gate (e.g. a push-approval
+    ``capability`` block). A ``go_noetig`` parent still awaiting its GO (held, or
+    freshly re-held with a new ``go_noetig`` block) keeps gating the child — the
     decision genuinely isn't made yet.
     """
     status = parent_row["pstatus"]
@@ -4734,7 +4736,9 @@ def _dependency_parent_satisfied(
         if "pcategory" in parent_row.keys()
         else ""
     )
-    if category == "go_noetig" and _go_gate_released(conn, parent_row["pid"]):
+    if category == "go_noetig" and _go_gate_decision_released(
+        conn, parent_row["pid"]
+    ):
         return True
     return False
 
@@ -10819,6 +10823,53 @@ def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchone()
     return bool(row) and row["kind"] == "unblocked"
+
+
+def _go_gate_decision_released(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the *GO decision* on a ``go_noetig`` card has been released.
+
+    :func:`_go_gate_released` asks the stricter question — "is the card's
+    most recent ``blocked``/``unblocked`` event an ``unblocked``" — which a
+    card that got its GO and then re-blocked for an UNRELATED downstream gate
+    answers ``False``. For a dependency child sequenced behind the GO
+    *decision* that is wrong: the decision the child waited on WAS made (the
+    ``unblocked`` after the ``go_noetig`` block); the parent later hitting a
+    different gate on its own execution must not re-starve the child.
+
+    Live repro (F41 recurrence): child ``t_e5183b37`` waited on parent
+    ``t_d991a49d`` ("Freigabe: Frontend-Lint-Konfiguration übernehmen") whose
+    ``go_noetig`` GO was released (``unblocked``), after which the parent
+    re-blocked on a ``capability`` push-approval gate ("Push-Gate verlangt
+    externe Approval"). The strict predicate flipped back to ``False`` and
+    the child starved in ``todo`` until the Beobachter's frist tripped
+    ``rot-stuck`` — even though its GO decision was long since granted.
+
+    Released iff an ``unblocked`` event fired AFTER the most recent
+    ``go_noetig`` ``blocked`` event. A fresh ``go_noetig`` re-hold (a NEW GO
+    genuinely required) therefore re-gates the child; a non-``go_noetig``
+    re-block does not. With no ``go_noetig`` block on record, fall back to the
+    strict predicate so nothing is loosened for ordinary cards.
+    """
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    go_block_id = None
+    for r in rows:
+        if r["kind"] != "blocked":
+            continue
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else {}
+        except (ValueError, TypeError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("category") == "go_noetig":
+            go_block_id = r["id"]
+            break
+    if go_block_id is None:
+        return _go_gate_released(conn, task_id)
+    return any(r["kind"] == "unblocked" and r["id"] > go_block_id for r in rows)
 
 
 # Tenant → reviewer profile routing and the repository profile registry are
