@@ -4167,3 +4167,57 @@ def test_complete_rejected_for_premise_noop_card(monkeypatch, worker_env):
         assert kb.get_task(conn, tid).status == "running"
     finally:
         conn.close()
+
+
+def test_complete_technik_noop_routes_to_merger(monkeypatch, worker_env):
+    """F46 (Karte-19 recurrence): a TECHNIK card completed as a no-op must NOT be
+    steered to kanban_block (the F47 escalation) — a blocked technik card is
+    categorically ROT at the observer (rot-technik-rueckfrage) and the F48 gate
+    rejects that very block, so the reviewer would deadlock. For a technik card
+    the only reachable green terminal is `ready @ merger` (Regel c): route the
+    contested premise there as a Freigabe/Entscheid instead of blocking."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="S3-Backup: Streu-Tag </content> aus SUMMARY/PLAN entfernen",
+            body=(
+                "Generierungs-Artefakt: Streu-Tag in SUMMARY/PLAN. Ursache im "
+                "Erzeuger finden und beheben.\n\nTechnik-Entscheidung (selbst "
+                "treffen, im Kommentar begründen): Ob per Regex, Parser oder "
+                "Prompt-Änderung am Erzeuger entscheidet die Fabrik selbst."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/review",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=(
+                "Ergebnis: belegter No-op, exakt 0 geänderte Dateien, "
+                "changed_files=[]. Kein Repo-Writer gefunden; bereits "
+                "historisch behoben."
+            ),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRÜN (belegter No-op)"})
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert d.get("assignee") == "merger"
+    assert d.get("status") == "ready"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.assignee == "merger"
+        comments = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?", (tid,),
+        ).fetchall()
+        assert any("FREIGABE" in (c[0] or "") for c in comments)
+    finally:
+        conn.close()

@@ -10705,6 +10705,23 @@ def _is_merger_profile(assignee: Optional[str]) -> bool:
     return a == "merger" or a.endswith("-merger")
 
 
+# A TECHNIK card (the Beobachter's ``art == "technik"``) carries this marker in
+# its body, injected verbatim by the observer's ``karte_body_fuer_fabrik`` for
+# every technik card ("Technik-Entscheidung (selbst treffen, im Kommentar
+# begründen): …"). The dispatcher recognises a technik card from the body (there
+# is no art column) so the GO gate can keep a technik merger card resting in
+# ``ready @ merger`` instead of parking it to ``blocked@till``: a blocked technik
+# card is categorically ROT at the observer (rot-technik-rueckfrage), so the park
+# would turn the ONE green terminal a technik card can reach (Regel c, ready @
+# merger) into a red one. Mirrors ``tools.kanban_tools._TECHNIK_CARD_MARKER``.
+_TECHNIK_CARD_BODY_MARKER = "Technik-Entscheidung (selbst treffen"
+
+
+def _is_technik_card_body(body: Optional[str]) -> bool:
+    """True when a card body carries the observer's technik-contract marker."""
+    return bool(body) and _TECHNIK_CARD_BODY_MARKER in body
+
+
 def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when a human has explicitly released this card past the GO gate.
 
@@ -11440,6 +11457,14 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     candidates = [
         row for row in rows
         if get_spawn_rejection_reason(conn, row["id"]) is None
+        # A merger card resting in ``ready`` is GO-gated (awaits an explicit
+        # human merge GO) and is never auto-spawned — the dispatcher skips it
+        # every tick. Excluding it keeps the "ready queue non-empty but nothing
+        # spawned" health warning from firing on a technik merger card that the
+        # GO gate deliberately leaves in ``ready @ merger`` (F46) instead of
+        # parking to blocked. Non-technik merger cards never linger here (they
+        # are parked to blocked@till), so this only affects the F46 resting case.
+        and not _is_merger_profile(row["assignee"])
     ]
     if not candidates:
         return False
@@ -11797,6 +11822,73 @@ def _dispatch_once_locked(
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):
             result.skipped_nonspawnable.append(row["id"])
+            # F46 (Karte-19 recurrence): a TECHNIK merger card may NOT be parked
+            # to ``blocked@till``. The observer marks ANY blocked technik card ROT
+            # (rot-technik-rueckfrage, beobachter line 850, evaluated BEFORE the
+            # done/zielfrage rules), while ``ready @ merger`` is greened
+            # unconditionally as Regel c (line 846, evaluated BEFORE the technik-
+            # blocked rule) AND is exempt from the board-stall / board-cleanliness
+            # scans. So for a technik card the GO gate achieves its "do not auto-
+            # spawn the merge; wait for a human GO" purpose by letting the card
+            # REST in ``ready @ merger`` (non-spawnable, skipped every tick) rather
+            # than flipping it to blocked — the flip would convert the one green
+            # terminal a technik card can reach into a red one. Till's GO is still
+            # an explicit claim/unblock; has_spawnable_ready excludes a merger
+            # card in ready so this resting card raises no "stuck" health warning.
+            # Only the terminal MERGE of a technik card is handled this way (merger
+            # assignee + technik body); a deploy/smoke/release terminal card, or a
+            # non-technik merger card, keeps the blocked@till park (F30/F49 green
+            # it as Regel b once parked).
+            _is_technik_merger = (
+                _is_merger_profile(row_assignee)
+                and _is_technik_card_body(_body)
+            )
+            if _is_technik_merger:
+                # The card is re-encountered every tick (it stays in ``ready``),
+                # so the one-time hold marker + explainer comment are written only
+                # on the FIRST encounter — guarded by the go_gate_held event — to
+                # avoid per-tick event/comment spam.
+                if not dry_run:
+                    _already_held = conn.execute(
+                        "SELECT 1 FROM task_events "
+                        "WHERE task_id = ? AND kind = 'go_gate_held' "
+                        "LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    if not _already_held:
+                        with write_txn(conn):
+                            # Durable "needs human GO" marker without touching
+                            # status/assignee — the card stays ``ready @ merger``.
+                            conn.execute(
+                                "UPDATE tasks SET category = 'go_noetig' "
+                                "WHERE id = ? AND status = 'ready'",
+                                (row["id"],),
+                            )
+                            _append_event(
+                                conn, row["id"], "go_gate_held",
+                                {"assignee": row_assignee, "status": "ready",
+                                 "reason": "technik merge card held at ready @ "
+                                           "merger (blocked would be ROT); awaits "
+                                           "explicit human GO"},
+                            )
+                            conn.execute(
+                                "INSERT INTO task_comments "
+                                "(task_id, author, body, created_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    row["id"],
+                                    "orchestrator",
+                                    "GO-Gate: Diese Technik-Karte verlangt eine "
+                                    "terminale Merge-Freigabe und wird nicht "
+                                    "automatisch gestartet. Sie ruht in "
+                                    "'ready @ merger' (eine Technik-Karte darf "
+                                    "nicht in 'blocked' geparkt werden) — für GO "
+                                    "die Karte einem Merger zuweisen und per "
+                                    "`hermes kanban claim` / `unblock` freigeben.",
+                                    int(time.time()),
+                                ),
+                            )
+                continue
             if not dry_run:
                 with write_txn(conn):
                     # Park as blocked@till, not ready@till: the board

@@ -411,6 +411,55 @@ def test_go_gate_holds_merger_card_despite_assignee(
         assert task.assignee == "till"
 
 
+def test_go_gate_rests_technik_merger_card_at_ready_not_blocked(
+    kanban_home, all_assignees_spawnable,
+):
+    # F46 (Karte-19 recurrence): a TECHNIK merger card may NOT be parked to
+    # blocked@till — the observer marks ANY blocked technik card ROT
+    # (rot-technik-rueckfrage), while `ready @ merger` is greened as Regel c and
+    # is the ONLY green terminal a technik card can reach. The GO gate keeps it
+    # resting in ready@merger (non-spawned, awaiting human GO) instead of
+    # flipping it to blocked, records a one-shot go_gate_held marker + explainer,
+    # and has_spawnable_ready does not count it so no "stuck" warning fires.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="S3-Backup: Streu-Tag </content> entfernen",
+            assignee="merger",
+            body=(
+                "Generierungs-Artefakt.\n\nTechnik-Entscheidung (selbst treffen, "
+                "im Kommentar begründen): Fabrik entscheidet selbst."
+            ),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+
+        def _comment_count() -> int:
+            return conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+                "AND body LIKE 'GO-Gate:%'",
+                (tid,),
+            ).fetchone()[0]
+
+        spawned = []
+        res = kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        assert tid in res.skipped_nonspawnable
+        task = kb.get_task(conn, tid)
+        # Rests at ready @ merger — NOT parked to blocked.
+        assert task.status == "ready"
+        assert task.assignee == "merger"
+        assert task.category == "go_noetig"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+        assert _comment_count() == 1
+        # The resting card is not counted as spawnable work (no stuck-warning).
+        assert kb.has_spawnable_ready(conn) is False
+
+        # Re-encountered every tick: idempotent, no event/comment spam.
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _comment_count() == 1
+
+
 def test_go_gate_holds_card_with_merge_group(
     kanban_home, all_assignees_spawnable,
 ):

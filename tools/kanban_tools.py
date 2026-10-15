@@ -1460,6 +1460,78 @@ def _handle_complete(args: dict, **kw) -> str:
                 if _completion_is_premise_noop(
                     noop_comments, summary or "", result or "", metadata
                 ):
+                    # F46 (Karte-19 recurrence after F47/F48): a TECHNIK card can
+                    # NEVER be escalated with a Rückfrage — the Beobachter marks
+                    # ANY blocked technik card ROT (rot-technik-rueckfrage, line
+                    # 850), so the F47 "prepare a premise-Zielfrage, kanban_block"
+                    # steer is itself ROT here and collides head-on with the F48
+                    # block gate (which rejects the very kanban_block F47 asks
+                    # for) → the reviewer deadlocks. The ONLY green terminal a
+                    # technik card can reach is `ready @ merger` (Regel c, line
+                    # 846, evaluated BEFORE the technik-blocked ROT): rule b
+                    # (blocked) is closed for technik and rule a (done) cannot
+                    # green because a no-op can't satisfy the generator-fix
+                    # criterion AND the backend-pytest acceptance is env-gated
+                    # (aiosqlite collection death, F21-class). The contested
+                    # premise ('already resolved / no repo generator' — falsified
+                    # by the recurring occurrences the factory itself reports) is
+                    # the owner's call; for a technik card the merger lane is the
+                    # ONLY owner-decision channel (blocked is forbidden), so route
+                    # it there as a Freigabe/Entscheid with the prepared premise
+                    # question. The dispatcher keeps a technik merger card resting
+                    # in `ready @ merger` (it does NOT GO-gate-park it to blocked),
+                    # so the Beobachter greens it Regel c and Till decides (accept
+                    # / close as obsolete / rescope to a real Erzeuger-Fix). A
+                    # non-technik no-op keeps the F47 blocked@till escalation.
+                    if _is_technik_card(task.body or ""):
+                        branch = (task.branch_name or "").strip()
+                        premise_note = (
+                            f"FREIGABE/ENTSCHEID nötig: Branch `{branch}` liefert "
+                            f"für diese Technik-Karte einen belegten No-op — der "
+                            f"verlangte Fix an der Erzeugung (im Generator) plus "
+                            f"Regressionstest am Beispielartefakt wurde NICHT "
+                            f"gebaut, weil die Fabrik keinen Repo-Erzeuger "
+                            f"lokalisieren konnte bzw. das Symptom nur historisch "
+                            f"nachträglich bereinigt ist. Da gleichartige "
+                            f"Vorkommen in weiteren Artefakten die Existenz eines "
+                            f"systematischen Erzeugers nahelegen, ist die Prämisse "
+                            f"('bereits erledigt / kein Erzeuger') strittig und "
+                            f"die Abnahme ist laufzeit-/umgebungs-gated. Soll der "
+                            f"aktuelle Stand abgenommen, die Karte als obsolet "
+                            f"geschlossen oder auf einen echten Erzeuger-Fix bzw. "
+                            f"repo-weiten Cleanup umgeschnitten werden (GO)?"
+                        )
+                        handed = kb.handoff_task(
+                            conn, tid, "merger",
+                            note=premise_note,
+                            author=_normalize_profile(
+                                os.environ.get("HERMES_PROFILE")
+                            ),
+                            expected_run_id=_worker_run_id(tid),
+                        )
+                        if handed:
+                            return _ok(
+                                task_id=tid,
+                                status="ready",
+                                assignee="merger",
+                                note=(
+                                    "technik no-op with a contested premise → "
+                                    "handed to the merger as a Freigabe/Entscheid "
+                                    "(ready @ merger) instead of blocked@till. A "
+                                    "technik card can NEVER be escalated with a "
+                                    "Rückfrage (blocked technik = rot-technik-"
+                                    "rueckfrage), so the owner decision (accept / "
+                                    "close as obsolete / rescope to a real "
+                                    "generator fix + regression test) rides the "
+                                    "merger lane, which the Beobachter greens as "
+                                    "Regel c. The honest fix remains 'beheben an "
+                                    "der Erzeugung' — sanitise the write path that "
+                                    "emits the artifact, do not scrub it "
+                                    "downstream."
+                                ),
+                            )
+                        # Handoff failed (card not in running/ready, or a claim
+                        # race). Fall through to the escalation tool_error below.
                     conn.close()
                     return tool_error(
                         "this card was completed as a NO-OP (0 changed files) — "
