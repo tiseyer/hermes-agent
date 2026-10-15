@@ -1046,6 +1046,51 @@ def test_block_allowed_for_specifier_prepared_go_on_reached_state(monkeypatch, w
     assert d.get("ok") is True
 
 
+def test_block_allowed_for_prepared_go_after_rejected_offload_in_thread(
+    monkeypatch, worker_env
+):
+    """F44 re-open (live Karte 18): the gate must evaluate the CURRENT Zielfrage
+    (reason + the last ``?``-comment, the observer's ``_letzte_frage``), NOT OR
+    both signals across the whole thread. A thread already carrying a REJECTED
+    off-load comment (the orchestrator's bounced HALT, or the specifier's own
+    first try) plus a freshly reshaped prepared Abnahme/Freigabe-GO on top must
+    PASS — otherwise the stale off-load traps the card and it can never reach the
+    green GO state the richter would accept."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Deutsche Uebersetzung der verbleibenden englischen UI-Worte",
+            assignee="specifier", repository="voicera",
+        )
+        # Stale off-load (both signals) left in the thread by an earlier round.
+        kb.add_comment(
+            conn, tid, author="orchestrator",
+            body=("Der 55er-Ledger ist falsifiziert, nur Beispiele, keine "
+                  "abschließende Whitelist. Welche konkret aufgezählten "
+                  "Ansichten/Begriffe gelten als vollständig zu übersetzen, "
+                  "welche dürfen englisch bleiben?"),
+        )
+        # Freshly reshaped, prepared GO on the reached state (the newest ?-comment).
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=("Der breit übersetzte Stand ist erreicht und dokumentiert. "
+                  "ABNAHME/FREIGABE: Soll der aktuell erreichte Stand für diese "
+                  "Runde als fertig abgenommen und freigegeben werden? Folge bei "
+                  "GO: vereinzelte dynamische Resttexte bleiben vorerst im "
+                  "englischen Original."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "specifier")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "siehe GO oben", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 _TECHNIK_BODY = (
     "Generierungs-Artefakt: in SUMMARY- und PLAN-Dateien des S3-Backups taucht "
     "ein verwaistes </content>-Tag auf. Ursache im Erzeuger finden und beheben.\n\n"

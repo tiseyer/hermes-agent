@@ -1657,12 +1657,22 @@ def _handle_block(args: dict, **kw) -> str:
         # legitimate owner escalation is PREPARED: present the achieved state and
         # concrete options WITH consequences, or a plain Abnahme/Freigabe-GO on
         # the reached state — never a demand that the owner author the list. The
-        # gate scans the block reason + the full comment thread (the factory
-        # states the off-loading question in a comment, which is where the
-        # observer reads it) and fires only when BOTH signals are present, so a
-        # prepared GO/Vorschlag passes untouched. Scoped to the two scope-owning
-        # roles + human-escalation kinds; worker-side (re-imported per spawn),
-        # live on the next spawn without a gateway restart (cf. F19).
+        # gate evaluates exactly the Zielfrage the Beobachter will judge: the
+        # block reason PLUS the single most-recent ``?``-comment — the observer's
+        # ``_letzte_frage`` (it reads the LAST question comment, not the whole
+        # history) — and fires only when BOTH signals co-occur there. It must
+        # NOT OR the two signals across the ENTIRE thread: once a rejected
+        # off-load comment exists (e.g. the orchestrator's earlier HALT that the
+        # board-guard bounced, or the specifier's own first try), a thread-wide
+        # scan would keep matching it forever, so even a correctly reshaped
+        # prepared GO retry could never clear the gate — the factory would be
+        # permanently trapped and the card could never reach the green GO state
+        # (F44 re-opened: live probe Karte 18 't_e7ef743c' never converged). By
+        # scoping to the current Zielfrage, the raw off-load is still caught (its
+        # own comment carries both signals) while a fresh GO/Vorschlag comment
+        # posted on top passes untouched. Scoped to the two scope-owning roles +
+        # human-escalation kinds; worker-side (re-imported per spawn), live on
+        # the next spawn without a gateway restart (cf. F19).
         if (
             task
             and _normalize_profile(os.environ.get("HERMES_PROFILE"))
@@ -1671,9 +1681,16 @@ def _handle_block(args: dict, **kw) -> str:
         ):
             scope_blob = str(reason or "")
             try:
-                scope_blob += "\n" + "\n".join(
-                    c.body or "" for c in kb.list_comments(conn, tid)
+                last_frage = next(
+                    (
+                        c.body
+                        for c in reversed(kb.list_comments(conn, tid))
+                        if "?" in (c.body or "")
+                    ),
+                    "",
                 )
+                if last_frage:
+                    scope_blob += "\n" + last_frage
             except Exception:
                 pass
             if _block_is_unprepared_scope_demand(scope_blob):
