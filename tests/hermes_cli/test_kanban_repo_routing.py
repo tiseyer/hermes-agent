@@ -724,6 +724,63 @@ def test_rebuild_convergence_ceiling_escalates_scope_zielfrage(
     assert blocked and blocked[-1].payload.get("kind") == "needs_input"
 
 
+def test_rebuild_convergence_ceiling_technik_routes_to_merger(
+    kanban_home, monkeypatch,
+):
+    """F45 (Karte-25 recurrence, t_95da36f1): the convergence ceiling must NOT
+    park a TECHNIK card at ``blocked@till`` — the observer marks ANY blocked
+    technik card ROT (rot-technik-rueckfrage), so it could never go green. A
+    non-converging technik coder card is handed to the MERGER instead
+    (``ready @ merger``), the one green terminal a technik card can reach."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(
+        profiles, "profile_exists",
+        lambda name: name in ("voicera-coder", "voicera-reviewer", "merger"),
+    )
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Tasks brauchen Logs zum Troubleshooten",
+            # The body carries the observer's technik-contract marker that
+            # ``karte_body_fuer_fabrik`` injects for every art=technik card.
+            body=(
+                "Bei jeder Task-Zustandsaenderung muss der Agent-Name im Log "
+                "stehen.\n\nTechnik-Entscheidung (selbst treffen, im Kommentar "
+                "begründen): Strukturiert oder Klartext entscheidet die Fabrik."
+            ),
+            assignee="voicera-coder", tenant="voicera",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        _add_event(conn, tid, "handoff", {"from": "specifier", "to": "voicera-coder"})
+        _add_event(conn, tid, "handoff", {"from": "specifier", "to": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        _add_event(conn, tid, "review_rejected", {"implementer": "voicera-coder"})
+        assert kb._coder_rebuild_count(conn, tid) == kb._REBUILD_CONVERGENCE_CAP
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda t, w, **k: spawns.append(t.id),
+        )
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+        ceiling = [e for e in kb.list_events(conn, tid)
+                   if e.kind == "rebuild_convergence_ceiling"]
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+    assert spawns == [], "no further non-converging coder round"
+    # Routed to the merger, NOT parked at blocked@till (which would be ROT).
+    assert task.status == "ready"
+    assert "merger" in task.assignee
+    assert task.assignee != "till"
+    assert task.block_kind is None
+    assert ("rebuild_convergence_ceiling"
+            in [r[1] for r in res.respawn_guarded])
+    assert ceiling and ceiling[-1].payload.get("technik") is True
+    assert ceiling[-1].payload.get("routed_to") == "merger"
+    # A legitimate Merge-GO Zielfrage, NOT a blocked sticky event.
+    assert not blocked, "technik card must not get a sticky human block"
+    assert any("Merge-GO" in (c.body or "") and "?" in (c.body or "")
+               for c in comments)
+
+
 def test_rebuild_convergence_below_cap_still_spawns(
     kanban_home, role_profiles_exist,
 ):

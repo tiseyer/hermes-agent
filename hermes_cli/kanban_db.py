@@ -12247,7 +12247,93 @@ def _dispatch_once_locked(
             and _is_coder_card
             and _coder_rebuild_count(conn, row["id"]) >= _REBUILD_CONVERGENCE_CAP
         ):
+            # F45 (Karte-25 recurrence, t_95da36f1): a TECHNIK card may NOT be
+            # escalated to ``blocked@till`` here. The convergence ceiling routes a
+            # non-converging coder card to the owner with a prepared scope
+            # Zielfrage — but the observer marks ANY blocked technik card ROT
+            # ("rot-technik-rueckfrage", befund "Frage haette die Fabrik selbst
+            # loesen muessen", beobachter line 850, evaluated with no
+            # Zielfrage-Richter), so a technik card parked here can NEVER go green.
+            # F48's worker-side gate rejects a technik Rückfrage in kanban_block,
+            # but this ceiling is dispatcher-side and bypasses it. For a technik
+            # card hand it to the MERGER instead: the merger runs in the real
+            # tenant checkout and finishes the reached state; ``ready @ merger`` is
+            # the ONE green terminal a technik card can reach (Regel c; or Regel b
+            # once the GO-gate parks it to blocked@till with a legitimate Merge-GO
+            # Zielfrage — F46-technik keeps it resting at ready@merger). Mirrors
+            # the F36 self-repair-ceiling merger escape. Falls back to the plain
+            # blocked@till escalation when the card is not technik or no merger
+            # profile is spawnable (bare-DB unit tests).
+            _rebuild_body = row["body"] if "body" in row.keys() else None
+            _rebuild_merger = (
+                _resolve_merger(conn, row["id"])
+                if _is_technik_card_body(_rebuild_body)
+                else None
+            )
             with write_txn(conn):
+                if _rebuild_merger is not None:
+                    merge_target = "das Merge-Ziel des Repository-Profils"
+                    try:
+                        _merge_profile = resolve_task_repository_profile(
+                            conn, row["id"],
+                        )
+                        merge_target = (
+                            (_merge_profile.merge_target or "").strip()
+                            or merge_target
+                        )
+                    except RepositoryProfileError:
+                        pass
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'ready',
+                               assignee      = ?,
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = NULL,
+                               consecutive_failures = 0
+                         WHERE id = ? AND status = 'ready'
+                           AND claim_lock IS NULL
+                        """,
+                        (_rebuild_merger, row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments "
+                            "(task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                row["id"],
+                                "orchestrator",
+                                "Technik-Karte nach "
+                                f"{_REBUILD_CONVERGENCE_CAP} Bau-/Review-Runden "
+                                "nicht in der Coder-/Reviewer-Spur konvergiert — "
+                                "KEINE Rückfrage an Till (eine blockierte "
+                                "Technik-Karte ist beim Beobachter kategorisch ROT, "
+                                "'Frage haette die Fabrik selbst loesen muessen'). "
+                                "Die Umfangs-/Technik-Entscheidung trifft die Fabrik "
+                                "selbst. FREIGABE noetig (Merge-GO): Der Merger "
+                                "arbeitet im echten Checkout (mit Git-Remotes und "
+                                "echter .env), materialisiert den Branch und "
+                                "schliesst die Integration des erreichten Standes "
+                                f"nach `{merge_target}` ab. Soll diese Karte im "
+                                "echten Checkout fertiggestellt und gemerged werden "
+                                "(GO)?",
+                                int(time.time()),
+                            ),
+                        )
+                        _append_event(
+                            conn, row["id"], "rebuild_convergence_ceiling",
+                            {"rebuilds": _coder_rebuild_count(conn, row["id"]),
+                             "cap": _REBUILD_CONVERGENCE_CAP,
+                             "routed_to": _rebuild_merger,
+                             "technik": True},
+                        )
+                    result.respawn_guarded.append(
+                        (row["id"], "rebuild_convergence_ceiling")
+                    )
+                    continue
                 cur = conn.execute(
                     """
                     UPDATE tasks
