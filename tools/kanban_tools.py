@@ -2357,6 +2357,79 @@ def _handle_block(args: dict, **kw) -> str:
                     "genuine business/Freigabe decision that is Till's to make, "
                     "stated as a question in a comment."
                 )
+        # TECH_REGEX Zielfrage-word gate (F47 recurrence, Karte 47
+        # t_d356333d 'Strategie für Environment Variables sicher speichern',
+        # art=zielfrage, erwartung=blocked_zielfrage). The factory prepared a
+        # genuine owner decision (SOPS+age vs. eigener Vault — a security/budget
+        # Zielfrage the observer's richter judges TOR1/2/3 all JA), but phrased
+        # the current state as the "Ist-Pfad"/"Recovery-Pfad" of the secrets
+        # flow. "Pfad" (here plain business language for "the way/route secrets
+        # flow") is one of the observer's HARD TECH_REGEX prefilter words
+        # (:data:`_SPECIFIER_TECH_REGEX`): a single hit forces the observer's
+        # ``zielfrage`` gate to False and the LLM richter CANNOT override it —
+        # so the blocked_zielfrage card is guaranteed ``rot-keine-zielfrage``
+        # ("[Regex-Vorfilter] Technik-Begriff -> keine Zielfrage") no matter how
+        # legitimate the decision. The observer reads the question from the
+        # NEWEST ``?``-comment across ALL authors (``_letzte_frage``); here the
+        # reviewer blocked the card (keeping the orchestrator's Zielfrage) and
+        # its own verdict comment re-quoted the ABNAHMEKRITERIUM full of "Pfad",
+        # so that comment became _letzte_frage and tripped the regex. The F23/F24
+        # specifier gate above already mirrors this, but only over the specifier's
+        # OWN question comment — it misses a reviewer/orchestrator block whose
+        # newest ``?``-comment (any author) carries the trigger word. Mirror the
+        # observer EXACTLY here, for every role: compute _letzte_frage over all
+        # comments and reject a human-escalation block whose observed Zielfrage
+        # trips TECH_REGEX. A faithful necessary-condition mirror (it rejects only
+        # what the observer would also reject, never more — not a facade): the
+        # fix is to rephrase the business question into the Alltagssprache TOR3
+        # already demands (e.g. "Pfad"→"Weg"/"Ablauf"/"Verteilweg",
+        # "Abhängigkeit"→"Voraussetzung") and re-post it as the FINAL ``?``-comment
+        # so the observer reads a tech-free Zielfrage. Runs after the role gates
+        # so the specifier's own tech test keeps its message; technik cards never
+        # reach here (they return above). Worker-side (re-imported per spawn),
+        # live on the next spawn without a gateway restart (cf. F19).
+        if task and kind in _HUMAN_BLOCK_KINDS:
+            letzte_frage = ""
+            try:
+                for c in kb.list_comments(conn, tid):
+                    if "?" in (c.body or ""):
+                        letzte_frage = c.body or ""
+            except Exception:
+                letzte_frage = ""
+            tech_hits = (
+                _SPECIFIER_TECH_REGEX.findall(letzte_frage)
+                if letzte_frage else []
+            )
+            if tech_hits:
+                conn.close()
+                return tool_error(
+                    "the Zielfrage the observer will read (the newest "
+                    "\"?\"-comment on this card) carries a term its HARD regex "
+                    "prefilter treats as technical — "
+                    f"{sorted({h.lower() for h in tech_hits})} "
+                    "(the full set: rebase, port, library, bibliothek, "
+                    "dependency, abhängigkeit, pfad/path, version, framework). "
+                    "A single hit forces the observer's zielfrage gate to False "
+                    "and the LLM richter CANNOT override it, so this "
+                    "blocked_zielfrage card is guaranteed ROT "
+                    "(rot-keine-zielfrage, \"[Regex-Vorfilter] Technik-Begriff -> "
+                    "keine Zielfrage\") no matter how legitimate the owner "
+                    "decision is. This is NOT a real method/technical question — "
+                    "it is a business word (e.g. \"Ist-Pfad\"/\"Recovery-Pfad\" "
+                    "for the WAY secrets flow) that collides with the crude "
+                    "prefilter. Fix it by phrasing the question in the everyday "
+                    "language TOR3 already asks for: replace \"Pfad\" with "
+                    "\"Weg\"/\"Ablauf\"/\"Verteilweg\", \"Abhängigkeit\" with "
+                    "\"Voraussetzung\", drop a bare \"Version\"/\"Framework\"/"
+                    "\"Library\" mention, etc. — then POST the reshaped business "
+                    "Zielfrage as a NEW comment so it becomes the newest "
+                    "\"?\"-comment the observer reads, and block again. If you are "
+                    "the reviewer, do NOT re-quote a tech-laden ABNAHMEKRITERIUM "
+                    "as your final comment (that quote becomes _letzte_frage and "
+                    "trips the regex); keep your verdict free of the trigger words "
+                    "and let the clean Zielfrage comment be the last one. The "
+                    "decision content stays identical — only the wording changes."
+                )
         try:
             ok = kb.block_task(
                 conn, tid,

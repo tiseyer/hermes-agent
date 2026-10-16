@@ -961,6 +961,94 @@ def test_block_allowed_for_specifier_genuine_question_after_abnahmekriterium(mon
     assert d.get("ok") is True
 
 
+def test_block_rejected_when_observed_zielfrage_trips_tech_regex(monkeypatch, worker_env):
+    """F47 recurrence (Karte 47 t_d356333d, art=zielfrage,
+    erwartung=blocked_zielfrage): a genuine owner decision (SOPS+age vs. eigener
+    Vault) phrased the current state as the "Ist-Pfad" of the secrets flow. The
+    reviewer blocked the card and its verdict comment re-quoted the criterion
+    full of "Pfad", so that comment became the observer's _letzte_frage (the
+    newest "?"-comment, any author). "Pfad" is a HARD TECH_REGEX prefilter word:
+    a single hit forces the observer's zielfrage gate to False and the richter
+    cannot override it → guaranteed rot-keine-zielfrage. The F23/F24 specifier
+    gate mirrors TECH_REGEX only over the specifier's OWN comment and so misses
+    a reviewer/orchestrator block; the general gate rejects any role's human
+    block whose observed Zielfrage trips the regex, steering a plain-language
+    rephrase."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Strategie fuer Environment Variables sicher speichern",
+            assignee="voicera-reviewer", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="orchestrator",
+            body=("## Zielfrage\n\nSoll Voicera den eigenen lokalen Vault "
+                  "verbindlich als Zielarchitektur festlegen statt SOPS+age? "
+                  "Der belegte Ist-Pfad verteilt serverlokale Klartextwerte."),
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-reviewer",
+            body=("REVIEW GRÜN (read-only) — die Karte bleibt wegen der offenen "
+                  "Zielentscheidung bei Till. Zitiertes Abnahmekriterium: der "
+                  "Repo-Pfad `.env` → Compose → Container ist vollständig "
+                  "wiedergegeben; offene Frage?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "Zielentscheidung offen; bleibt bei Till.",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "regex prefilter" in d["error"]
+    assert "pfad" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_allowed_when_observed_zielfrage_is_plain_language(monkeypatch, worker_env):
+    """The general TECH_REGEX gate must not swallow a legitimately reshaped
+    Zielfrage: the same owner decision phrased in everyday language (no trigger
+    word — "Verteilweg"/"Weg" instead of "Pfad") passes the gate so the
+    observer's richter can judge it on the merits."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Strategie fuer Environment Variables sicher speichern",
+            assignee="voicera-reviewer", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-reviewer",
+            body=("REVIEW GRÜN (read-only). Offene Zielentscheidung bleibt bei "
+                  "Till: Soll als Secret-Speicherweg SOPS+age festgelegt werden "
+                  "statt eines eigenen Vaults? Vorschlag: Ja. Konsequenz: "
+                  "weniger Betriebsaufwand, dafür dauerhaft schwächere zentrale "
+                  "Nachvollziehbarkeit."),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "Zielentscheidung offen; bleibt bei Till.",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
 def test_block_rejected_for_specifier_unprepared_scope_demand(monkeypatch, worker_env):
     """F44: a specifier that cannot close an open 'alle'/'vollständig' scope must
     not off-load the enumeration onto the owner. Live probe Karte 18
