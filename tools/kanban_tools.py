@@ -817,6 +817,63 @@ _SCOPE_ENUM_DEMAND_RE = re.compile(
 )
 
 
+# F46: a Zielfrage escalation whose "question" is a BUNDLE of suggestive yes/no
+# questions the factory has ALREADY answered for the owner with a blanket
+# affirmative ("Vorschlag: Ja zu allen vier Schutzzielen" / "Vorschlag jeweils:
+# Ja"). This is the sibling of the F44 unprepared-scope gate, one failure mode
+# over: F44 off-loads the enumeration ONTO the owner; F46 does the opposite —
+# it rubber-stamps the factory's OWN recommendation across several rhetorical
+# protection-goal questions nobody would answer "Nein" to, so there is no real
+# decision left. The observer's richter judges it TOR1 JA / TOR3 JA but TOR2
+# NEIN ("vier nackte Ja/Nein-Suggestivfragen mit vorweggenommenem 'Ja zu allen';
+# es fehlen aktueller Anlass/Stand sowie Optionen samt Kosten/Folgen") →
+# rot-ohne-kontext (live probe Karte 47 't_57f3eeef', erwartung=
+# blocked_zielfrage: the specifier degraded a well-prepared option-decision
+# Zielfrage — "SOPS+age vs. Vault vs. verschlüsseltes .env mit Aufwand/
+# Sicherheitsniveau" — into "Brauche Eigentümerfreigabe: Soll …?, soll …?,
+# dürfen …?, müssen …? Vorschlag: Ja zu allen vier Schutzzielen").
+#
+# A legitimate owner escalation presents ONE concrete decision with the current
+# Anlass/Stand and the alternatives WITH their Kosten/Folgen (exactly the
+# earlier, un-degraded orchestrator Zielfrage on the same card: "Soll Voicera
+# … SOPS+age festlegen und Vault erst bei belegtem Bedarf …? Vorschlag: Ja.
+# Konsequenz: … Die Alternative 'Vault jetzt' bringt … jedoch …"), OR a plain
+# Freigabe-GO on a reached state. Neither of those carries a blanket "Ja zu
+# allen"/"jeweils Ja" over three-plus bundled yes/no clauses, so a reshaped
+# Zielfrage clears this gate untouched (no F44-style trap). The two signals are
+# AND-ed: the blanket pre-answer AND a genuine multi-question bundle (≥3
+# interrogative yes/no clause leads), so a single prepared "Vorschlag: Ja."
+# decision never trips it.
+_BLANKET_PREANSWER_RE = re.compile(
+    r"\bja\s+zu\s+allen\b"
+    r"|\bvorschlag\b[^.\n]{0,30}?\bjeweils\b[^.\n]{0,15}?\W*ja\b"
+    r"|\bjeweils\b[^.\n]{0,15}?\W*ja\b[^.\n]{0,25}?\?"
+    r"|\b(?:ja|zustimmung|go)\s+zu\s+(?:allen\s+)?"
+    r"(?:zwei|drei|vier|f[üu]nf|sechs|sieben|acht|allen)\b"
+    r"|\ballen?\s+(?:zwei|drei|vier|f[üu]nf|sechs|sieben|acht)\s+"
+    r"(?:schutzziel\w*|ziel\w*|frage\w*|punkt\w*|entscheidung\w*)\b",
+    re.IGNORECASE,
+)
+_YESNO_CLAUSE_LEAD_RE = re.compile(
+    r"(?:(?<=[\s,;])|^)\s*(?:und\s+)?(?:soll(?:en|te|ten)?|darf|d[üu]rfen"
+    r"|muss|m[üu]ssen|sind|wird|werden|k[öo]nnen|kann)\b",
+    re.IGNORECASE,
+)
+
+
+def _block_is_preanswered_suggestive_bundle(blob: str) -> bool:
+    """True when a Zielfrage human-block poses a BUNDLE of suggestive yes/no
+    questions with a pre-supplied blanket affirmative (F46) — the factory has
+    already answered for the owner, so there is no prepared decision (no current
+    Anlass/Stand, no options with Kosten/Folgen) left to make. Requires BOTH a
+    blanket pre-answer (:data:`_BLANKET_PREANSWER_RE`) and a genuine multi-
+    question bundle (≥3 interrogative yes/no clause leads) so a single prepared
+    "Vorschlag: Ja." option-decision is never caught."""
+    if not blob or not _BLANKET_PREANSWER_RE.search(blob):
+        return False
+    return len(_YESNO_CLAUSE_LEAD_RE.findall(blob)) >= 3
+
+
 def _block_is_unprepared_scope_demand(blob: str) -> bool:
     """True when a scope human-block off-loads the completeness enumeration onto
     the owner instead of preparing it (F44). Requires BOTH an open-set concession
@@ -1940,6 +1997,43 @@ def _handle_block(args: dict, **kw) -> str:
                     "dynamische Resttexte bleiben vorerst im Original') OR the "
                     "concrete options WITH their consequences — NEVER a question "
                     "that asks the owner to author the completeness list."
+                )
+            # Pre-answered suggestive-bundle gate (F46, sibling of F44 one
+            # failure mode over). Where F44 off-loads the enumeration ONTO the
+            # owner, F46 does the opposite: it escalates a BUNDLE of suggestive
+            # yes/no questions the factory has already answered for the owner
+            # with a blanket "Vorschlag: Ja zu allen" — so there is no real
+            # decision left (no current Anlass/Stand, no options with Kosten/
+            # Folgen). The observer's richter judges that TOR1 JA / TOR3 JA but
+            # TOR2 NEIN → rot-ohne-kontext (live probe Karte 47 't_57f3eeef').
+            # Evaluates the SAME Zielfrage blob the observer will judge (reason +
+            # the single most-recent ``?``-comment), so a reshaped single
+            # option-decision or a plain Freigabe-GO clears it untouched.
+            if _block_is_preanswered_suggestive_bundle(scope_blob):
+                conn.close()
+                return tool_error(
+                    "this Zielfrage is a BUNDLE of suggestive yes/no questions "
+                    "you have ALREADY answered for the owner ('Vorschlag: Ja zu "
+                    "allen …' / 'Vorschlag jeweils: Ja'). That is not a decision "
+                    "— nobody answers 'Nein' to protection goals like 'dürfen "
+                    "Assistenten niemals Produktions-Secrets lesen?'. The "
+                    "observer's richter judges it TOR1 JA / TOR3 JA but TOR2 "
+                    "NEIN (nackte Ja/Nein-Suggestivfragen mit vorweggenommenem "
+                    "'Ja zu allen'; es fehlen aktueller Anlass/Stand sowie "
+                    "Optionen samt Kosten/Folgen) → rot-ohne-kontext. Reshape "
+                    "it: escalate the ONE decision that is genuinely open and "
+                    "owner-owned as a SINGLE prepared Zielfrage — name the "
+                    "current Anlass/Stand and lay out the concrete alternatives "
+                    "WITH their Kosten/Folgen so a 'Nein' is a real choice "
+                    "(e.g. 'Soll als Secret-Speicherweg SOPS+age festgelegt "
+                    "werden statt eines eigenen Vaults? Vorschlag: Ja. "
+                    "Konsequenz bei Ja: … Alternative Vault: höherer Betriebs-/"
+                    "Verfügbarkeitsaufwand, dafür …'), OR — if what is actually "
+                    "pending is a release — ask a plain Freigabe-GO on a "
+                    "concrete reached state. Self-evident protection goals are "
+                    "requirements you set yourself and fold into the "
+                    "ABNAHMEKRITERIUM, NOT owner questions; do not bundle them "
+                    "into the escalation."
                 )
         # Orchestrator block gate (F22, sibling of the F21 complete gate). The
         # orchestrator coordinates a fresh repo work card by decomposing it and
