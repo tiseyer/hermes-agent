@@ -130,6 +130,57 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_owner_zielentscheidung_loop_routes_to_blocked_till(
+    kanban_home: Path,
+) -> None:
+    """F50: a needs_input loop whose card carries a genuine non-technical
+    business ``?``-comment is an owner Zielentscheidung — it escalates to
+    ``blocked@till`` (Beobachter rule b), NOT to ``triage`` (which would
+    auto-decompose the goal-dispute into deadlocking autonomous sub-work)."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="Strategie für Secrets")
+        # The factory raised a real owner goal-question on the card.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (tid, "voicera-reviewer",
+                 "Soll die zentrale Verwahrung durch verschlüsselte Ablage je "
+                 "Kundeninstanz ersetzt werden, oder nur zur Erprobung?",
+                 0),
+            )
+        kb.block_task(conn, tid, reason="Zielwiderspruch", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="Tills Ziele fehlen noch",
+                      kind="needs_input")
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked"
+        assert t.assignee == "till"
+        assert t.block_kind == "needs_input"
+        # Sticky block → recompute_ready must NOT auto-recover it.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+        # Routed to the owner, not quarantined in triage / decomposed.
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "owner_decision_loop_escalated" in kinds
+        assert "block_loop_detected" not in kinds
+
+
+def test_needs_input_loop_without_zielfrage_still_triages(
+    kanban_home: Path,
+) -> None:
+    """A bare needs_input wall ("need creds") carries no business question, so
+    the F50 owner-escalation must NOT fire — it keeps the triage quarantine."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="need creds", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="still need creds", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------

@@ -7448,45 +7448,123 @@ def block_task(
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+            # F50 (owner Zielentscheidung loop): a ``needs_input`` / un-typed
+            # DECISION block that recurs to the limit is NOT a spin bug to
+            # quarantine in ``triage`` — it is an owner goal-dispute the factory
+            # cannot settle on its own. ``triage`` auto-decomposes (gateway
+            # ``kanban_watchers``), which fans the owner question out into
+            # autonomous sub-work; a child then re-escalates the real
+            # Zielentscheidung (``blocked``) and the decomposed family ROOT
+            # deadlocks in ``todo`` behind that held decision until the
+            # Beobachter trips ``rot-stuck`` (live repro: Karte 47 ``t_1ab478bc``
+            # "Strategie für Environment Variables" → loop → triage → decomposed
+            # → children gated on blocked owner decision ``t_7b92ce55``). An
+            # owner goal-dispute is never autonomous work (F39/F43/F45): present
+            # it AS ``blocked@till`` on THIS card with its Zielfrage so the owner
+            # answers it and the Beobachter greens rule b — no decompose, no
+            # deadlock. The discriminator is EVIDENCE, not the reason string: a
+            # decision kind (``needs_input``/``None``) AND the card already
+            # carries a genuine non-technical business ``?``-comment
+            # (:func:`_card_has_nontech_zielfrage` — the exact shape the
+            # Beobachter greens). A ``capability`` wall or a bare needs_input
+            # ("need creds", no business question) has no such comment and keeps
+            # the ``triage`` quarantine, preserving the loop-breaker contract.
+            _owner_loop = (
+                kind in _ZIELFRAGE_BLOCK_KINDS
+                and _card_has_nontech_zielfrage(conn, task_id)
             )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+            if _owner_loop:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input',
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (recurrences, task_id) if expected_run_id is None
+                    else (recurrences, task_id, int(expected_run_id)),
                 )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                },
-                run_id=run_id,
-            )
-            routed_to = "triage"
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="owner Zielentscheidung loop → blocked@till (F50)",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="owner Zielentscheidung loop → blocked@till (F50)",
+                    )
+                # The owner Zielfrage is already present as a non-technical
+                # ``?``-comment (the entry gate required it), so the Beobachter's
+                # ``_letzte_frage`` reads a legit question straight off the card —
+                # nothing to synthesise, no facade.
+                # Sticky ``blocked`` event: recompute_ready must not auto-recover
+                # a held owner decision — it waits for the human answer, not a
+                # cron unblock.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"reason": reason, "kind": "needs_input",
+                     "recurrences": recurrences,
+                     "escalation": "owner_decision_loop"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "owner_decision_loop_escalated",
+                    {"routed_to": "till", "recurrences": recurrences,
+                     "limit": BLOCK_RECURRENCE_LIMIT},
+                    run_id=run_id,
+                )
+                routed_to = "blocked"
+            else:
+                # Loop detected — stop letting the unblocker spin this task. Route
+                # to triage for a human-in-the-loop decision instead of blocked.
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'triage',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id) if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                    )
+                _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                    },
+                    run_id=run_id,
+                )
+                routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
