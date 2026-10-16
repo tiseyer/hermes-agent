@@ -339,14 +339,37 @@ def test_complete_rejected_for_specifier_profile(monkeypatch, worker_env):
 
 
 def test_complete_allowed_for_non_specifier_profile(monkeypatch, worker_env):
-    """The specifier guard must not leak to other roles: a coder/reviewer
-    worker completes its card normally."""
+    """The specifier/coder guards must not leak to the reviewer: the reviewer
+    is the role that completes a work card and must keep its normal path."""
     monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
     from tools import kanban_tools as kt
     out = kt._handle_complete({"summary": "review green"})
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"] == worker_env
+
+
+def test_complete_rejected_for_coder_profile(monkeypatch, worker_env):
+    """A coder must hand off to the reviewer, never self-`done` (F44): the
+    coder SOUL already forbids kanban_complete, but a prompt rule is not
+    load-bearing. Guards against the live failure where voicera-coder drove
+    Karte 25 (technik, t_e759635f) straight to `done` — reviewer=None — which
+    the Beobachter rejects as 'done ohne vollständige Abnahme' (Regel a). The
+    card must stay in-flight and the error must steer to the review handoff."""
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-coder")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "built it, looks good"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "must not complete" in d["error"]
+    assert "kanban_block" in d["error"] and "review" in d["error"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+    finally:
+        conn.close()
 
 
 def test_complete_rejected_for_orchestrator_repo_work_card(monkeypatch, worker_env):
@@ -4021,6 +4044,50 @@ def test_card_is_build_gated_db_less_backend_pytest():
         "DB-Fixture mit genau vier Grenzfaellen.",
     ]
     assert kt._card_is_build_gated(title, body, comments) is True
+
+
+def test_card_is_build_gated_db_schema_backend_pytest():
+    """F44 live probe Karte 25 (technik, t_e759635f): a backend lifecycle-logging
+    card whose acceptance `cd backend && pytest -k task_log_agent` targets
+    `backend/app/tasks/scheduled.py`/`agent_tasks.py`. Importing those task
+    modules at collection boots `app.database`'s async engine, so the
+    Beobachter's env-less check-worktree dies exactly like the DB-less pytest
+    probe — yet the card frames itself as a *logging* task, not a DB test. The
+    DB-boundness is signalled instead by the in-scope schema change the thread
+    names (Migration / DB-Enum / Migrationsunterbau). Must route to the merger
+    like F21."""
+    from tools import kanban_tools as kt
+    title = "Tasks brauchen Logs zum Troubleshooten: welcher Agent hat was gemacht"
+    body = (
+        "Bei jeder Task-Zustandsaenderung muss im Log stehen: Task-ID, "
+        "Agent-Name, alter und neuer Zustand, Zeitstempel. Technik-Entscheidung "
+        "(selbst treffen, im Kommentar begruenden): JSON-Log oder Klartext."
+    )
+    comments = [
+        "Code-Quelle: backend/app/tasks/scheduled.py und "
+        "backend/app/tasks/agent_tasks.py; structlog/app.logging nutzen. "
+        "reversible Techniksetzung samt Migration/Test.",
+        "ABNAHMEKRITERIUM: cd backend && pytest -q "
+        "tests/test_task_lifecycle_logging.py simuliert ohne echte Queue die "
+        "realen Pfade. Falls `queued` im Modell/DB-Enum fehlt, gehoeren die "
+        "rueckwaertskompatible Enum-/Migrationserweiterung und deren "
+        "Regressionstest zum Scope. Umsetzung in backend/app/tasks/scheduled.py "
+        "sowie nur dem dafuer noetigen Modell-/Migrationsunterbau.",
+    ]
+    assert kt._card_is_build_gated(title, body, comments) is True
+
+
+def test_card_not_build_gated_for_migration_without_pytest_or_app_path():
+    """The F44 schema tokens only broaden the THIRD F21 signal: a card that
+    names a migration but has neither a pytest acceptance nor an app-package
+    target must keep the honest Regel-a `done` path (all three signals
+    required)."""
+    from tools import kanban_tools as kt
+    assert kt._card_is_build_gated(
+        "Hinweis zur Datenmigration",
+        "Wir planen spaeter eine Migration der Alt-Daten.",
+        ["Notiz: die Migration kommt in einem spaeteren Schritt."],
+    ) is False
 
 
 def test_card_not_build_gated_for_static_helper_pytest():

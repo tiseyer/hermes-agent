@@ -485,13 +485,33 @@ _IMPORT_HYGIENE_RE = re.compile(
 # and the ``backend/app/…`` path; the card frames it as "ohne (laufende)
 # Datenbank / ohne DB-Fixture"), so the reviewer sees them at completion.
 _PYTEST_ACCEPTANCE_RE = re.compile(r"\bpytest\b", re.IGNORECASE)
+#
+# F44 (Karte 25, technik, t_e759635f 'Tasks brauchen Logs zum Troubleshooten'):
+# a backend lifecycle-logging card whose acceptance is
+# ``cd backend && pytest -k task_log_agent`` and whose producer files are
+# ``backend/app/tasks/scheduled.py``/``agent_tasks.py``. Importing those task
+# modules at collection pulls in ``app.database`` (engine boot) exactly as in
+# F21, so the Beobachter's env-less check-worktree dies before a test runs
+# (stdout_tail: ``app/database.py:49 create_async_engine(settings.DATABASE_URL)``
+# in a venv without the async driver / real DATABASE_URL). But the card frames
+# itself as a *logging* task, not a DB test, so the original DB-less tokens miss
+# it — the DB-boundness is signalled instead by the in-scope schema change the
+# orchestrator/specifier name in the thread ("samt Migration/Test", "falls
+# ``queued`` im Modell/DB-Enum fehlt, … rückwärtskompatible
+# Enum-/Migrationserweiterung", "nur dem dafür nötigen Modell-/Migrationsunterbau").
+# A card that touches a DB migration / schema enum / alembic is unambiguously
+# DB-bound, so its backend pytest boots the engine at collection just the same.
+# These tokens only broaden the THIRD F21 signal — a card still needs the pytest
+# acceptance AND an app-package target to trip the gate, so a pure static helper
+# test (no ``app/…`` import, no schema change) keeps the honest Regel-a ``done``.
 _DB_ENGINE_NEXUS_RE = re.compile(
     r"(?:ohne\s+(?:laufende\s+)?(?:datenbank|db)\b"
     r"|ohne\s+db[-\s]?fixture|keine?\s+db[-\s]?fixture"
     r"|no\s+db[-\s]?fixture|without\s+(?:a\s+)?(?:database|db)\b"
     r"|\bpostgres\b|\bpostgresql\b|\brls\b|\baiosqlite\b"
     r"|async[-\s]?engine|create_async_engine|\bsqlalchemy\b"
-    r"|\bdatabase_url\b|datenbank[-\s]?fixture)",
+    r"|\bdatabase_url\b|datenbank[-\s]?fixture"
+    r"|\bmigration|\bmigrationen\b|\balembic\b|db[-\s]?enum)",
     re.IGNORECASE,
 )
 
@@ -542,6 +562,20 @@ def _is_reviewer_profile(profile: Optional[str]) -> bool:
     """
     p = (profile or "").strip().lower()
     return p == "reviewer" or p.endswith("-reviewer")
+
+
+def _is_coder_profile(profile: Optional[str]) -> bool:
+    """True when the current worker profile is a repo coder.
+
+    Coders are tenant-scoped (``voicera-coder``, ``hermes-coder`` …); a bare
+    ``coder`` is accepted for a future untenanted variant. A coder's contract
+    ends with a handoff to the reviewer, never a self-``done`` (see the
+    completion guard in _handle_complete). The read-only helper roles
+    (``recon``, ``brain-reader``) are deliberately NOT coders and keep their
+    own completion paths.
+    """
+    p = (profile or "").strip().lower()
+    return p == "coder" or p.endswith("-coder")
 
 
 def _card_is_build_gated(title: str, body: str, comment_bodies: list[str]) -> bool:
@@ -1180,6 +1214,42 @@ def _handle_complete(args: dict, **kw) -> str:
             "kanban_handoff(to=\"voicera-coder\") for a voicera card. The "
             "dispatcher spawns the coder on the SAME card; only the reviewer "
             "completes a work card."
+        )
+    # A coder's contract ends with a handoff to the reviewer, never a
+    # self-`done`: it builds on wt/<id> and hands off so the reviewer can
+    # reproduce the acceptance against the specifier's ABNAHMEKRITERIUM. The
+    # coder SOUL already says this ("Rufe NICHT kanban_complete (das setzt done
+    # und überspringt den Reviewer)"), but — as F01 proved for the specifier — a
+    # prompt rule is not load-bearing: live probe Karte 25 (technik,
+    # t_e759635f, 'Tasks brauchen Logs zum Troubleshooten') showed voicera-coder
+    # drive the card straight to `done` itself (reviewer=None). The Beobachter's
+    # Done-Abnahme (Regel a) then surfaces reviewer=None → "done ohne
+    # vollständige Abnahme" (F44), and because the acceptance is an env-gated
+    # backend pytest (collection boots app.database's async engine) Regel a can
+    # never green — only the reviewer→merger lane (F21/F30/F46-technik) reaches a
+    # green terminal. Enforce the invariant in code and point the coder at the
+    # review handoff. Scoped to the coder profile so the reviewer (who completes
+    # work cards) and the read-only helper roles (recon, brain-reader) keep
+    # their own paths. Runs in the coder's own short-lived worker (re-imported
+    # per spawn), so it survives the gateway-restart gap that defeats
+    # dispatcher-side fixes (cf. F19).
+    if _is_coder_profile(os.environ.get("HERMES_PROFILE")):
+        return tool_error(
+            "the coder must not complete a card — your job ends by handing it "
+            "to the reviewer, not by finishing it. Completing it `done` skips "
+            "the reviewer (reviewer=None), which the Beobachter rejects as "
+            "'done ohne vollständige Abnahme' (Regel a). Post ONE handoff "
+            "comment with the proof (branch, commit hash, pytest/tsc status, "
+            "which trigger case you checked before/after, what is still "
+            "unverified; add the ⚠️ Tenant-Isolation marker if your diff "
+            "touches RLS/connector/workspace layers). If the full acceptance "
+            "cannot be run read-only here (no docker / no live DB — e.g. the "
+            "backend pytest boots the DB engine at collection), say so "
+            "explicitly in that comment so the reviewer routes the card to the "
+            "merger instead of blocking. Then call "
+            "kanban_block(kind=\"review\", reason=\"…\"), which moves the card "
+            "to status=review with the repo reviewer (e.g. voicera-reviewer) "
+            "as assignee. Only the reviewer completes a work card."
         )
     summary = args.get("summary")
     metadata = args.get("metadata")
