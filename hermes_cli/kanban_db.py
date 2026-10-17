@@ -12052,13 +12052,31 @@ def _dispatch_once_locked(
         # category is the durable "needs human GO" marker the dispatcher must
         # honour: re-assert the hold so the card rests in blocked@till, which
         # is where a waiting-on-Till card belongs.
+        #
+        # F51: F40 only re-asserted the hold for category 'go_noetig'. But the
+        # OTHER waiting-on-a-human categories (_HUMAN_DECISION_CATEGORIES:
+        # frage/entscheidung/abnahme) leak the exact same way — and when they
+        # do the synchronous re-park no longer fires, so the card lingers in
+        # ready@till long enough for a slow Manager agent (P34 status-anomaly
+        # correction) to claim and re-block it, opening a multi-minute window
+        # the 5-min board scan catches as rot-stuck (live Karte 47 t_0c438764:
+        # a merge-gated Zielentscheidung whose category got flipped go_noetig→
+        # entscheidung by a manager move_to_human, churning ready↔blocked for
+        # ~28h). Treat ANY human-decision category as terminal so the hold is
+        # re-asserted in the SAME dispatch tick — but ONLY when the card sits on
+        # the human sink (assignee='till'); a decision-category card still owned
+        # by a real worker profile is active work and must not be gated. The
+        # unconditional 'go_noetig' clause (merger cards keep assignee=merger)
+        # is preserved exactly.
         _row_category = (row["category"] or "") if "category" in row.keys() else ""
+        _on_human_sink = (row_assignee or "").strip().lower() == "till"
         _is_terminal_card = (
             bool(_GO_GATE_RE.search(_title))
             or bool(_GO_GATE_BODY_RE.search(_body))
             or _is_merger_profile(row_assignee)
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
             or _row_category == "go_noetig"
+            or (_row_category in _HUMAN_DECISION_CATEGORIES and _on_human_sink)
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):
             result.skipped_nonspawnable.append(row["id"])
@@ -12143,12 +12161,22 @@ def _dispatch_once_locked(
                     # unassigned. Parking DELIBERATELY takes a pre-assigned
                     # terminal card away from its merger/coder and hands it
                     # to 'till' — the GO is the human re-assign + unblock.
+                    # F51: preserve an existing human-decision category
+                    # (frage/entscheidung/abnahme/go_noetig) so the card keeps
+                    # its inbox bucket across the leak/re-park cycle; only a
+                    # vocab-/merger-detected terminal card with no human
+                    # category yet is stamped 'go_noetig' (the F40 default).
+                    _park_category = (
+                        _row_category
+                        if _row_category in _HUMAN_DECISION_CATEGORIES
+                        else "go_noetig"
+                    )
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = 'till', "
                         "status = 'blocked', block_kind = 'needs_input', "
-                        "category = 'go_noetig' "
+                        "category = ? "
                         "WHERE id = ? AND status = 'ready'",
-                        (row["id"],),
+                        (_park_category, row["id"]),
                     )
                     if cur.rowcount == 1:
                         # F40: has this card ever been go-gate-held before?

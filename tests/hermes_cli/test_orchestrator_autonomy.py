@@ -393,6 +393,67 @@ def test_go_gate_reparks_leaked_go_noetig_card_without_comment_spam(
         assert _comment_count() == 1
 
 
+def test_go_gate_reparks_leaked_entscheidung_card_preserving_category(
+    kanban_home, all_assignees_spawnable,
+):
+    # F51: F40's synchronous re-park only fired for 'go_noetig'. A leaked
+    # owner-Zielentscheidung (category 'entscheidung', assignee 'till') — e.g.
+    # a merge-gated decision whose category got flipped go_noetig->entscheidung
+    # by a manager move_to_human — slipped past the gate, lingered in
+    # ready@till, and a slow Manager agent re-blocked it minutes later, a
+    # window the board scan catches as rot-stuck (live Karte 47 t_0c438764).
+    # Any human-decision category on the human sink must re-assert the hold in
+    # the SAME tick, and the category (the inbox bucket) must survive the cycle.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Strategie fuer Environment Variables sicher speichern",
+            assignee="till",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = 'till', "
+            "category = 'entscheidung', block_kind = 'needs_input' WHERE id = ?",
+            (tid,),
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        assert task.block_kind == "needs_input"
+        # Inbox bucket preserved — NOT overwritten with go_noetig.
+        assert task.category == "entscheidung"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+
+        # Leak again (Beobachter ANTWORT_TODO -> recompute_ready -> ready@till):
+        # the re-park stays synchronous, so the card is never stuck in ready.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).category == "entscheidung"
+
+
+def test_go_gate_ignores_decision_category_card_owned_by_worker(
+    kanban_home, all_assignees_spawnable,
+):
+    # F51 guard against over-gating: a decision-category card is only a
+    # waiting-on-Till card when it sits on the human sink (assignee='till').
+    # A card carrying category 'entscheidung' but still owned by a real worker
+    # profile is active work (a worker about to escalate) and must still spawn
+    # — the gate keys on assignee='till', not on the category alone.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Ganz normale Arbeitskarte", assignee="alice",
+        )
+        conn.execute(
+            "UPDATE tasks SET category = 'entscheidung' WHERE id = ?", (tid,),
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == [tid]
+
+
 def test_go_gate_holds_merger_card_despite_assignee(
     kanban_home, all_assignees_spawnable,
 ):
