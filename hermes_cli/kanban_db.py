@@ -1820,6 +1820,17 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    if (
+        os.environ.get("HERMES_TEST_ISOLATION")
+        and db_path is None
+        and not os.environ.get("HERMES_KANBAN_DB", "").strip()
+        and not os.environ.get("HERMES_KANBAN_HOME", "").strip()
+        and not os.environ.get("HERMES_HOME", "").strip()
+    ):
+        raise RuntimeError(
+            "HERMES_TEST_ISOLATION is active but no explicit test kanban DB "
+            "or Hermes home is configured; refusing default kanban.db"
+        )
     if db_path is not None:
         path = db_path
     else:

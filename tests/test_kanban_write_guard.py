@@ -12,12 +12,76 @@ fixture-setup time.
 """
 from __future__ import annotations
 
+import os
+import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from tests import conftest as _conftest
+
+
+_CHILD_CREATE_SENTINEL = """
+from hermes_cli import kanban_db as kb
+
+conn = kb.connect()
+try:
+    kb.create_task(conn, title="child-process-sentinel")
+finally:
+    conn.close()
+"""
+
+
+def test_child_process_requires_explicit_test_db(tmp_path):
+    """The test marker fails closed in children that lose every DB/home pin."""
+    env = os.environ.copy()
+    simulated_home = tmp_path / "simulated-user-home"
+    env["HOME"] = str(simulated_home)
+    env["HERMES_TEST_ISOLATION"] = "1"
+    for name in tuple(env):
+        if name.startswith("PYTEST_"):
+            env.pop(name)
+    for name in (
+        "HERMES_HOME",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+    ):
+        env.pop(name, None)
+
+    unpinned = subprocess.run(
+        [sys.executable, "-c", _CHILD_CREATE_SENTINEL],
+        cwd=_conftest.PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    simulated_prod_db = simulated_home / ".hermes" / "kanban.db"
+    assert unpinned.returncode != 0
+    assert "HERMES_TEST_ISOLATION" in unpinned.stderr
+    assert not simulated_prod_db.exists()
+
+    isolated_db = tmp_path / "explicit-test-kanban.db"
+    env["HERMES_KANBAN_DB"] = str(isolated_db)
+    pinned = subprocess.run(
+        [sys.executable, "-c", _CHILD_CREATE_SENTINEL],
+        cwd=_conftest.PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pinned.returncode == 0, pinned.stderr
+    with sqlite3.connect(isolated_db) as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE title = ?",
+            ("child-process-sentinel",),
+        ).fetchone()[0] == 1
 
 
 def test_explicit_db_path_under_real_root_refused():
