@@ -1797,6 +1797,21 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+def _guard_unpinned_test_database(db_path: Optional[Path]) -> None:
+    """Fail closed when a test process would fall back to the default DB."""
+    if (
+        os.environ.get("HERMES_TEST_ISOLATION")
+        and db_path is None
+        and not os.environ.get("HERMES_KANBAN_DB", "").strip()
+        and not os.environ.get("HERMES_KANBAN_HOME", "").strip()
+        and not os.environ.get("HERMES_HOME", "").strip()
+    ):
+        raise RuntimeError(
+            "HERMES_TEST_ISOLATION is active but no explicit test kanban DB "
+            "or Hermes home is configured; refusing default kanban.db"
+        )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -1820,17 +1835,7 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
-    if (
-        os.environ.get("HERMES_TEST_ISOLATION")
-        and db_path is None
-        and not os.environ.get("HERMES_KANBAN_DB", "").strip()
-        and not os.environ.get("HERMES_KANBAN_HOME", "").strip()
-        and not os.environ.get("HERMES_HOME", "").strip()
-    ):
-        raise RuntimeError(
-            "HERMES_TEST_ISOLATION is active but no explicit test kanban DB "
-            "or Hermes home is configured; refusing default kanban.db"
-        )
+    _guard_unpinned_test_database(db_path)
     if db_path is not None:
         path = db_path
     else:
@@ -1976,6 +1981,7 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    _guard_unpinned_test_database(db_path)
     if db_path is not None:
         path = db_path
     else:

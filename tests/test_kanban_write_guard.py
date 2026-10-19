@@ -35,8 +35,15 @@ finally:
 """
 
 
-def test_child_process_requires_explicit_test_db(tmp_path):
-    """The test marker fails closed in children that lose every DB/home pin."""
+_CHILD_INIT_DB = """
+from hermes_cli import kanban_db as kb
+
+kb.init_db()
+"""
+
+
+def _isolated_child_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """Return a test-marked child env with every Hermes DB/home pin removed."""
     env = os.environ.copy()
     simulated_home = tmp_path / "simulated-user-home"
     env["HOME"] = str(simulated_home)
@@ -51,6 +58,12 @@ def test_child_process_requires_explicit_test_db(tmp_path):
         "HERMES_KANBAN_BOARD",
     ):
         env.pop(name, None)
+    return env, simulated_home
+
+
+def test_child_process_requires_explicit_test_db(tmp_path):
+    """The test marker fails closed in children that lose every DB/home pin."""
+    env, simulated_home = _isolated_child_env(tmp_path)
 
     unpinned = subprocess.run(
         [sys.executable, "-c", _CHILD_CREATE_SENTINEL],
@@ -82,6 +95,40 @@ def test_child_process_requires_explicit_test_db(tmp_path):
             "SELECT count(*) FROM tasks WHERE title = ?",
             ("child-process-sentinel",),
         ).fetchone()[0] == 1
+
+
+def test_child_init_db_requires_explicit_test_db(tmp_path):
+    """init_db must not turn an implicit production path explicit."""
+    env, simulated_home = _isolated_child_env(tmp_path)
+    command = [sys.executable, "-c", _CHILD_INIT_DB]
+
+    unpinned = subprocess.run(
+        command,
+        cwd=_conftest.PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    simulated_prod_db = simulated_home / ".hermes" / "kanban.db"
+    assert unpinned.returncode != 0
+    assert "HERMES_TEST_ISOLATION" in unpinned.stderr
+    assert not simulated_prod_db.exists()
+
+    isolated_db = tmp_path / "explicit-init-test-kanban.db"
+    env["HERMES_KANBAN_DB"] = str(isolated_db)
+    pinned = subprocess.run(
+        command,
+        cwd=_conftest.PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pinned.returncode == 0, pinned.stderr
+    assert isolated_db.exists()
+    with sqlite3.connect(isolated_db) as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_explicit_db_path_under_real_root_refused():
