@@ -1099,12 +1099,13 @@ def _send_manager_loop_alert(
         )
 
 
-def _drain_manager_loop_alerts(task_id: str) -> None:
-    """Retry durable alerts until a successful Telegram send is recorded."""
+def _drain_manager_loop_alerts() -> None:
+    """Retry one board-wide pending alert on the next guarded action."""
     with kb.connect_closing() as conn:
-        alert = kb.claim_pending_manager_alert(conn, task_id=task_id)
+        alert = kb.claim_pending_manager_alert(conn)
     if alert is None:
         return
+    task_id = str(alert["task_id"])
     try:
         with kb.connect_closing() as conn:
             task = kb.get_task(conn, task_id)
@@ -1272,9 +1273,9 @@ def kanban_command(args: argparse.Namespace) -> int:
                         f"Manager loop brake: skipped {action} for {task_id} "
                         f"after {guard_result.repeat_count} unchanged repeats"
                     )
-                    _drain_manager_loop_alerts(task_id)
+                    _drain_manager_loop_alerts()
                     return 0
-                _drain_manager_loop_alerts(task_id)
+                _drain_manager_loop_alerts()
                 return int(guard_result.mutation_result or 0)
 
             return int(handler(args) or 0)

@@ -4059,21 +4059,25 @@ def guard_manager_action(
 def claim_pending_manager_alert(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
+    task_id: Optional[str] = None,
     claim_ttl_seconds: int = 300,
 ) -> Optional[sqlite3.Row]:
     """Claim one undelivered alert so concurrent ticks cannot double-send."""
     now = int(time.time())
     stale_before = now - claim_ttl_seconds
     with write_txn(conn):
+        task_filter = "task_id = ? AND " if task_id is not None else ""
+        params: tuple[Any, ...] = (
+            (task_id, stale_before) if task_id is not None else (stale_before,)
+        )
         row = conn.execute(
-            """
+            f"""
             SELECT id FROM manager_alert_outbox
-             WHERE task_id = ? AND delivered_at IS NULL
+             WHERE {task_filter}delivered_at IS NULL
                AND (claimed_at IS NULL OR claimed_at < ?)
              ORDER BY id LIMIT 1
             """,
-            (task_id, stale_before),
+            params,
         ).fetchone()
         if row is None:
             return None
