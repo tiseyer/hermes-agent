@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import os
 import shlex
@@ -243,6 +244,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "(set via `hermes kanban boards switch <slug>` or the "
             "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
             "to see all boards."
+        ),
+    )
+    kanban_parser.add_argument(
+        "--manager-action",
+        action="store_true",
+        help=(
+            "Route this single-card mutation through the persistent Manager "
+            "loop brake. Manager cron rituals must put this before the action."
         ),
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
@@ -989,6 +998,131 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 # Command dispatch
 # ---------------------------------------------------------------------------
 
+_MANAGER_GUARDED_ACTIONS = {
+    "comment",
+    "relabel",
+    "human",
+    "block",
+    "schedule",
+    "unblock",
+    "promote",
+    "archive",
+}
+
+
+class _ManagerMutationFailed(RuntimeError):
+    def __init__(self, return_code: int):
+        super().__init__(f"manager mutation failed with exit code {return_code}")
+        self.return_code = return_code
+
+
+def _comment_body(args: argparse.Namespace) -> str:
+    body = " ".join(args.text).strip()
+    if args.max_len is not None:
+        if args.max_len < 1:
+            raise ValueError("--max-len must be positive")
+        if len(body) > args.max_len:
+            suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
+            body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+    return body
+
+
+def _manager_action_task_id(args: argparse.Namespace) -> str:
+    """Resolve exactly one card from a guarded CLI mutation."""
+    direct = getattr(args, "task_id", None)
+    listed = list(getattr(args, "task_ids", None) or [])
+    extra = list(getattr(args, "ids", None) or [])
+    purge = list(getattr(args, "purge_ids", None) or [])
+    ids = ([direct] if direct else []) + listed + extra + purge
+    ids = [str(task_id) for task_id in ids if task_id]
+    unique = list(dict.fromkeys(ids))
+    if len(unique) != 1:
+        raise ValueError(
+            "--manager-action requires a mutation of exactly one existing card"
+        )
+    return unique[0]
+
+
+def _manager_action_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """Canonical payload for detecting a repeated semantic CLI action."""
+    action = args.kanban_action
+    if action == "comment":
+        return {"body": _comment_body(args), "author": args.author or _profile_author()}
+    if action in {"block", "schedule", "promote"}:
+        reason = " ".join(getattr(args, "reason", None) or []).strip() or None
+    else:
+        reason = (getattr(args, "reason", None) or "").strip() or None
+    fields_by_action = {
+        "relabel": ("title", "kurzbeschreibung"),
+        "human": ("title", "kurzbeschreibung", "category"),
+        "block": ("kind",),
+        "schedule": (),
+        "unblock": (),
+        "promote": ("force", "dry_run"),
+        "archive": ("purge_ids",),
+    }
+    payload = {"reason": reason}
+    payload.update(
+        (name, getattr(args, name, None))
+        for name in fields_by_action.get(action, ())
+    )
+    return payload
+
+
+def _send_manager_loop_alert(
+    task: kb.Task,
+    action_kind: str,
+    repeat_count: int,
+) -> None:
+    """Send the one claimed loop-brake alert to Telegram's home channel."""
+    send_message_tool = importlib.import_module(
+        "tools.send_message_tool"
+    ).send_message_tool
+
+    message = (
+        "Manager-Schleifenbremse: Karte "
+        f"„{task.title}“ wurde nach {repeat_count} identischen "
+        f"{action_kind}-Aktionen ohne relevante Zustandsänderung angehalten. "
+        "Andere Karten laufen weiter."
+    )
+    raw = send_message_tool(
+        {"action": "send", "target": "telegram", "message": message}
+    )
+    try:
+        result = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        result = {"error": "invalid response"}
+    if not result.get("success"):
+        raise RuntimeError(
+            "Manager loop-brake Telegram delivery failed: "
+            f"{result.get('error') or result}"
+        )
+
+
+def _drain_manager_loop_alerts(task_id: str) -> None:
+    """Retry durable alerts until a successful Telegram send is recorded."""
+    with kb.connect_closing() as conn:
+        alert = kb.claim_pending_manager_alert(conn, task_id=task_id)
+    if alert is None:
+        return
+    try:
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, task_id)
+        if task is None:
+            return
+        _send_manager_loop_alert(
+            task,
+            str(alert["action_kind"]),
+            int(alert["repeat_count"]),
+        )
+    except Exception as exc:
+        with kb.connect_closing() as conn:
+            kb.mark_manager_alert_failed(conn, int(alert["id"]), str(exc))
+        print(f"kanban: {exc}", file=sys.stderr)
+        return
+    with kb.connect_closing() as conn:
+        kb.mark_manager_alert_delivered(conn, int(alert["id"]))
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …`` argparse dispatch.
 
@@ -1107,6 +1241,42 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
         try:
+            guard_result: Optional[kb.ManagerActionGuardResult] = None
+            if getattr(args, "manager_action", False):
+                if action not in _MANAGER_GUARDED_ACTIONS:
+                    raise ValueError(
+                        f"--manager-action is not valid for {action!r}"
+                    )
+                task_id = _manager_action_task_id(args)
+                try:
+                    with kb.connect_closing() as conn:
+                        def _mutation():
+                            with kb.connection_override(conn):
+                                return_code = int(handler(args) or 0)
+                            if return_code != 0:
+                                raise _ManagerMutationFailed(return_code)
+                            return return_code
+
+                        _, guard_result = kb.guard_manager_action(
+                            conn,
+                            task_id,
+                            action,
+                            _manager_action_payload(args),
+                            mutation=_mutation,
+                        )
+                except _ManagerMutationFailed as exc:
+                    return exc.return_code
+                assert guard_result is not None
+                if not guard_result.allowed:
+                    print(
+                        f"Manager loop brake: skipped {action} for {task_id} "
+                        f"after {guard_result.repeat_count} unchanged repeats"
+                    )
+                    _drain_manager_loop_alerts(task_id)
+                    return 0
+                _drain_manager_loop_alerts(task_id)
+                return int(guard_result.mutation_result or 0)
+
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
@@ -1971,14 +2141,11 @@ def _cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
-    body = " ".join(args.text).strip()
-    if args.max_len is not None:
-        if args.max_len < 1:
-            print("kanban: --max-len must be positive", file=sys.stderr)
-            return 2
-        if len(body) > args.max_len:
-            suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
-            body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+    try:
+        body = _comment_body(args)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)

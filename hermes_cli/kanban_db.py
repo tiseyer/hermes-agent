@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1178,6 +1178,17 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ManagerActionGuardResult:
+    """Decision returned before one explicitly-marked Manager mutation."""
+
+    allowed: bool
+    repeat_count: int
+    alert_claimed: bool
+    reset: bool = False
+    mutation_result: Any = None
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1320,6 +1331,39 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Per-card loop brake for explicitly-marked Manager mutations. This is
+-- operational guard state, not user-visible card state.
+CREATE TABLE IF NOT EXISTS manager_action_guard (
+    task_id          TEXT PRIMARY KEY,
+    action_hash      TEXT NOT NULL,
+    state_hash       TEXT NOT NULL,
+    repeat_count     INTEGER NOT NULL DEFAULT 0,
+    halted           INTEGER NOT NULL DEFAULT 0,
+    alert_claimed_at INTEGER,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manager_action_comments (
+    comment_id INTEGER PRIMARY KEY,
+    task_id    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manager_alert_outbox (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    action_kind    TEXT NOT NULL,
+    repeat_count   INTEGER NOT NULL,
+    title          TEXT NOT NULL,
+    action_hash    TEXT NOT NULL,
+    state_hash     TEXT NOT NULL,
+    delivered_at   INTEGER,
+    claimed_at     INTEGER,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    created_at     INTEGER NOT NULL,
+    UNIQUE(task_id, action_hash, state_hash)
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1401,6 +1445,10 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_CONNECTION_OVERRIDE: ContextVar[sqlite3.Connection | None] = ContextVar(
+    "hermes_kanban_connection_override",
+    default=None,
+)
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1940,6 +1988,10 @@ def connect_closing(
     intentionally manage the connection lifetime (tests, long-lived
     callers) continue to work.
     """
+    existing = _CONNECTION_OVERRIDE.get()
+    if existing is not None:
+        yield existing
+        return
     conn = connect(db_path=db_path, board=board)
     try:
         yield conn
@@ -1948,6 +2000,16 @@ def connect_closing(
             conn.close()
         except Exception:
             pass
+
+
+@contextlib.contextmanager
+def connection_override(conn: sqlite3.Connection):
+    """Make nested CLI handlers reuse one caller-owned transaction."""
+    token = _CONNECTION_OVERRIDE.set(conn)
+    try:
+        yield
+    finally:
+        _CONNECTION_OVERRIDE.reset(token)
 
 
 def init_db(
@@ -2714,6 +2776,19 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if getattr(conn, "in_transaction", False):
+        savepoint = f"hermes_nested_{secrets.token_hex(6)}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -3741,6 +3816,303 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 # Comments & events
 # ---------------------------------------------------------------------------
+
+MANAGER_ACTION_REPEAT_LIMIT = 3
+
+_MANAGER_STATE_COLUMNS = (
+    "status", "status_changed_at", "title", "body", "assignee", "priority",
+    "block_kind", "block_recurrences", "category", "current_run_id",
+    "consecutive_failures", "last_failure_error", "result", "parent_id",
+    "initiative_id", "family_root_id", "family_order", "child_role",
+    "repository", "project_id", "merge_group", "workflow_template_id",
+    "current_step_key",
+)
+
+_MANAGER_IGNORED_EVENT_KINDS = {
+    "commented",
+    "heartbeat",
+    "manager_loop_halted",
+}
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _manager_relevant_state_hash(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Task, str]:
+    """Hash durable, user-relevant state while excluding Manager self-noise.
+
+    Heartbeats/claim expiry and Manager comments must not reset a stable loop.
+    External comments, card fields, relevant events and dependency/family state
+    do reset it. The task object is returned for alert rendering.
+    """
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    task = Task.from_row(row)
+    keys = set(row.keys())
+    state: dict[str, Any] = {
+        key: row[key] if key in keys else None for key in _MANAGER_STATE_COLUMNS
+    }
+
+    external_comment = conn.execute(
+        """
+        SELECT c.id, c.author, c.body
+          FROM task_comments c
+          LEFT JOIN manager_action_comments m ON m.comment_id = c.id
+         WHERE c.task_id = ? AND m.comment_id IS NULL
+         ORDER BY c.id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    state["latest_external_comment"] = (
+        {
+            "id": external_comment["id"],
+            "author": external_comment["author"],
+            "body_hash": _canonical_sha256(external_comment["body"]),
+        }
+        if external_comment
+        else None
+    )
+
+    ignored = sorted(_MANAGER_IGNORED_EVENT_KINDS)
+    placeholders = ",".join("?" for _ in ignored)
+    relevant_event = conn.execute(
+        f"""
+        SELECT id, kind, payload
+          FROM task_events
+         WHERE task_id = ? AND kind NOT IN ({placeholders})
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id, *ignored),
+    ).fetchone()
+    state["latest_relevant_event"] = (
+        {
+            "id": relevant_event["id"],
+            "kind": relevant_event["kind"],
+            "payload": relevant_event["payload"],
+        }
+        if relevant_event
+        else None
+    )
+
+    dependency_rows = conn.execute(
+        """
+        SELECT p.id, p.status, p.status_changed_at, p.result
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    state["dependencies"] = [dict(dependency) for dependency in dependency_rows]
+
+    family_key = row["family_root_id"] or task_id
+    family_rows = conn.execute(
+        """
+        SELECT id, status, status_changed_at, assignee, result
+          FROM tasks
+         WHERE family_root_id = ? OR id = ?
+         ORDER BY id
+        """,
+        (family_key, family_key),
+    ).fetchall()
+    state["family"] = [dict(member) for member in family_rows]
+    return task, _canonical_sha256(state)
+
+
+def guard_manager_action(
+    conn: sqlite3.Connection,
+    task_id: str,
+    action_kind: str,
+    action_payload: Any,
+    *,
+    mutation: Callable[[], Any],
+    repeat_limit: int = MANAGER_ACTION_REPEAT_LIMIT,
+) -> tuple[Task, ManagerActionGuardResult]:
+    """Atomically decide whether one explicit Manager mutation may execute.
+
+    Attempts one through ``repeat_limit`` are allowed. The threshold attempt
+    atomically halts future matching attempts and claims one alert; later ticks
+    are silent no-ops. A changed action or relevant card state starts a fresh
+    per-card episode.
+    """
+    if repeat_limit < 1:
+        raise ValueError("repeat_limit must be positive")
+    normalized_kind = str(action_kind or "").strip().lower()
+    if not normalized_kind:
+        raise ValueError("action_kind is required")
+    action_hash = _canonical_sha256(
+        {"kind": normalized_kind, "payload": action_payload}
+    )
+    now = int(time.time())
+
+    with write_txn(conn):
+        task, state_hash = _manager_relevant_state_hash(conn, task_id)
+        prior = conn.execute(
+            "SELECT * FROM manager_action_guard WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        reset = bool(
+            prior
+            and (
+                prior["action_hash"] != action_hash
+                or prior["state_hash"] != state_hash
+            )
+        )
+        if prior and not reset and prior["halted"]:
+            return task, ManagerActionGuardResult(
+                allowed=False,
+                repeat_count=int(prior["repeat_count"]),
+                alert_claimed=False,
+            )
+
+        repeat_count = (
+            int(prior["repeat_count"]) + 1 if prior and not reset else 1
+        )
+        before_comment_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        mutation_result = mutation()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO manager_action_comments (comment_id, task_id)
+            SELECT id, task_id FROM task_comments
+             WHERE task_id = ? AND id > ?
+            """,
+            (task_id, before_comment_id),
+        )
+        alert_claimed = repeat_count >= repeat_limit
+        conn.execute(
+            """
+            INSERT INTO manager_action_guard (
+                task_id, action_hash, state_hash, repeat_count, halted,
+                alert_claimed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                action_hash = excluded.action_hash,
+                state_hash = excluded.state_hash,
+                repeat_count = excluded.repeat_count,
+                halted = excluded.halted,
+                alert_claimed_at = excluded.alert_claimed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                action_hash,
+                state_hash,
+                repeat_count,
+                int(alert_claimed),
+                now if alert_claimed else None,
+                now,
+            ),
+        )
+        if alert_claimed:
+            _append_event(
+                conn,
+                task_id,
+                "manager_loop_halted",
+                {
+                    "action_kind": normalized_kind,
+                    "repeat_count": repeat_count,
+                    "action_hash": action_hash,
+                    "state_hash": state_hash,
+                },
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO manager_alert_outbox (
+                    task_id, action_kind, repeat_count, title,
+                    action_hash, state_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id, normalized_kind, repeat_count, task.title,
+                    action_hash, state_hash, now,
+                ),
+            )
+        return task, ManagerActionGuardResult(
+            allowed=True,
+            repeat_count=repeat_count,
+            alert_claimed=alert_claimed,
+            reset=reset,
+            mutation_result=mutation_result,
+        )
+
+
+def claim_pending_manager_alert(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    claim_ttl_seconds: int = 300,
+) -> Optional[sqlite3.Row]:
+    """Claim one undelivered alert so concurrent ticks cannot double-send."""
+    now = int(time.time())
+    stale_before = now - claim_ttl_seconds
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT id FROM manager_alert_outbox
+             WHERE task_id = ? AND delivered_at IS NULL
+               AND (claimed_at IS NULL OR claimed_at < ?)
+             ORDER BY id LIMIT 1
+            """,
+            (task_id, stale_before),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE manager_alert_outbox SET claimed_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
+        return conn.execute(
+            "SELECT * FROM manager_alert_outbox WHERE id = ?", (row["id"],)
+        ).fetchone()
+
+
+def mark_manager_alert_delivered(conn: sqlite3.Connection, alert_id: int) -> None:
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE manager_alert_outbox
+               SET delivered_at = ?, claimed_at = NULL,
+                   attempts = attempts + 1, last_error = NULL
+             WHERE id = ? AND delivered_at IS NULL
+            """,
+            (int(time.time()), alert_id),
+        )
+
+
+def mark_manager_alert_failed(
+    conn: sqlite3.Connection,
+    alert_id: int,
+    error: str,
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE manager_alert_outbox
+               SET claimed_at = NULL, attempts = attempts + 1, last_error = ?
+             WHERE id = ? AND delivered_at IS NULL
+            """,
+            (str(error)[:1000], alert_id),
+        )
 
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
@@ -7149,6 +7521,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        conn.execute("DELETE FROM manager_action_comments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM manager_alert_outbox WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM manager_action_guard WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -7182,6 +7557,9 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
             ).fetchall()
         ]
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute("DELETE FROM manager_action_comments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM manager_alert_outbox WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM manager_action_guard WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
