@@ -434,6 +434,75 @@ def test_go_gate_reparks_leaked_entscheidung_card_preserving_category(
         assert kb.get_task(conn, tid).category == "entscheidung"
 
 
+def test_go_gate_reparks_leaked_blank_category_owner_decision(
+    kanban_home, all_assignees_spawnable,
+):
+    # F54: the F50 owner-Zielentscheidung escalation parks the card at
+    # blocked@till but historically left `category` BLANK. When the Beobachter
+    # posts antwort_till and flips the card blocked->todo (a 'status' event, not
+    # an 'unblocked'), recompute_ready promotes it todo->ready@till where the
+    # F40/F51 category/vocabulary checks no longer recognise it — it stranded in
+    # ready@till until the board scan read it as rot-stuck (live Karte 47
+    # t_50c33925). The sticky owner-decision 'blocked' event survives the flip,
+    # so the dispatcher keys off it even with a blank category and re-asserts the
+    # hold in the SAME tick, stamping the correct 'entscheidung' inbox bucket.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Strategie fuer Environment Variables sicher speichern",
+            assignee="till",
+        )
+        # Leaked state: ready@till, BLANK category, with the sticky F50 escalation
+        # 'blocked' event as the most-recent blocked/unblocked record.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = 'till', "
+            "category = '', block_kind = 'needs_input' WHERE id = ?",
+            (tid,),
+        )
+        kb._append_event(
+            conn, tid, "blocked",
+            {"reason": "owner decision", "kind": "needs_input",
+             "recurrences": 2, "escalation": "owner_decision_loop"},
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        # Blank category is upgraded to the owner-decision inbox bucket, so the
+        # NEXT leak is caught by the ordinary F51 category path (self-sustaining).
+        assert task.category == "entscheidung"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+
+
+def test_go_gate_ignores_blank_category_needs_input_without_escalation(
+    kanban_home, all_assignees_spawnable,
+):
+    # F54 guard against over-gating: a plain needs_input card at ready@till with
+    # a blank category and NO owner-decision escalation marker (e.g. a transient
+    # infra re-queue) must NOT be treated as a held owner decision — the backstop
+    # keys strictly on the sticky 'owner_decision_loop' blocked event. Without an
+    # assignee re-route it would just skip as non-spawnable, never re-parked.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Irgendeine Karte", assignee="till",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = 'till', "
+            "category = '', block_kind = 'needs_input' WHERE id = ?",
+            (tid,),
+        )
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input"})
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: None)
+        # The backstop must NOT fire: no re-park to blocked, no go_gate_held
+        # marker, category left blank. (In prod 'till' is non-spawnable so the
+        # card merely skips; here the test fixture makes every assignee
+        # spawnable, so what matters is strictly the absence of the hold.)
+        assert kb.get_task(conn, tid).status != "blocked"
+        assert kb.get_task(conn, tid).category in ("", None)
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+
+
 def test_go_gate_ignores_decision_category_card_owned_by_worker(
     kanban_home, all_assignees_spawnable,
 ):

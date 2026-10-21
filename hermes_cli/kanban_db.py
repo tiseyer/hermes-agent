@@ -7576,6 +7576,21 @@ def block_task(
                 and _card_has_nontech_zielfrage(conn, task_id)
             )
             if _owner_loop:
+                # F54: stamp a durable human-decision ``category`` on the park.
+                # Without it the escalated card rests at ``blocked@till`` with an
+                # EMPTY category; when the Beobachter then posts ``antwort_till``
+                # and flips the card ``blocked→todo`` (ANTWORT_TODO), recompute_ready
+                # promotes it ``todo→ready@till`` and the F40/F51 synchronous re-park
+                # no longer recognises it — the title/body carry no GO-gate vocabulary
+                # and the empty category matches neither ``go_noetig`` nor
+                # _HUMAN_DECISION_CATEGORIES, so the card strands in ``ready@till``
+                # (non-spawnable human assignee) until the board scan reads it as
+                # rot-stuck (live repro F39 Karte 47 ``t_50c33925``: owner Vault
+                # Zielentscheidung looped blocked↔todo, then leaked to ready@till and
+                # stuck 2h). ``entscheidung`` is the owner-decision bucket and IS in
+                # _HUMAN_DECISION_CATEGORIES, so the re-park re-asserts the hold in the
+                # SAME dispatch tick. An already-set human-decision category is kept
+                # (symmetric to the F51 ``_park_category`` preservation).
                 cur = conn.execute(
                     """
                     UPDATE tasks
@@ -7585,6 +7600,10 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = 'needs_input',
+                           category      = CASE
+                               WHEN category IN
+                                   ('frage', 'entscheidung', 'abnahme', 'go_noetig')
+                               THEN category ELSE 'entscheidung' END,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
@@ -10996,6 +11015,40 @@ def _is_technik_card_body(body: Optional[str]) -> bool:
     return bool(body) and _TECHNIK_CARD_BODY_MARKER in body
 
 
+def _held_owner_decision(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's most recent ``blocked`` event is an F50 owner-
+    Zielentscheidung-loop escalation (``escalation == 'owner_decision_loop'``).
+
+    F54 backstop for the dispatch re-park: an F50 escalation parks the card at
+    ``blocked@till`` but (historically) left ``category`` empty. When the
+    Beobachter then posts ``antwort_till`` and flips the card ``blocked→todo``
+    (an ``ANTWORT_TODO`` ``status`` event, NOT an ``unblocked``), recompute_ready
+    promotes it ``todo→ready@till`` — where the F40/F51 category/vocabulary
+    checks no longer recognise it and it strands in ``ready@till`` (non-spawnable
+    human assignee) until the board scan reads it as rot-stuck (live repro F39
+    Karte 47 ``t_50c33925``). The sticky owner-decision ``blocked`` event survives
+    the ``status`` flip, so it is the durable "this is a held owner decision"
+    marker the dispatcher can key off even when ``category`` is blank — letting
+    the re-park re-assert the hold for a card that predates the category stamp.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (ValueError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("escalation") == "owner_decision_loop"
+    )
+
+
 def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when a human has explicitly released this card past the GO gate.
 
@@ -12172,6 +12225,12 @@ def _dispatch_once_locked(
         # is preserved exactly.
         _row_category = (row["category"] or "") if "category" in row.keys() else ""
         _on_human_sink = (row_assignee or "").strip().lower() == "till"
+        # F54: a held owner Zielentscheidung (F50) that leaked back to ready@till
+        # with a BLANK category — its durable marker is the sticky owner-decision
+        # ``blocked`` event, not the category column — must still be re-parked.
+        # Only consult it on the human sink (the leak target), where the extra
+        # per-row event read is cheap (ready@till is rare) and unambiguous.
+        _held_owner_dec = _on_human_sink and _held_owner_decision(conn, row["id"])
         _is_terminal_card = (
             bool(_GO_GATE_RE.search(_title))
             or bool(_GO_GATE_BODY_RE.search(_body))
@@ -12179,6 +12238,7 @@ def _dispatch_once_locked(
             or (_row_merge_group is not None and str(_row_merge_group).strip() != "")
             or _row_category == "go_noetig"
             or (_row_category in _HUMAN_DECISION_CATEGORIES and _on_human_sink)
+            or _held_owner_dec
         )
         if _is_terminal_card and not _go_gate_released(conn, row["id"]):
             result.skipped_nonspawnable.append(row["id"])
@@ -12268,11 +12328,16 @@ def _dispatch_once_locked(
                     # its inbox bucket across the leak/re-park cycle; only a
                     # vocab-/merger-detected terminal card with no human
                     # category yet is stamped 'go_noetig' (the F40 default).
-                    _park_category = (
-                        _row_category
-                        if _row_category in _HUMAN_DECISION_CATEGORIES
-                        else "go_noetig"
-                    )
+                    # F54: an owner Zielentscheidung held by F50 belongs in the
+                    # 'entscheidung' inbox bucket, not the 'go_noetig' Merge-GO
+                    # default — a blank-category card re-parked via _held_owner_dec
+                    # would otherwise be mislabelled as a merge gate.
+                    if _row_category in _HUMAN_DECISION_CATEGORIES:
+                        _park_category = _row_category
+                    elif _held_owner_dec:
+                        _park_category = "entscheidung"
+                    else:
+                        _park_category = "go_noetig"
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = 'till', "
                         "status = 'blocked', block_kind = 'needs_input', "
