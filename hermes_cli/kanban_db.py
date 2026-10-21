@@ -124,6 +124,17 @@ HUMAN_CARD_KURZBESCHREIBUNG_MAX = 160
 # coupling for cards blocked with ``needs_input`` AFTER the migration).
 _USER_VERSION_HUMAN_STATUS = 1
 
+# F52: one-shot recovery that UNDOES the v1 misfire. The original
+# ``_apply_human_status_migration`` (before its F38 guard) swept EVERY
+# ``blocked``+(``needs_input``|``assignee='till'``) card into ``human`` —
+# including legit business Zielentscheidung cards that the Beobachter only
+# greens while they REST in ``blocked`` (``blocked_zielfrage``). Those cards
+# stranded in ``human`` → rot-stuck. This pass moves every ``human`` card that
+# carries a genuine non-technical Zielfrage back to ``blocked``. Runs exactly
+# once per DB (it is strictly after v1, so a fresh board — where the now-guarded
+# v1 never mangled a Zielfrage — simply finds nothing to recover).
+_USER_VERSION_HUMAN_ZIELFRAGE_FIX = 2
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -2467,6 +2478,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
         _set_user_version(conn, _USER_VERSION_HUMAN_STATUS)
 
+    # F52: one-shot recovery of the v1 misfire — pull legit blocked-Zielfrage
+    # cards back out of ``human`` into ``blocked``. Strictly after the v1 block:
+    # on a fresh board the now-guarded v1 never mangled a Zielfrage, so this
+    # finds nothing; on an already-migrated board (user_version == 1) it repairs
+    # the 38 cards the unguarded v1 stranded. Guarded by its own version bit so
+    # it fires exactly once and never re-blocks a card a human later moves on.
+    if (
+        {"status", "block_kind"} <= _human_cols
+        and _read_user_version(conn) < _USER_VERSION_HUMAN_ZIELFRAGE_FIX
+    ):
+        recovered = _recover_misparked_human_zielfragen(conn)
+        if recovered:
+            _log.info(
+                "kanban: F52 restored %d blocked_zielfrage card(s) from "
+                "human→blocked: %s",
+                len(recovered),
+                ", ".join(f"{tid}({title!r})" for tid, title in recovered),
+            )
+        _set_user_version(conn, _USER_VERSION_HUMAN_ZIELFRAGE_FIX)
+
 
 def _read_user_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("PRAGMA user_version").fetchone()
@@ -2502,6 +2533,12 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
         item; it must stay in its column, not jump to Till's inbox (Foxtrot
         finding 27.09.). ``human_check`` children are the only signal that
         crosses column boundaries, because they are human steps by definition.
+      * F38/F52: a ``blocked`` card carrying a genuine non-technical business
+        Zielfrage (:func:`_blocked_card_has_zielfrage`) must REST in ``blocked``
+        — the only status the Beobachter greens for a ``blocked_zielfrage`` card
+        — so it is excluded from the sweep. The original (unguarded) version
+        mass-swept 38 such cards into ``human`` where they stranded rot-stuck;
+        :func:`_recover_misparked_human_zielfragen` (v2) undoes that.
 
     Idempotent: migrated rows now hold ``status='human'``, which clause (1)
     excludes, so a second call moves nothing. ``child_role``/``block_kind`` are
@@ -2518,7 +2555,7 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
     """
     rows = conn.execute(
         """
-        SELECT id, title FROM tasks
+        SELECT id, title, status, child_role FROM tasks
          WHERE status NOT IN ('archived', 'done', 'review', 'human')
            AND (
                  child_role = 'human_check'
@@ -2527,7 +2564,22 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
            )
         """
     ).fetchall()
-    moved = [(r["id"], r["title"]) for r in rows]
+    # F38/F52 guard — a THIRD call site of the stays-blocked rule (after
+    # ``move_to_human`` and the dispatcher GO-gate re-park): a ``blocked`` card
+    # carrying a genuine non-technical business Zielfrage must REST in
+    # ``blocked`` — the only status the Beobachter greens for a
+    # ``blocked_zielfrage`` card (checks/beobachter.py:861). Never sweep it into
+    # ``human``, where it strands rot-stuck. ``human_check`` children are planned
+    # human steps that cross column boundaries by design and still migrate.
+    moved = [
+        (r["id"], r["title"])
+        for r in rows
+        if not (
+            (r["child_role"] if "child_role" in r.keys() else None) != "human_check"
+            and r["status"] == "blocked"
+            and _blocked_card_has_zielfrage(conn, r["id"])
+        )
+    ]
     for tid, _title in moved:
         conn.execute(
             "UPDATE tasks SET status = 'human' WHERE id = ?",
@@ -2536,6 +2588,56 @@ def _apply_human_status_migration(conn: sqlite3.Connection) -> list[tuple[str, s
         _append_event(
             conn, tid, "human",
             {"reason": "legacy human-signal migrated to status=human"},
+        )
+    return moved
+
+
+def _recover_misparked_human_zielfragen(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """F52: restore legit blocked-Zielfrage cards wrongly swept into ``human``.
+
+    The v1 :func:`_apply_human_status_migration` (before it grew its F38 guard)
+    moved every ``blocked``+(``needs_input``|``assignee='till'``) card into the
+    first-class ``human`` status — including genuine business Zielentscheidung
+    cards. The Beobachter only greens a ``blocked_zielfrage`` card while it RESTS
+    in ``blocked`` (checks/beobachter.py:861); in ``human`` such a card reads
+    ``rot-stuck`` "Zielfrage-Karte haengt in human" after N hours (the recurring
+    F38 befund — e.g. Karte 47 ``t_279fc2b5``). This pass moves every ``human``
+    card that carries a genuine non-technical Zielfrage
+    (:func:`_blocked_card_has_zielfrage`, the exact predicate the observer reads)
+    back to ``blocked``. Cards legitimately in ``human`` — abnahme/human_check
+    smoke cards with no Zielfrage — are left untouched.
+
+    ``block_kind``/``assignee``/``category`` are preserved (v1 only ever changed
+    ``status``), so the restored card lands back in the precise human-decision
+    bucket the dispatcher GO-gate (F40/F51) and the observer both expect.
+
+    Idempotent: afterwards the card is ``blocked``, which this pass's
+    ``status='human'`` filter no longer matches. Returns the moved
+    ``(id, title)`` pairs for logging/tests. Plain ``conn.execute`` to mirror the
+    sibling one-shot passes (see :func:`_apply_human_status_migration`).
+    """
+    rows = conn.execute(
+        "SELECT id, title FROM tasks WHERE status = 'human'"
+    ).fetchall()
+    moved = [
+        (r["id"], r["title"])
+        for r in rows
+        if _blocked_card_has_zielfrage(conn, r["id"])
+    ]
+    for tid, _title in moved:
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+            (tid,),
+        )
+        _append_event(
+            conn, tid, "status",
+            {
+                "status": "blocked",
+                "reason": "F52 recovery: legit blocked_zielfrage restored "
+                          "from human (v1 human-migration misfire)",
+            },
         )
     return moved
 

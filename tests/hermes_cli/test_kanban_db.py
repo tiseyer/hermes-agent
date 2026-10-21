@@ -5854,6 +5854,63 @@ def test_migration_is_one_shot_and_does_not_resweep_new_needs_input(kanban_home)
         assert kb.get_task(conn, later).status == "blocked"
 
 
+def test_migration_leaves_legit_blocked_zielfrage_in_blocked(kanban_home):
+    """F38/F52: a ``blocked`` card carrying a genuine non-technical business
+    Zielfrage must NOT be swept into ``human`` — the Beobachter only greens a
+    ``blocked_zielfrage`` card while it RESTS in ``blocked``. A blocked card
+    with no Zielfrage (or only a technical one) still migrates."""
+    with kb.connect() as conn:
+        # (Z) blocked + needs_input + genuine business Zielfrage -> STAYS blocked
+        z = kb.create_task(conn, title="Z zielentscheidung", assignee="till")
+        _set(conn, z, status="blocked", block_kind="needs_input")
+        kb.add_comment(conn, z, "specifier",
+                       "Welcher Tresor soll als Ziel gelten: eigener lokaler "
+                       "Tresor oder gehosteter Dienst?")
+        # (T) blocked + needs_input + only a TECHNICAL question -> still migrates
+        t = kb.create_task(conn, title="T technik", assignee="till")
+        _set(conn, t, status="blocked", block_kind="needs_input")
+        kb.add_comment(conn, t, "coder",
+                       "Welche library-version soll der rebase nutzen?")
+        # (P) blocked@till, no question at all -> still migrates (no Zielfrage)
+        p = kb.create_task(conn, title="P parked till", assignee="till")
+        _set(conn, p, status="blocked")
+
+        moved = {tid for tid, _ in kb._apply_human_status_migration(conn)}
+
+        assert z not in moved
+        assert kb.get_task(conn, z).status == "blocked"
+        assert {t, p} <= moved
+        assert kb.get_task(conn, t).status == "human"
+        assert kb.get_task(conn, p).status == "human"
+
+
+def test_recover_misparked_human_zielfragen_restores_only_zielfragen(kanban_home):
+    """F52: the v1 misfire stranded legit blocked-Zielfrage cards in ``human``
+    (Karte 47 ``t_279fc2b5`` → rot-stuck ``haengt in human``). The recovery pass
+    pulls exactly those back to ``blocked`` and leaves genuine human cards
+    (abnahme/human_check, no Zielfrage) untouched; idempotent."""
+    with kb.connect() as conn:
+        # A legit Zielentscheidung the v1 migration wrongly put in human.
+        zf = kb.create_task(conn, title="Strategie Env-Variablen", assignee="till")
+        _set(conn, zf, status="blocked", block_kind="needs_input")
+        kb.add_comment(conn, zf, "specifier",
+                       "Soll der eigene lokale Tresor oder ein gehosteter "
+                       "Dienst das Ziel sein?")
+        _set(conn, zf, status="human")  # simulate the v1 sweep
+        # A genuine human card: human_check smoke, no business Zielfrage.
+        hc = kb.create_task(conn, title="Smoke check", child_role="human_check")
+        _set(conn, hc, status="human")
+
+        recovered = {tid for tid, _ in kb._recover_misparked_human_zielfragen(conn)}
+
+        assert recovered == {zf}
+        assert kb.get_task(conn, zf).status == "blocked"
+        assert kb.get_task(conn, hc).status == "human"
+
+        # Idempotent: a second pass moves nothing (zf is now blocked again).
+        assert kb._recover_misparked_human_zielfragen(conn) == []
+
+
 def test_human_card_is_never_promoted_by_dispatcher_and_negative_probe(kanban_home):
     """Dispatcher exclusion + negative probe.
 
