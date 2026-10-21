@@ -685,6 +685,21 @@ def _card_is_zielentscheidung(
     return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
 
 
+# F53: a PROCEDURAL ``?``-comment — a merge/deploy/release/smoke "Freigabe (GO)"
+# question (e.g. the F30/F31 reviewer Merge-GO "… merged nach develop. Soll dieser
+# Merge freigegeben werden (GO)?"). It is NOT the owner's strategic Zielentscheidung
+# the card exists to ask; the Beobachter's richter rejects it TOR1 NEIN ("merge nach
+# develop ist ein internes Integrationsmittel … substituiert die erwartete echte
+# Geschäftsentscheidung"). Used to tell a genuine prepared owner Zielfrage apart from
+# such a procedural question when deciding whether a wrongly-built Zielentscheidung
+# card still carries a clean Zielfrage to preserve.
+_PROCEDURAL_GO_RE = re.compile(
+    r"\bmerge[-\s]?go\b|\bmerged?\s+nach\b|\bfreigegeben\s+werden\b"
+    r"|\bsmoke\b|\bdeploy\b|\brelease\b|\(go\)",
+    re.IGNORECASE,
+)
+
+
 # F47: a reviewer completing a repo work card as a NO-OP — the factory concluded
 # the demanded fix is unnecessary (already fixed historically) or impossible (the
 # producer/generator could not be located) and delivered 0 changed files, yet
@@ -1477,6 +1492,107 @@ def _handle_complete(args: dict, **kw) -> str:
                         "context. Keep the question business-level and free of "
                         "internal task IDs / branch names."
                     )
+
+            # A Zielentscheidung card that was wrongly BUILT → rest at
+            # blocked@till, never route the prepared owner Zielfrage into a
+            # Merge-GO (F53, Karte 47 recurrence t_dc61dc64 'Strategie für
+            # Environment Variables sicher speichern', art=zielfrage,
+            # erwartung=blocked_zielfrage). The F39 guard above protects a
+            # Zielentscheidung card only while it carries NO branch (its premise:
+            # "a decision card changes no code"). But here the orchestrator
+            # PREPARED a clean owner Zielfrage ("## Zielentscheidung … Soll
+            # Voicera den selbst betriebenen zentralen Tresor als Produktionsziel
+            # festlegen?") AND THEN "losgeprescht": it spun the SAME card through
+            # specifier→coder→reviewer to build a versioned strategy DOCUMENT and
+            # pushed `wt/<id>`. With a branch present, F39 no longer fires, and the
+            # build-gated reviewer route below (F30/F31, docs touch .env/Secrets/DB
+            # → runtime-gated) converts the review into a Merge-GO comment ("…
+            # merged nach develop. Soll dieser Merge freigegeben werden (GO)?").
+            # That Merge-GO is the NEWEST ``?``-comment, so the Beobachter's
+            # ``_letzte_frage`` reads IT instead of the owner Zielentscheidung and
+            # the richter rejects it TOR1 NEIN ("merge nach develop ist ein
+            # internes Integrationsmittel … substituiert die erwartete echte
+            # Geschäftsentscheidung") → rot-keine-zielfrage. The Beobachter even
+            # injects the steering "Das ist ein Projekt, kein Fix … als
+            # blocked-Karte mit Zielfragen. Nicht lospreschen." The only green
+            # terminal for a Zielentscheidung card is ``blocked`` with the owner
+            # Zielfrage as the newest ``?``-comment (Regel b). So when the card is
+            # a Zielentscheidung (``_card_is_zielentscheidung`` — matches every
+            # blocked_zielfrage karte, zero done cards) that already carries a
+            # CLEAN prepared owner Zielfrage (a ``?``-comment that is neither a
+            # TECH_REGEX nor a procedural Merge/GO question), park it at
+            # blocked@till via ``block_task`` — which, unlike ``handoff_task``,
+            # appends NO comment, so the observer keeps reading the orchestrator's
+            # Zielentscheidung and greens rule b. Conservative on purpose: it only
+            # DIVERTS a card that already has a clean owner Zielfrage to preserve,
+            # so a genuine build card (no such comment, ``_card_is_zielentscheidung``
+            # False) is untouched and keeps the F30 Merge-GO / honest-done path.
+            # Worker-side (re-imported per spawn), live on the next spawn without a
+            # gateway restart (cf. F19).
+            if task and (task.branch_name or "").strip():
+                _ze_comments = [
+                    (r[0] or "")
+                    for r in conn.execute(
+                        "SELECT body FROM task_comments WHERE task_id = ? "
+                        "ORDER BY created_at",
+                        (tid,),
+                    ).fetchall()
+                ]
+                if _card_is_zielentscheidung(
+                    task.title, task.body or "", task.category, _ze_comments
+                ):
+                    _owner_frage = ""
+                    for _b in _ze_comments:
+                        if "?" in _b:
+                            _owner_frage = _b
+                    _frage_clean = (
+                        bool(_owner_frage)
+                        and not _SPECIFIER_TECH_REGEX.search(_owner_frage)
+                        and not _PROCEDURAL_GO_RE.search(_owner_frage)
+                    )
+                    if _frage_clean:
+                        parked = kb.block_task(
+                            conn, tid,
+                            reason=(
+                                "Zielentscheidung offen (F53): Diese Karte "
+                                "bereitet eine Inhaber-Weiche vor (Varianten mit "
+                                "Aufwand und Risiko) und ist kein Bauauftrag. Der "
+                                "Branch ist zwar review-gruen, aber ein Merge "
+                                "wartet auf die bereits aufbereitete "
+                                "Zielentscheidung weiter oben im Verlauf. Die "
+                                "Karte ruht bei Till, bis die Weiche entschieden "
+                                "ist; danach folgt Umsetzung und Merge. Keine neue "
+                                "Rueckfrage noetig — die aufbereitete Zielfrage "
+                                "steht bereits als Kommentar."
+                            ),
+                            kind="needs_input",
+                            expected_run_id=_worker_run_id(tid),
+                        )
+                        if parked:
+                            try:
+                                kb.assign_task(conn, tid, "till")
+                            except Exception:  # noqa: BLE001 — best-effort label
+                                pass
+                            return _ok(
+                                task_id=tid,
+                                status="blocked",
+                                assignee="till",
+                                note=(
+                                    "Zielentscheidung card wrongly built → parked "
+                                    "at blocked@till, NOT routed to a Merge-GO. "
+                                    "This card prepares an owner decision (which "
+                                    "secret-store), not code to merge; a Merge-GO "
+                                    "would become the newest ?-comment the "
+                                    "Beobachter reads and it rejects a procedural "
+                                    "merge question (TOR1 NEIN). The prepared owner "
+                                    "Zielfrage already on the card stays the "
+                                    "newest ?-comment → legitime Zielfrage (Regel "
+                                    "b). The merge waits until Till decides the "
+                                    "strategy."
+                                ),
+                            )
+                        # block failed (lost claim / not running) → fall through
+                        # to the normal completion path rather than wedging it.
 
             # The orchestrator coordinates a work card, it never finishes one:
             # only the reviewer completes a repo-bound work card, at the end of

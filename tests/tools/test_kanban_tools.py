@@ -4274,6 +4274,132 @@ def test_reviewer_routes_docker_gated_card_to_merger(monkeypatch, worker_env):
         conn.close()
 
 
+def test_reviewer_parks_wrongly_built_zielentscheidung_at_blocked_till(
+    monkeypatch, worker_env
+):
+    """F53 (Karte 47 recurrence t_dc61dc64 'Strategie für Environment Variables
+    sicher speichern', art=zielfrage, erwartung=blocked_zielfrage): the
+    orchestrator PREPARED a clean owner Zielentscheidung ("Soll Voicera den selbst
+    betriebenen zentralen Tresor als Produktionsziel festlegen?") and THEN
+    "losgeprescht" — it built a versioned strategy document on the SAME card and
+    pushed wt/<id>. With a branch present the F39 guard no longer fires, and the
+    build-gated reviewer route would convert the review into a Merge-GO
+    ("… merged nach develop. Soll dieser Merge freigegeben werden (GO)?"). That
+    Merge-GO becomes the newest "?"-comment the Beobachter reads (`_letzte_frage`)
+    and the richter rejects it TOR1 NEIN (merge-to-develop is an internal means
+    that substitutes the real business decision) → rot-keine-zielfrage. The only
+    green terminal for a Zielentscheidung card is `blocked` with the owner
+    Zielfrage as the newest "?"-comment (Regel b). The gate parks the wrongly-built
+    card at blocked@till via block_task (which appends NO comment), so the
+    orchestrator's Zielentscheidung stays the newest "?"-comment — no Merge-GO."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Strategie fuer Environment Variables sicher speichern",
+            body=(
+                "Secrets liegen heute in .env-Dateien auf den Servern. Varianten: "
+                "Vault/Secret-Manager, SOPS-verschluesselte Dateien im Repo, oder "
+                "verschluesselte .env mit Schluessel auf dem Host. Bitte Varianten "
+                "mit Aufwand und Risiko darstellen."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/t_build",
+        )
+        kb.add_comment(
+            conn, tid, author="orchestrator",
+            body=(
+                "## Zielentscheidung\n\nDer Vergleich zeigt eine echte "
+                "geschäftliche Weiche. **Soll Voicera den selbst betriebenen "
+                "zentralen Tresor als verbindliches Produktionsziel festlegen, "
+                "damit Offline-/On-Prem-Kundenbetrieb und eigene Datenhoheit "
+                "erhalten bleiben?** Vorschlag: Ja. Konsequenz: höherer "
+                "Betriebsaufwand, dafür ein einheitliches Ziel. Alternative: der "
+                "gemanagte Cloud-Dienst reduziert den Betrieb, bindet aber an "
+                "Anbieter und erfordert die EU-/Vertragsfreigabe."
+            ),
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-coder",
+            body=(
+                "Coder-Handoff an Review: Branch `wt/t_build` gepusht. Geändert: "
+                "genau eine Datei, `docs/iso27001/secrets-strategy.md`. Laufzeit-"
+                "Import des Backends, der Secrets/DB braucht, read-only nicht "
+                "verifizierbar."
+            ),
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-reviewer",
+            body="REVIEW GRÜN. Abnahmekriterium erfüllt, Doku vollständig.",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRÜN — build-gated"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("status") == "blocked"
+    assert d.get("assignee") == "till"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        # No new "?"-comment was appended: the orchestrator's Zielentscheidung is
+        # the newest "?"-comment (what the Beobachter reads), NOT a Merge-GO.
+        q_comments = [
+            c.body for c in kb.list_comments(conn, tid) if "?" in (c.body or "")
+        ]
+        assert q_comments, "the prepared owner Zielfrage must still be on the card"
+        assert "Tresor" in q_comments[-1]
+        assert "Merge" not in q_comments[-1]
+    finally:
+        conn.close()
+
+
+def test_reviewer_does_not_divert_plain_build_card_to_blocked(
+    monkeypatch, worker_env
+):
+    """F53 is conservative: a genuine build card (NOT a Zielentscheidung, no
+    prepared owner Zielfrage) keeps the F30 Merge-GO / honest-done path. The
+    env-gated DB-less backend pytest card still lands at `ready @ merger`."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Unit-Test fuer die Prioritaetspruefung ohne Datenbank",
+            body=(
+                "_check_priority in backend/app/services/todo_service.py. "
+                "Reiner Unit-Test. Keine DB-Fixture."
+            ),
+            assignee="voicera-reviewer", repository="voicera",
+            workspace_kind="worktree", branch_name="wt/review",
+        )
+        kb.add_comment(
+            conn, tid, author="specifier",
+            body=(
+                "ABNAHMEKRITERIUM: Aus `backend/` `.venv/bin/python -m pytest "
+                "tests/test_todo_priority.py -q` ohne laufende Datenbank."
+            ),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "REVIEW GRUEN - 4 passed, diff nur Testdatei"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("assignee") == "merger"
+    assert d.get("status") == "ready"
+
+
 def test_reviewer_routes_db_less_backend_pytest_to_merger(monkeypatch, worker_env):
     """End-to-end: the reviewer completing the env-gated DB-less pytest card does
     not land `done` (which would be shell=ROT every re-check); it hands the
