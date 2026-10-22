@@ -1188,9 +1188,18 @@ class GatewayKanbanWatchersMixin:
                             break
                         attempted += 1
                         try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
-                            )
+                            # Serialise this out-of-dispatcher decompose write on
+                            # the board's single-writer flock (same lock file,
+                            # <db>.dispatch.lock, as _dispatch_tick_lock and the
+                            # event-claim site above). decompose_task itself takes
+                            # NO lock (the CLI wraps it externally), so wrapping
+                            # the watcher call-site cannot re-enter the flock and
+                            # self-deadlock. write_serialize_lock degrades to a
+                            # no-op where fcntl/msvcrt is unavailable.
+                            with _kb.write_serialize_lock(_kb.kanban_db_path(slug)):
+                                outcome = _decomp.decompose_task(
+                                    tid, author="auto-decomposer",
+                                )
                         except Exception:
                             logger.exception(
                                 "kanban auto-decompose: decompose_task crashed on %s",

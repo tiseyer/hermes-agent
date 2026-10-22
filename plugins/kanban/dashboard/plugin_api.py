@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import defaultdict
 import json
 import logging
@@ -134,6 +135,45 @@ def _conn(board: Optional[str] = None):
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
+
+
+@contextlib.contextmanager
+def _write_locked(board: Optional[str] = None):
+    """Open a kanban_db connection under the board's single-writer flock.
+
+    The dashboard runs in a SEPARATE process from the gateway dispatcher, so
+    its mutating endpoints are an out-of-dispatcher writer class that must
+    serialise against the dispatcher on ``<db>.dispatch.lock`` instead of
+    racing it on WAL frames (the 2026-10-14 ``disk image is malformed``
+    corruption came from exactly such an unguarded cockpit write). This CM
+    takes the SAME ``write_serialize_lock`` the CLI, bridge, and worker tools
+    already use, THEN opens the connection — matching ``hermes_bridge``'s
+    ``_rw_locked`` ordering.
+
+    Read-only endpoints keep using bare :func:`_conn`; only mutating handlers
+    use this so a handler that only reads never contends for the writer lock.
+
+    The dashboard never holds ``_dispatch_tick_lock`` (that is the gateway),
+    and no mutating handler re-enters this CM on a second fd, so there is no
+    self-deadlock. ``write_serialize_lock`` degrades to a no-op where
+    fcntl/msvcrt is unavailable; where it is missing entirely we fall back to
+    a plain connection so the endpoint never breaks.
+    """
+    if hasattr(kanban_db, "write_serialize_lock"):
+        try:
+            lock_cm = kanban_db.write_serialize_lock(
+                kanban_db.kanban_db_path(board=board)
+            )
+        except Exception:
+            lock_cm = contextlib.nullcontext()
+    else:
+        lock_cm = contextlib.nullcontext()
+    with lock_cm:
+        conn = _conn(board=board)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +808,8 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
+      try:
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -808,10 +848,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
                 # Probe failure must never block the create itself.
                 pass
         return body
-    except ValueError as e:
+      except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -860,8 +898,8 @@ async def upload_task_attachment(
     absolute path surfaced in ``build_worker_context``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
+      try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
@@ -910,10 +948,8 @@ async def upload_task_attachment(
         )
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
-    except ValueError as e:
+      except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
 
 
 @router.get("/attachments/{attachment_id}")
@@ -946,14 +982,11 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 @router.delete("/attachments/{attachment_id}")
 def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         att = kanban_db.delete_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -978,8 +1011,7 @@ class UpdateTaskBody(BaseModel):
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1090,8 +1122,6 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1101,14 +1131,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
-    finally:
-        conn.close()
 
 
 def _parents_blocking_ready(
@@ -1250,16 +1277,13 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
         return {"ok": True}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1274,14 +1298,12 @@ class LinkBody(BaseModel):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
-        return {"ok": True}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
+    with _write_locked(board=board) as conn:
+        try:
+            kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+            return {"ok": True}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/links")
@@ -1291,12 +1313,9 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1327,8 +1346,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:
@@ -1408,8 +1426,6 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 entry.update(ok=False, error=str(e))
             results.append(entry)
         return {"results": results}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1685,8 +1701,7 @@ def terminate_run_endpoint(
     ``/runs/{run_id}/inspect``) but no termination control surface.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
@@ -1705,8 +1720,6 @@ def terminate_run_endpoint(
                 ),
             )
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1731,8 +1744,7 @@ def reclaim_task_endpoint(
     ``hermes kanban reclaim <task_id> --reason ...``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
         if not ok:
             raise HTTPException(
@@ -1743,8 +1755,6 @@ def reclaim_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id}
-    finally:
-        conn.close()
 
 
 class SpecifyBody(BaseModel):
@@ -1781,7 +1791,18 @@ def specify_task_endpoint(
     # HERMES_KANBAN_BOARD env var — this endpoint runs in FastAPI's
     # threadpool, so two concurrent requests for different boards would
     # otherwise race on the shared env var and cross-write (issue #38323).
-    with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+    # Serialise the specify write (specify_task connects + writes internally
+    # with NO lock of its own — the CLI wraps it externally) on the board's
+    # single-writer flock so it never races the dispatcher's WAL frames.
+    _spec_lock = contextlib.nullcontext()
+    if hasattr(kanban_db, "write_serialize_lock"):
+        try:
+            _spec_lock = kanban_db.write_serialize_lock(
+                kanban_db.kanban_db_path(board=board)
+            )
+        except Exception:
+            _spec_lock = contextlib.nullcontext()
+    with _spec_lock, kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
         # Import lazily so a missing auxiliary client at import time
         # doesn't break plugin load.
         from hermes_cli import kanban_specify  # noqa: WPS433 (intentional)
@@ -1819,8 +1840,7 @@ def reassign_task_endpoint(
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
@@ -1836,8 +1856,6 @@ def reassign_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1984,8 +2002,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
                    f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1998,8 +2015,6 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             notifier_profile=_active_profile_name(),
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
-    finally:
-        conn.close()
 
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
@@ -2013,8 +2028,7 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             detail=f"No home channel configured for platform {platform!r}.",
         )
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
+    with _write_locked(board=board) as conn:
         kanban_db.remove_notify_sub(
             conn,
             task_id=task_id,
@@ -2023,8 +2037,6 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             thread_id=home["thread_id"] or None,
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2419,7 +2431,18 @@ def decompose_task_endpoint(
     # endpoint runs in FastAPI's threadpool, so mutating the process-global
     # HERMES_KANBAN_BOARD env var would let concurrent requests for
     # different boards race and cross-write (issue #38323).
-    with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+    # Serialise the decompose write (decompose_task connects + writes
+    # internally with NO lock of its own — the CLI wraps it externally) on the
+    # board's single-writer flock so it never races the dispatcher's WAL frames.
+    _dc_lock = contextlib.nullcontext()
+    if hasattr(kanban_db, "write_serialize_lock"):
+        try:
+            _dc_lock = kanban_db.write_serialize_lock(
+                kanban_db.kanban_db_path(board=board)
+            )
+        except Exception:
+            _dc_lock = contextlib.nullcontext()
+    with _dc_lock, kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
         from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
         outcome = kanban_decompose.decompose_task(
             task_id,

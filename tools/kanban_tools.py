@@ -1005,28 +1005,41 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     _auto_heartbeat_last_attempt = now
     try:
-        kb, conn = _connect()
-        try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+        from hermes_cli import kanban_db as _kb
+        # Serialise this out-of-dispatcher heartbeat write on the board's
+        # single-writer flock (same lock the CLI/bridge/tools take) so it never
+        # commits WAL frames concurrently with the gateway dispatcher. The board
+        # is the default resolution chain (``_connect(None)`` → ``kb.connect``),
+        # so match it with ``kanban_db_path(board=None)``.
+        _lock_cm = contextlib.nullcontext()
+        if hasattr(_kb, "write_serialize_lock"):
             try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                _lock_cm = _kb.write_serialize_lock(_kb.kanban_db_path(board=None))
             except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
+                _lock_cm = contextlib.nullcontext()
+        with _lock_cm:
+            kb, conn = _connect()
             try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                try:
+                    kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+                run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+                run_id: Optional[int]
+                try:
+                    run_id = int(run_id_raw) if run_id_raw else None
+                except (TypeError, ValueError):
+                    run_id = None
+                try:
+                    kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
