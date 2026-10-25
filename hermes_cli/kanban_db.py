@@ -3112,9 +3112,9 @@ def create_task(
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
-    # can be named deterministically (project slug + task id) instead of the
-    # random ``wt/<task-id>`` fallback the worker skill applies when no branch
-    # is set. Projects live in the creator's per-profile projects.db; the repo
+    # can be persisted deterministically in the D/F-safe ``wt/<task-id>``
+    # namespace instead of being left for the worker fallback. Projects live
+    # in the creator's per-profile projects.db; the repo
     # path is absolute (profile-independent) and the branch name is pure, so the
     # cross-profile dispatcher needs no projects.db access at dispatch time.
     project_obj = None
@@ -3326,8 +3326,8 @@ def create_task(
                         tenant = irow["tenant"]
 
                 # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
+                # plus a deterministic D/F-safe ``wt/<task-id>`` branch. Together
+                # these persist the worker fallback convention and avoid the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:

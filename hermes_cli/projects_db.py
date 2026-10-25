@@ -8,8 +8,8 @@ persisted entity the user creates and names. It anchors:
 - **Desktop session grouping** — a session belongs to a project when its
   ``cwd`` lives under one of the project's folders (longest-prefix match).
 - **Kanban task worktrees** — a task linked to a project creates its worktree
-  under the project's primary repo with a deterministic branch name, instead
-  of the random ``wt/<task-id>`` fallback.
+  under the project's primary repo with a deterministic ``wt/<task-id>``
+  branch name.
 
 Scope: **per-profile**, stored at ``$HERMES_HOME/projects.db`` (resolved via
 ``get_hermes_home()``), mirroring sessions / config / cron. This deliberately
@@ -714,11 +714,11 @@ _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
 def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
     """Deterministic branch name for a project-linked kanban task.
 
-    Shape: ``<project-slug>/<task-id>`` (optionally ``-<title-slug>``). Stable
-    and human-meaningful, replacing the random ``wt/<task-id>`` fallback.
+    Shape: ``wt/<task-id>`` (optionally ``-<title-slug>``). The fixed namespace
+    cannot D/F-collide with a top-level branch named after the project slug.
     """
-    slug = project.slug or _slugify(project.name)
-    base = f"{slug}/{task_id}"
+    del project  # Retained in the public signature for call-site compatibility.
+    base = f"wt/{task_id}"
     if title:
         tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")
         tslug = tslug[:40].strip("-")
