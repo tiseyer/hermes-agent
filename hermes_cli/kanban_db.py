@@ -4880,6 +4880,43 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        # F55 rescue: an owner/human DECISION card that leaked into
+        # ``scheduled`` (a cleanup/defer pass that scheduled an answered
+        # Zielentscheidung — live Karte 47 t_cbddd945) is non-dispatchable and
+        # otherwise ignored here, so it would strand until the board scan reads
+        # it as rot-stuck. Re-park it to ``blocked@till`` (the Beobachter's
+        # blocked_zielfrage bucket) with a sticky ``blocked`` event, preserving
+        # its inbox category. Narrowly scoped to decision cards: a legit
+        # time-deferred WORK card stays in ``scheduled`` untouched. The
+        # ``owner_decision_loop`` marker makes the F54 _held_owner_decision check
+        # keep recognising the card even if its category is later blanked.
+        for srow in conn.execute(
+            "SELECT id, category FROM tasks WHERE status = 'scheduled'"
+        ).fetchall():
+            sid = srow["id"]
+            if not _is_owner_decision_card(
+                conn, sid, category=srow["category"], status="scheduled"
+            ):
+                continue
+            _scat = (srow["category"] or "").strip()
+            _park_cat = _scat if _scat in _HUMAN_DECISION_CATEGORIES else "entscheidung"
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', assignee = 'till', "
+                "block_kind = 'needs_input', category = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'scheduled'",
+                (_park_cat, sid),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn, sid, "blocked",
+                    {"kind": "needs_input", "from": "scheduled",
+                     "category": _park_cat, "escalation": "owner_decision_loop",
+                     "reason": "F55: owner-decision card re-parked scheduled→"
+                               "blocked@till (decisions rest in blocked, never "
+                               "scheduled)"},
+                )
+                promoted += 1
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries, child_role "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -9068,6 +9105,16 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        # F55: an owner/human DECISION card must rest in ``blocked@till`` (the
+        # Beobachter's ``blocked_zielfrage`` bucket), NEVER in ``scheduled``.
+        # A scheduled decision card is non-dispatchable and un-rescued, so it
+        # strands and the board scan reads it as rot-stuck (live Karte 47
+        # t_cbddd945: a cleanup pass deferred the vault build by scheduling the
+        # answered owner Zielentscheidung). Refuse the park — the dispatcher's
+        # F40/F51 re-park keeps the card in blocked@till. Symmetric to the F38
+        # move_to_human guard (which refuses blocked_zielfrage → human).
+        if _is_owner_decision_card(conn, task_id):
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -11047,6 +11094,49 @@ def _held_owner_decision(conn: sqlite3.Connection, task_id: str) -> bool:
         isinstance(payload, dict)
         and payload.get("escalation") == "owner_decision_loop"
     )
+
+
+def _is_owner_decision_card(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+) -> bool:
+    """F55: True when a card is an owner/human DECISION that must rest in
+    ``blocked@till`` — the Beobachter's ``blocked_zielfrage`` bucket — and may
+    NEVER be parked in ``scheduled``.
+
+    The Beobachter greens a watched card only in done / blocked-with-Zielfrage /
+    ready@merger. A decision card parked in ``scheduled`` (e.g. a cleanup/defer
+    pass that postpones the build) is non-dispatchable AND invisible to
+    recompute_ready / the GO-gate re-park, so it strands until the board scan
+    reads it as ``rot-stuck`` (live Karte 47 ``t_cbddd945``: an answered owner
+    Zielentscheidung a cleanup pass scheduled to defer the vault build hung in
+    ``scheduled`` for 84.8h). The durable markers mirror the F40/F51/F54 dispatch
+    re-park: a human-decision category, the sticky F50 owner-decision ``blocked``
+    event, or an already-``blocked`` business Zielfrage.
+
+    ``category``/``status`` may be passed by a caller that already has the row to
+    skip the extra read; otherwise they are looked up.
+    """
+    if category is None or status is None:
+        row = conn.execute(
+            "SELECT status, category FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if status is None:
+            status = row["status"]
+        if category is None:
+            category = row["category"]
+    if (category or "").strip() in _HUMAN_DECISION_CATEGORIES:
+        return True
+    if _held_owner_decision(conn, task_id):
+        return True
+    if status == "blocked" and _blocked_card_has_zielfrage(conn, task_id):
+        return True
+    return False
 
 
 def _go_gate_released(conn: sqlite3.Connection, task_id: str) -> bool:
