@@ -4947,3 +4947,59 @@ def test_dependency_on_autonomous_parent_still_parks_todo(kanban_home):
         ]
         assert "dependency_wait" in kinds
         assert "scope_recut_ceiling" not in kinds
+
+
+def test_dependency_park_folds_prepared_owner_zielentscheidung(kanban_home):
+    """F56 (losgeprescht-then-defer): a card that already carries its OWN
+    prepared non-technical owner Zielentscheidung must NOT be dependency-parked
+    in ``todo`` behind fresh autonomous recon it just spun up — it is folded
+    onto blocked@till so the owner answers it (live Karte 47 ``t_8ab69122``:
+    full SOPS+age Entscheidungsvorlage + business Soll-Frage, then dependency_
+    wait on two recon children). Neither the F43 gate-fold (parents are
+    autonomous, not held human) nor the recut ceiling (first park) catches it."""
+    with kb.connect() as conn:
+        main = kb.create_task(
+            conn, title="Strategie Environment-Secrets",
+            assignee="orchestrator",
+        )
+        # The card carries a fully prepared, non-technical owner Zielfrage.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'orchestrator', ?, strftime('%s','now'))",
+            (main,
+             "Entscheidungsvorlage: Soll Voicera die erste Stufe als empfohlenen "
+             "Weg festlegen, statt jetzt schon den hoeheren laufenden Aufwand der "
+             "zentralen Variante zu uebernehmen?"),
+        )
+        # A fresh autonomous recon child (still working — NOT a held human block).
+        recon = kb.create_task(conn, title="Recon realer Secret-Ablauf",
+                               assignee="recon")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (recon,))
+        kb.link_tasks(conn, recon, main)
+
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (main,))
+        assert kb.block_task(conn, main, kind="dependency",
+                             reason="warte auf Recon, danach Inhaberentscheidung "
+                                    "abschliessen") is True
+
+        t = kb.get_task(conn, main)
+        assert t.status == "blocked", t.status
+        assert t.assignee == "till", t.assignee
+        assert t.block_kind == "needs_input", t.block_kind
+        assert t.category == "entscheidung", t.category  # F54 durable marker
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (main,)
+            )
+        ]
+        assert "owner_decision_loop_escalated" in kinds
+        assert kinds[-1] != "dependency_wait"  # not the todo-park path
+        assert kb._has_sticky_block(conn, main) is True
+
+        # No facade: the question is the card's OWN existing comment, not a
+        # freshly synthesised one.
+        n_comments = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (main,)
+        ).fetchone()[0]
+        assert n_comments == 1, n_comments

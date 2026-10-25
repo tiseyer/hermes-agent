@@ -7318,6 +7318,94 @@ def block_task(
                     reason="F43 dependency-recut convergence ceiling",
                 )
                 return True
+            # F56 (losgeprescht-then-defer): the two guards above miss the
+            # shape where THIS card already carries its OWN prepared owner
+            # Zielentscheidung and the orchestrator — instead of escalating it —
+            # dithers and dependency-parks it behind fresh autonomous recon it
+            # just spun up. The recut ceiling (guard 2) can't fire on the first
+            # park of a freshly re-anstossed instance (count 0), and the gate-
+            # fold (guard 1) can't fire because the parents are autonomous recon,
+            # not held human decisions. So a card whose own newest ``?``-comment
+            # is a genuine non-technical business decision question — the exact
+            # shape the Beobachter greens at blocked@till (rule b) and nowhere
+            # else — would park in ``todo`` and rot to rot-stuck (live repro
+            # Karte 47 ``t_8ab69122`` "Strategie für Environment Variables": a
+            # full SOPS+age Entscheidungsvorlage with a business Soll-Frage, then
+            # self-decide → un-decide → dependency_wait on two recon children).
+            # An unanswered owner question is never autonomous work (F39/F43/F45/
+            # F50): fold it onto THIS card at blocked@till so the owner answers
+            # it. The question is already present as a non-technical ``?``-comment
+            # (:func:`_card_has_nontech_zielfrage` — the same discriminator the
+            # F50 block-loop guard trusts), so there is nothing to synthesise and
+            # no facade. A plain build dependency carries no such business
+            # question (coder/reviewer comments are technical → TECH_REGEX) and
+            # keeps the normal todo park below.
+            if _card_has_nontech_zielfrage(conn, task_id):
+                # F54: stamp a durable human-decision category so the dispatcher's
+                # F40/F51 re-park re-asserts the hold after the Beobachter's
+                # antwort_till flips blocked→todo→ready@till; an already-set
+                # human-decision category is preserved.
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input',
+                           category      = CASE
+                               WHEN category IN
+                                   ('frage', 'entscheidung', 'abnahme', 'go_noetig')
+                               THEN category ELSE 'entscheidung' END
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="prepared owner Zielentscheidung dependency-parked "
+                            "→ blocked@till (F56)",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="prepared owner Zielentscheidung dependency-"
+                                "parked → blocked@till (F56)",
+                    )
+                # Sticky ``blocked`` event: recompute_ready must not auto-recover
+                # a held owner decision — it waits for the human answer, not for
+                # the (irrelevant) recon children to finish and promote it.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"kind": "needs_input",
+                     "reason": "F56: vorbereitete Inhaber-Zielentscheidung statt "
+                               "in todo zu parken auf blocked@till gefaltet",
+                     "escalation": "owner_decision_loop"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "owner_decision_loop_escalated",
+                    {"routed_to": "till", "variant": "dependency_park_fold"},
+                    run_id=run_id,
+                )
+                routed_to = "blocked"
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_blocked",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id,
+                    reason="F56 prepared owner Zielentscheidung dependency fold",
+                )
+                return True
             cur = conn.execute(
                 """
                 UPDATE tasks
