@@ -684,11 +684,36 @@ hermes kanban notify-unsubscribe <id>
 hermes kanban context <id>                             # what a worker sees
 hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-column idea
         [--author NAME] [--json]                       #   into a full spec and promote to todo
-hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
-        [--log-retention-days N]
+hermes kanban gc [--event-retention-days N]            # workspaces + old events/logs + orphaned decomposer children
+        [--log-retention-days N] [--orphan-retention-days N]
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+### Scheduled auto-decomposer cleanup
+
+`hermes kanban gc` removes terminal (`done` or `archived`) children created by
+the gateway auto-decomposer when their decomposition root no longer exists and
+the child has been terminal for at least 30 days. Active cards and cards with a
+running attempt are always preserved. Preview the cleanup with
+`hermes kanban gc --orphan-retention-days 30 --dry-run`; pass `-1` to disable
+this part of GC.
+
+Run the cleanup weekly, for example Sunday at 03:00, with a no-agent cron job:
+
+```bash
+mkdir -p ~/.hermes/scripts
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+  'hermes kanban --board default gc --orphan-retention-days 30' \
+  > ~/.hermes/scripts/kanban-auto-decomposer-gc.sh
+chmod +x ~/.hermes/scripts/kanban-auto-decomposer-gc.sh
+hermes cron create "0 3 * * 0" --no-agent \
+  --script kanban-auto-decomposer-gc.sh --deliver local \
+  --name "kanban auto-decomposer GC"
+```
+
+GC operates on one board at a time. Install one job per board, changing the
+`--board <slug>` argument and using a distinct script/job name for each board.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
