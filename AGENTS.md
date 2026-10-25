@@ -1104,7 +1104,7 @@ kanban task.
   `kanban_attach_url`, `kanban_attachments`; profiles that explicitly
   enable the `kanban` toolset outside a dispatcher-spawned task also get
   `kanban_list` and `kanban_unblock` for board routing.
-- **Dispatcher:** long-lived loop that (default every 60s) reclaims
+- **Dispatcher:** long-lived loop that (default every 30s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
   `kanban.dispatch_in_gateway: true`.

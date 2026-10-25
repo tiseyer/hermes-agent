@@ -832,13 +832,13 @@ class GatewayKanbanWatchersMixin:
             )
 
         try:
-            interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+            interval = float(kanban_cfg.get("dispatch_interval_seconds", 30) or 30)
         except (ValueError, TypeError):
             logger.warning(
-                "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
+                "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 30",
                 kanban_cfg.get("dispatch_interval_seconds"),
             )
-            interval = 60.0
+            interval = 30.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks

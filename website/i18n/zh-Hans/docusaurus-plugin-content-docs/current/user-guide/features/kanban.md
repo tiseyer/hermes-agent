@@ -62,7 +62,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
   - `scratch`（默认）—— 在 `~/.hermes/kanban/workspaces/<id>/` 下（非默认看板为 `~/.hermes/kanban/boards/<slug>/workspaces/<id>/`）创建的临时目录。**任务完成时删除** —— scratch 按设计是临时性的。通过 `kanban_complete(artifacts=[...])` 明确声明的文件会在清理前复制到持久的任务附件存储；旧版完成摘要中已存在的交付文件路径也会得到同样处理。其他 scratch 文件仍会被删除。如果声明的 scratch 交付文件不存在，任务会保持进行中，worker 可修正路径后重试。需要保留整个工作区时，请使用 `worktree:` 或 `dir:<path>`。在某次安装中首次创建 scratch 工作区时，调度器会记录警告并在任务上发出 `tip_scratch_workspace` 事件（可通过 `hermes kanban show <id>` 查看）。
   - `dir:<path>` —— 现有的共享目录（Obsidian vault、邮件运维目录、每账号文件夹）。**必须是绝对路径。** 像 `dir:../tenants/foo/` 这样的相对路径在调度时会被拒绝，因为它们会相对于调度器碰巧所在的 CWD 解析，这是模糊的，也是混淆代理（confused-deputy）逃逸向量。路径本身是受信任的 —— 这是你的机器、你的文件系统，worker 以你的 uid 运行。这是受信任本地用户的威胁模型；kanban 设计为单主机。**完成时保留。**
   - `worktree` —— 用于编码任务的 git worktree，位于 `.worktrees/<id>/` 下。使用 `worktree:<path>` 固定确切的目标路径。Worker 端的 `git worktree add` 创建它，提供 `--branch` 时使用该分支。**完成时保留。**
-- **Dispatcher（调度器）** —— 一个长期运行的循环，每 N 秒（默认 60 秒）执行一次：回收过期的认领、回收崩溃的 worker（PID 消失但 TTL 尚未过期）、推进就绪任务、原子性认领、启动已分配的配置文件。默认**在 gateway 内部运行**（`kanban.dispatch_in_gateway: true`）。每次 tick 一个调度器扫描所有看板；worker 启动时固定了 `HERMES_KANBAN_BOARD`，因此无法看到其他看板。在同一任务上连续启动失败 `kanban.failure_limit` 次（默认：2）后，调度器会以最后一个错误为原因自动阻塞该任务 —— 防止因配置文件不存在、工作区无法挂载等原因导致的反复抖动。
+- **Dispatcher（调度器）** —— 一个长期运行的循环，每 N 秒（默认 30 秒）执行一次：回收过期的认领、回收崩溃的 worker（PID 消失但 TTL 尚未过期）、推进就绪任务、原子性认领、启动已分配的配置文件。默认**在 gateway 内部运行**（`kanban.dispatch_in_gateway: true`）。每次 tick 一个调度器扫描所有看板；worker 启动时固定了 `HERMES_KANBAN_BOARD`，因此无法看到其他看板。在同一任务上连续启动失败 `kanban.failure_limit` 次（默认：2）后，调度器会以最后一个错误为原因自动阻塞该任务 —— 防止因配置文件不存在、工作区无法挂载等原因导致的反复抖动。
 - **Tenant（租户）** —— 看板*内*的可选字符串命名空间。一个专家团队可以通过工作区路径和内存键前缀为多个业务提供数据隔离服务（`--tenant business-a`）。租户是软过滤器；看板是硬隔离边界。
 
 ## 看板（多项目） {#boards-multi-project}
@@ -154,13 +154,13 @@ hermes kanban stats
 
 ### Gateway 内嵌调度器（默认）
 
-调度器在 gateway 进程内运行。无需安装任何东西，无需管理单独的服务 —— 只要 gateway 运行，就绪任务会在下一个 tick（默认 60 秒）被接管。
+调度器在 gateway 进程内运行。无需安装任何东西，无需管理单独的服务 —— 只要 gateway 运行，就绪任务会在下一个 tick（默认 30 秒）被接管。
 
 ```yaml
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # 默认
-  dispatch_interval_seconds: 60    # 默认
+  dispatch_interval_seconds: 30    # 默认
 ```
 
 通过 `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0` 在运行时覆盖配置标志以进行调试。标准 gateway 监督适用：直接运行 `hermes gateway start`，或将 gateway 配置为 systemd 用户单元（参见 gateway 文档）。没有运行中的 gateway，`ready` 任务会保持原状，直到 gateway 启动 —— `hermes kanban create` 在创建时会对此发出警告。
@@ -383,7 +383,7 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
   - **依赖编辑器** —— 父级和子级的芯片列表，每个都有 `×` 用于取消链接，加上所有其他任务的下拉菜单用于添加新的父级或子级。循环尝试在服务器端被拒绝并给出清晰的消息。
   - **状态操作行**（→ triage / → ready / → running / block / unblock / complete / archive），破坏性转换有确认提示。对于 **Triage** 列中的卡片，该行还提供两个 LLM 驱动的操作：**⚗ Decompose** 将任务扇出为路由到专家配置文件（按描述）的子任务图（编排器驱动路径），**✨ Specify** 进行单任务规格重写。当 LLM 判断任务不需要扇出时，Decompose 会回退到类似 specify 的推进，因此它是严格的超集。两者都可以从 CLI（`hermes kanban decompose <id>` / `specify <id>` / `--all`）、任何 gateway 平台（`/kanban decompose <id>`）以及通过 `POST /api/plugins/kanban/tasks/:id/decompose` 和 `…/specify` 以编程方式访问。在 `config.yaml` 的 `auxiliary.kanban_decomposer` 和 `auxiliary.triage_specifier` 下配置模型。
   - 结果部分（也以 markdown 渲染）、带 Enter 提交的评论线程、最近 20 个事件。
-- **工具栏过滤器** —— 自由文本搜索、租户下拉菜单（默认为 `config.yaml` 中的 `dashboard.kanban.default_tenant`）、受让人下拉菜单、"显示已归档"切换、"按配置文件分组"切换，以及**推动调度器**按钮，这样你就不必等待下一个 60 秒 tick。
+- **工具栏过滤器** —— 自由文本搜索、租户下拉菜单（默认为 `config.yaml` 中的 `dashboard.kanban.default_tenant`）、受让人下拉菜单、"显示已归档"切换、"按配置文件分组"切换，以及**推动调度器**按钮，这样你就不必等待下一个 30 秒 tick。
 
 视觉上目标是熟悉的 Linear / Fusion 布局：深色主题、带计数的列标题、彩色状态点、优先级和租户的标签芯片。插件只读取主题 CSS 变量（`--color-*`、`--radius`、`--font-mono` 等），因此它会随活动的仪表盘主题自动重新换肤。
 
@@ -463,7 +463,7 @@ GUI 严格是一个**通过 DB 读取 + 通过 kanban_db 写入**的层，没有
 | `PUT` | `/orchestration` | 在 `config.yaml` 中更新三个编排键中的一个或多个。验证非空配置文件名实际存在。 |
 | `POST` | `/links` | 添加依赖关系（`parent_id` → `child_id`） |
 | `DELETE` | `/links?parent_id=…&child_id=…` | 删除依赖关系 |
-| `POST` | `/dispatch?max=…&dry_run=…` | 推动调度器 —— 跳过 60 秒等待 |
+| `POST` | `/dispatch?max=…&dry_run=…` | 推动调度器 —— 跳过 30 秒等待 |
 | `GET` | `/config` | 从 `config.yaml` 读取 `dashboard.kanban` 偏好设置 —— `default_tenant`、`lane_by_profile`、`include_archived_by_default`、`render_markdown` |
 | `WS` | `/events?since=<event_id>` | `task_events` 行的实时流 |
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 import textwrap
@@ -72,6 +73,56 @@ class _Host(kw.GatewayKanbanWatchersMixin):
         self._kanban_watchdog_probe_interval = probe
         self._kanban_watchdog_max_strikes = strikes
         self._kanban_watchdog_on_stall = on_stall
+
+
+@pytest.mark.parametrize(
+    ("kanban_config", "warning"),
+    [
+        ({}, None),
+        ({"dispatch_interval_seconds": "invalid"}, "using default 30"),
+    ],
+)
+def test_watcher_fallback_interval_is_30_seconds(
+    wd_home, monkeypatch, caplog, kanban_config, warning
+):
+    """Missing and invalid config both preserve the production 30s cadence."""
+    _stub_watcher_environment(
+        monkeypatch, lambda *_a, **_kw: kb.DispatchResult()
+    )
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": kanban_config})
+    monkeypatch.setenv(wd.WATCHDOG_ENV_VAR, "0")
+    monkeypatch.setattr(kw, "_acquire_singleton_lock", lambda _path: (None, "unavailable"))
+    monkeypatch.setattr(kw, "_release_singleton_lock", lambda _handle: None)
+
+    host = _Host()
+    sleep_slices = 0
+    heartbeat_ticks = []
+
+    def _heartbeat(**payload):
+        heartbeat_ticks.append(payload["tick_count"])
+        if payload["tick_count"] == 2:
+            host._running = False
+
+    async def _sleep(delay):
+        nonlocal sleep_slices
+        if delay == kw._DISPATCHER_INITIAL_DELAY_S:
+            return
+        assert delay == 1.0
+        sleep_slices += 1
+        assert sleep_slices <= 30, "watcher did not start its next tick after 30s"
+
+    monkeypatch.setattr(wd, "write_heartbeat", _heartbeat)
+    monkeypatch.setattr(kw.asyncio, "sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(host._kanban_dispatcher_watcher())
+
+    assert sleep_slices == 30
+    assert heartbeat_ticks == [1, 2]
+    if warning is not None:
+        assert warning in caplog.text
 
 
 async def _drain(task: asyncio.Task, host: _Host, timeout: float = 15.0) -> None:
