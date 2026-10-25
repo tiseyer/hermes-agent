@@ -1632,16 +1632,57 @@ def _handle_complete(args: dict, **kw) -> str:
                 if _card_is_zielentscheidung(
                     task.title, task.body or "", task.category, _ze_comments
                 ):
-                    _owner_frage = ""
-                    for _b in _ze_comments:
-                        if "?" in _b:
-                            _owner_frage = _b
-                    _frage_clean = (
-                        bool(_owner_frage)
-                        and not _SPECIFIER_TECH_REGEX.search(_owner_frage)
-                        and not _PROCEDURAL_GO_RE.search(_owner_frage)
+                    # The owner Zielfrage can be BURIED under a later tech/recon
+                    # ?-comment (F53 recurrence t_e0d2d62d 'Strategie fuer
+                    # Environment Variables sicher speichern', erwartung=
+                    # blocked_zielfrage). The orchestrator PREPARED a clean
+                    # Entscheidungsvorlage ("Varianten … Soll SOPS+age … festgelegt
+                    # werden?" — options+Aufwand/Risiko+Vorschlag+business ?, TECH/
+                    # PROC/RECON all clean) but then SELF-DECIDED it ("Entschieden
+                    # (nicht neu diskutieren) … SOPS+age") and spun the SAME card
+                    # through specifier→coder→reviewer to BUILD a strategy DOCUMENT;
+                    # the specifier's ABNAHMEKRITERIUM (full of "Pfad" and
+                    # "Read-only-Recon … verifiziert") became the NEWEST ?-comment.
+                    # The old code read ONLY the last ?-comment, found it tech-dirty,
+                    # and fell through to a plain `done` → rot-zielentscheid-selbst.
+                    # Mirror the F46 re-surface instead: scan BACKWARD for the newest
+                    # CLEAN owner Zielfrage (not TECH prefilter, not a procedural
+                    # Merge/GO, not a read-only recon dump); if a later dirty
+                    # ?-comment buried it, re-post it VERBATIM so the Beobachter's
+                    # _letzte_frage reads the clean owner Zielfrage, then park at
+                    # blocked@till (Regel b). A Zielentscheidung card has exactly one
+                    # green terminal (blocked with the owner Weiche), so when NO
+                    # clean Weiche was ever prepared the factory fully usurped the
+                    # decision → refuse the `done` and steer it to prepare + block
+                    # (the branched twin of the F39 branchless guard above).
+                    def _owner_weiche_clean(_b: str) -> bool:
+                        return (
+                            bool(_b)
+                            and "?" in _b
+                            and not _SPECIFIER_TECH_REGEX.search(_b)
+                            and not _PROCEDURAL_GO_RE.search(_b)
+                            and not _RECON_DUMP_RE.search(_b)
+                        )
+
+                    _zq = [b for b in _ze_comments if "?" in b]
+                    _clean_weiche = next(
+                        (b for b in reversed(_zq) if _owner_weiche_clean(b)), ""
                     )
-                    if _frage_clean:
+                    if _clean_weiche:
+                        # Re-surface the buried clean Weiche as the newest ?-comment
+                        # (idempotent — a no-op when it is already the newest one).
+                        if _zq and not _owner_weiche_clean(_zq[-1]):
+                            try:
+                                kb.add_comment(
+                                    conn, tid,
+                                    author=(
+                                        os.environ.get("HERMES_PROFILE")
+                                        or "reviewer"
+                                    ),
+                                    body=_clean_weiche,
+                                )
+                            except Exception:  # noqa: BLE001 — best-effort re-surface
+                                pass
                         parked = kb.block_task(
                             conn, tid,
                             reason=(
@@ -1676,14 +1717,38 @@ def _handle_complete(args: dict, **kw) -> str:
                                     "would become the newest ?-comment the "
                                     "Beobachter reads and it rejects a procedural "
                                     "merge question (TOR1 NEIN). The prepared owner "
-                                    "Zielfrage already on the card stays the "
-                                    "newest ?-comment → legitime Zielfrage (Regel "
-                                    "b). The merge waits until Till decides the "
-                                    "strategy."
+                                    "Zielfrage (re-surfaced if a later tech/recon "
+                                    "?-comment buried it) stays the newest "
+                                    "?-comment → legitime Zielfrage (Regel b). The "
+                                    "merge waits until Till decides the strategy."
                                 ),
                             )
                         # block failed (lost claim / not running) → fall through
                         # to the normal completion path rather than wedging it.
+                    else:
+                        # No clean owner Zielfrage was ever prepared: the factory
+                        # self-decided a Zielentscheidung and built a document. A
+                        # decision card must end blocked with the owner Weiche,
+                        # never `done` — refuse completion and steer to prepare +
+                        # block.
+                        conn.close()
+                        return tool_error(
+                            "this is a Zielentscheidung — a business/product "
+                            "decision that is Till's to make, not the factory's. A "
+                            "strategy DOCUMENT was built, but the owner never "
+                            "decided which option; completing it `done` — even "
+                            "review-gruen — means the factory took the owner's "
+                            "decision itself, which the Beobachter rejects as "
+                            "rot-zielentscheid-selbst. Do NOT call kanban_complete "
+                            "and do NOT route a Merge-GO. Post the prepared choice "
+                            "as a COMMENT (the variants with their cost/consequences "
+                            "and a Vorschlag) ending in ONE business question with "
+                            "\"?\", in Alltagssprache free of internal task IDs / "
+                            "branch names / tech prefilter words (Pfad, Path, "
+                            "Version, Framework, Dependency), then call "
+                            "kanban_block(kind=\"needs_input\"). The built branch "
+                            "waits until Till decides the strategy."
+                        )
 
             # The orchestrator coordinates a work card, it never finishes one:
             # only the reviewer completes a repo-bound work card, at the end of
