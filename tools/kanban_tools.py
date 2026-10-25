@@ -901,6 +901,69 @@ def _block_is_unprepared_scope_demand(blob: str) -> bool:
     )
 
 
+# F46 (recurrence Karte 47 't_de33d932', erwartung=blocked_zielfrage): a
+# Zielfrage escalation that off-loads the QUANTIFICATION of an operational
+# target onto the owner instead of preparing it. Where the F44 gate off-loads
+# the completeness ENUMERATION ("welche Ansichten/Begriffe …?"), this one
+# off-loads the operational TARGET VALUES — it demands the owner "festlegen"
+# the Zielvariante AND concrete numbers (RTO/RPO, maximal tolerierbare Ausfall-/
+# Wiederherstellungszeit, a "verbindlich festzulegendes Zeitfenster") without a
+# prepared, closed options-with-costs comparison. The observer's richter judges
+# it TOR1 JA / TOR3 JA but TOR2 NEIN ("verlangt vom Inhaber, Zielvariante UND
+# konkrete Ausfall-/Wiederherstellungszeitfenster selbst festzulegen, ohne dass
+# der aktuelle Stand/Anlass und konkrete Optionen samt Kosten/Folgen aufbereitet
+# sind … offene Anforderungs-Erhebung, die die Fabrik erst mit konkreten
+# Varianten und Aufwandsschätzungen aufbereiten muss") → rot-ohne-kontext.
+#
+# A legitimate owner escalation PROPOSES the target values itself (the factory
+# sets a default RTO/RPO/Verfügbarkeitsziel with its Kosten/Folgen and asks the
+# owner to CONFIRM or CHOOSE between prepared variants — "Vorschlag: Einzelhost,
+# RTO bis 8h; Alternative HA-Cluster, RTO <1h, höherer Betriebsaufwand"), or a
+# plain Freigabe-GO on a reached state. Those ask the owner to *bestätigen /
+# wählen*, never to *festlegen / selbst festzulegen* the raw numbers, so they
+# carry no elicitation demand and clear this gate untouched. The two signals are
+# AND-ed (like the F44/F46-bundle pairs): an owner-elicitation demand to author/
+# define the values (:data:`_ELICIT_OWNER_DEMAND_RE`) AND the demanded thing
+# being an operational target the factory should have prepared
+# (:data:`_OPERATIONAL_TARGET_RE`). A prepared "Vorschlag: …" decision carries
+# neither, so it still passes to the richter. Not a facade — it enforces exactly
+# the observer's TOR2, never more.
+_ELICIT_OWNER_DEMAND_RE = re.compile(
+    r"\bbitte\b[^.\n]{0,90}?\bfestleg\w*"
+    r"|\b(?:selbst|vom\s+inhaber|durch\s+den\s+inhaber|seitens\s+des\s+inhabers)"
+    r"\b[^.\n]{0,40}?\bfestzulegen\b"
+    r"|\b(?:verbindlich\s+)?festzulegende[nrs]?\b"
+    r"|\bmaximal\s+tolerierbare?\b[^.\n]{0,70}?\bfestleg\w*",
+    re.IGNORECASE,
+)
+_OPERATIONAL_TARGET_RE = re.compile(
+    r"\brto\b|\brpo\b"
+    r"|\bzeitfenster\b"
+    r"|\b(?:ausfall|wiederherstell\w*|stillstand\w*|wiederanlauf\w*)[- ]?zeit\w*"
+    r"|\bmaximal\s+tolerierbare?\b"
+    r"|\bzielvariante\b"
+    r"|\bverf[üu]gbarkeits(?:ziel|klasse|stufe|grad)\w*",
+    re.IGNORECASE,
+)
+
+
+def _block_is_unprepared_target_elicitation(blob: str) -> bool:
+    """True when a Zielfrage human-block off-loads the QUANTIFICATION of an
+    operational target (RTO/RPO, Ausfall-/Wiederherstellungszeit, Zielvariante,
+    Verfügbarkeitsziel) onto the owner instead of preparing it (F46 recurrence,
+    sibling of :func:`_block_is_unprepared_scope_demand`). Requires BOTH an
+    owner-elicitation demand to author/define the values
+    (:data:`_ELICIT_OWNER_DEMAND_RE`) and the demanded thing being such an
+    operational target (:data:`_OPERATIONAL_TARGET_RE`), so a prepared
+    "Vorschlag: …" decision that NAMES its own default targets and asks the owner
+    only to confirm/choose is never caught."""
+    if not blob:
+        return False
+    return bool(_ELICIT_OWNER_DEMAND_RE.search(blob)) and bool(
+        _OPERATIONAL_TARGET_RE.search(blob)
+    )
+
+
 # F48: a TECHNIK card (the Beobachter's ``k.art == "technik"``) must NEVER be
 # escalated with a Rückfrage. The observer's rule is categorical and has no
 # Zielfrage-Richter: ``k.art == "technik" and status == blocked`` → ROT
@@ -2163,6 +2226,46 @@ def _handle_block(args: dict, **kw) -> str:
                     "requirements you set yourself and fold into the "
                     "ABNAHMEKRITERIUM, NOT owner questions; do not bundle them "
                     "into the escalation."
+                )
+            # Unprepared operational-target elicitation gate (F46 recurrence,
+            # sibling of the F44 scope gate one failure mode over). Where F44
+            # off-loads the completeness ENUMERATION onto the owner, this
+            # off-loads the operational TARGET VALUES: it demands the owner
+            # "festlegen" the Zielvariante AND concrete numbers (RTO/RPO,
+            # maximal tolerierbare Ausfall-/Wiederherstellungszeit, a verbindlich
+            # festzulegendes Zeitfenster) without a prepared, closed options-with-
+            # costs comparison. The observer's richter judges that TOR1 JA /
+            # TOR3 JA but TOR2 NEIN (offene Anforderungs-Erhebung) →
+            # rot-ohne-kontext (live probe Karte 47 't_de33d932'). Evaluates the
+            # SAME Zielfrage blob the observer will judge (reason + most-recent
+            # ``?``-comment); a prepared Vorschlag that names its OWN default
+            # targets and asks the owner only to confirm/choose clears it.
+            if _block_is_unprepared_target_elicitation(scope_blob):
+                conn.close()
+                return tool_error(
+                    "this Zielfrage OFF-LOADS the operational target values onto "
+                    "the owner — it asks the owner to 'festlegen' the Zielvariante "
+                    "AND author concrete numbers (RTO/RPO, maximal tolerierbare "
+                    "Ausfall-/Wiederherstellungszeit, a 'verbindlich festzulegendes "
+                    "Zeitfenster'). That is the fabric's own preparation work, not "
+                    "an owner decision. The observer's richter judges it TOR1 JA / "
+                    "TOR3 JA but TOR2 NEIN (offene Anforderungs-Erhebung ohne "
+                    "aufbereiteten Stand/Anlass und ohne konkrete Optionen samt "
+                    "Kosten/Folgen; die Fabrik muss die Varianten und "
+                    "Aufwandsschätzungen erst selbst aufbereiten) → "
+                    "rot-ohne-kontext. Reshape it: the factory PROPOSES the target "
+                    "values itself and presents ONE closed decision between "
+                    "concrete variants WITH their Kosten/Folgen, then asks the "
+                    "owner only to CONFIRM or CHOOSE — e.g. 'Soll der Vault als "
+                    "Einzelhost (Vorschlag: RTO bis ~8h Start-/Deploy-Stillstand "
+                    "tolerierbar, geringer Betriebsaufwand) oder als "
+                    "ausfallsichere Instanz (RTO <1h, deutlich höherer Betriebs-/"
+                    "Verfügbarkeitsaufwand) ausgelegt werden? Vorschlag: Einzelhost "
+                    "für die erste Ausbaustufe.' NEVER a question that asks the "
+                    "owner to invent the Zielvariante or the raw RTO/RPO numbers. "
+                    "If no owner choice is genuinely open, define the default "
+                    "target yourself, fold it into the ABNAHMEKRITERIUM, and "
+                    "kanban_handoff instead of blocking."
                 )
         # Orchestrator block gate (F22, sibling of the F21 complete gate). The
         # orchestrator coordinates a fresh repo work card by decomposing it and
