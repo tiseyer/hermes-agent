@@ -167,6 +167,23 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+@pytest.mark.parametrize("alias", ["--kurz", "--kurzbeschreibung", "--desc"])
+def test_run_slash_relabel_short_description_preserves_body_and_show_json(
+    kanban_home, alias
+):
+    full_body = "Diagnose: Größe ≥ 1\nAkzeptanz: 'bytegleich' \"erhalten\""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Titel", body=full_body)
+
+    assert "Relabeled" in kc.run_slash(
+        f"relabel {tid} {alias} 'Kurzer Überblick'"
+    )
+
+    payload = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert payload["task"]["body"] == full_body
+    assert payload["task"]["short_description"] == "Kurzer Überblick"
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

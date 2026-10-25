@@ -6040,7 +6040,8 @@ def test_move_to_human_hard_rejects_overlong_title(kanban_home):
 
 def test_relabel_sets_title_and_kurzbeschreibung_and_leaves_rest(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="alt", body="alter body",
+        full_body = "Diagnose: Größe ≥ 1\nAkzeptanz: 'bytegleich' \"erhalten\""
+        tid = kb.create_task(conn, title="alt", body=full_body,
                              assignee="worker", priority=3)
         _set(conn, tid, status="running")
         before = kb.get_task(conn, tid)
@@ -6052,7 +6053,8 @@ def test_relabel_sets_title_and_kurzbeschreibung_and_leaves_rest(kanban_home):
 
         after = kb.get_task(conn, tid)
         assert after.title == "neu"
-        assert after.body == "neue kurzbeschreibung"
+        assert after.body == full_body
+        assert after.short_description == "neue kurzbeschreibung"
         # Pure relabel — nothing else moves.
         assert after.status == before.status == "running"
         assert after.assignee == before.assignee
@@ -6068,7 +6070,7 @@ def test_relabel_sets_title_and_kurzbeschreibung_and_leaves_rest(kanban_home):
         payload = json.loads(ev["payload"])
         assert payload["actor"] == "manager"
         assert payload["title"] == {"old": "alt", "new": "neu"}
-        assert payload["kurzbeschreibung"]["old"] == "alter body"
+        assert payload["kurzbeschreibung"]["old"] is None
         assert payload["kurzbeschreibung"]["new"] == "neue kurzbeschreibung"
 
 
