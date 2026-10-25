@@ -14,6 +14,7 @@ review diffs balloon with unrelated upstream commits the task never touched.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 import time
@@ -51,9 +52,9 @@ def resolve_worktree_base(
 
     "Refresh" is deliberately cheap:
 
-    - The fetch is SKIPPED entirely when the repo's ``FETCH_HEAD`` is
-      younger than *freshness_window* seconds — a base fetched moments ago
-      cannot have meaningfully moved.
+    - The fetch is SKIPPED entirely when this exact base ref was refreshed
+      less than *freshness_window* seconds ago — a different remote or branch
+      fetched moments ago says nothing about the requested base.
     - The fetch is capped at *fetch_timeout* seconds. On timeout or failure
       we fall back to the locally-known remote-tracking ref (labelled
       "cached") instead of cascading into a second fetch attempt.
@@ -78,21 +79,40 @@ def resolve_worktree_base(
         except Exception:
             return False
 
-    def _fetch_head_age() -> Optional[float]:
-        """Seconds since the last fetch in this repo, or None if unknown."""
+    def _freshness_marker(ref: str) -> Optional[Path]:
+        """Return the repo-local freshness marker for one exact remote ref."""
         try:
-            gd = _git(["rev-parse", "--git-dir"])
+            gd = _git(["rev-parse", "--git-common-dir"])
             if gd.returncode != 0:
                 return None
             git_dir = Path(gd.stdout.strip())
             if not git_dir.is_absolute():
                 git_dir = Path(repo_root) / git_dir
-            fetch_head = git_dir / "FETCH_HEAD"
-            if not fetch_head.exists():
-                return None
-            return max(0.0, time.time() - fetch_head.stat().st_mtime)
+            digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()
+            return git_dir / "hermes-fetch-cache" / digest
         except Exception:
             return None
+
+    def _ref_fetch_age(ref: str) -> Optional[float]:
+        """Seconds since Hermes successfully fetched *ref*, if recorded."""
+        try:
+            marker = _freshness_marker(ref)
+            if marker is None or not marker.exists():
+                return None
+            return max(0.0, time.time() - marker.stat().st_mtime)
+        except Exception:
+            return None
+
+    def _mark_ref_fetched(ref: str) -> None:
+        """Record a successful targeted fetch; failure only disables caching."""
+        try:
+            marker = _freshness_marker(ref)
+            if marker is None:
+                return
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except Exception:
+            pass
 
     def _refresh(remote: str, branch: str, ref: str, *, required: bool = False) -> tuple:
         """Return (ref, label) after a cheap best-effort refresh of *ref*.
@@ -100,12 +120,13 @@ def resolve_worktree_base(
         Never raises, never fetches twice, never blocks longer than
         *fetch_timeout*.
         """
-        age = _fetch_head_age()
+        age = _ref_fetch_age(ref)
         if age is not None and age < freshness_window and _ref_exists(ref):
             return ref, f"{ref} (fetched {int(age)}s ago)"
         try:
             fetched = _git(["fetch", remote, branch], timeout=fetch_timeout)
             if fetched.returncode == 0:
+                _mark_ref_fetched(ref)
                 return ref, f"{ref} (fetched)"
             reason = "fetch failed"
         except subprocess.TimeoutExpired:

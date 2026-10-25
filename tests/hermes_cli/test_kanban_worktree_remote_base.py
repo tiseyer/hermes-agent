@@ -253,3 +253,74 @@ def test_resolver_uses_configured_fork_ref_not_origin_default(tmp_path):
 
     assert base_ref == "fork/main", label
     assert _run(["git", "rev-parse", base_ref], clone).stdout.strip() == fork_main
+
+
+def test_configured_fork_refresh_is_not_suppressed_by_recent_origin_fetch(tmp_path):
+    """Freshness belongs to the requested ref, not the repo's last fetch.
+
+    A recent ``origin/main`` fetch must not make a stale, already-present
+    ``fork/main`` look fresh.  This is the real dispatcher ordering: upstream
+    activity updates ``FETCH_HEAD`` shortly before a task is rooted on the
+    configured fork base.
+    """
+    from hermes_cli.worktree_base import resolve_worktree_base
+
+    upstream = tmp_path / "upstream.git"
+    fork = tmp_path / "fork.git"
+    _run(["git", "init", "--bare", str(upstream)], tmp_path)
+    _run(["git", "init", "--bare", str(fork)], tmp_path)
+
+    seed = tmp_path / "seed"
+    _run(["git", "clone", str(upstream), str(seed)], tmp_path)
+    _run(["git", "config", "user.email", "t@example.com"], seed)
+    _run(["git", "config", "user.name", "t"], seed)
+    _commit(seed, "base.txt", "shared base")
+    _run(["git", "branch", "-M", "main"], seed)
+    _run(["git", "push", "-u", "origin", "main"], seed)
+    _run(["git", "remote", "add", "fork", str(fork)], seed)
+    _run(["git", "push", "fork", "main"], seed)
+
+    clone = tmp_path / "clone"
+    _run(["git", "clone", str(upstream), str(clone)], tmp_path)
+    _run(["git", "remote", "add", "fork", str(fork)], clone)
+    _run(["git", "fetch", "fork", "main"], clone)
+    worktree_clone = tmp_path / "worktree-clone"
+    _run(["git", "clone", str(upstream), str(worktree_clone)], tmp_path)
+    _run(["git", "remote", "add", "fork", str(fork)], worktree_clone)
+    _run(["git", "fetch", "fork", "main"], worktree_clone)
+    stale_fork_tip = _run(
+        ["git", "rev-parse", "fork/main"], clone
+    ).stdout.strip()
+    origin_tip = _run(["git", "rev-parse", "origin/main"], clone).stdout.strip()
+
+    _commit(seed, "fork-only.txt", "new fork tip")
+    _run(["git", "push", "fork", "main"], seed)
+    fresh_fork_tip = _head(seed)
+    assert fresh_fork_tip != stale_fork_tip
+
+    # Poison the old repo-global freshness heuristic with an unrelated fetch.
+    _run(["git", "fetch", "origin", "main"], clone)
+    _run(["git", "fetch", "origin", "main"], worktree_clone)
+
+    base_ref, label = resolve_worktree_base(
+        str(clone), base_ref="fork/main"
+    )
+
+    assert base_ref == "fork/main", label
+    assert _run(["git", "rev-parse", base_ref], clone).stdout.strip() == fresh_fork_tip
+    assert _run(["git", "rev-parse", "origin/main"], clone).stdout.strip() == origin_tip
+
+    target = worktree_clone / ".worktrees" / "configured-fork"
+    kb._ensure_git_worktree(
+        worktree_clone, target, "wt/configured-fork", base_ref="fork/main"
+    )
+
+    assert _head(target) == fresh_fork_tip
+    assert (
+        _run(["git", "rev-parse", "fork/main"], worktree_clone).stdout.strip()
+        == fresh_fork_tip
+    )
+    assert (
+        _run(["git", "rev-parse", "origin/main"], worktree_clone).stdout.strip()
+        == origin_tip
+    )
