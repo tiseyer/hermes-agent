@@ -700,6 +700,21 @@ _PROCEDURAL_GO_RE = re.compile(
 )
 
 
+# F46 (live probe Karte 47 't_a58e0a64'): markers of a READ-ONLY RECON DUMP — a
+# long investigative comment that happens to carry a ``?`` (usually a multi-way
+# method/Technik question like "… als Prozess-env, Datei/sidecar/template oder
+# Laufzeit-API erfolgen?"). Such a dump is NOT the prepared business Weiche the
+# card exists to ask, but when it lands as the newest ``?``-comment the observer's
+# ``_letzte_frage`` judges IT (no aufbereitete Optionen+Kosten/Folgen → TOR2 NEIN
+# → rot-ohne-kontext), burying the real Weiche. Used to tell a concise prepared
+# decision Weiche apart from a recon dump when deciding whether to re-surface.
+_RECON_DUMP_RE = re.compile(
+    r"read[-\s]?only|\brecon\b|keine\s+produktentscheidung|\bbefund(?:e|en)?\b"
+    r"|origin/\w+@|verifiziert|integrationskanten|\bscope/beleglage\b",
+    re.IGNORECASE,
+)
+
+
 # F47: a reviewer completing a repo work card as a NO-OP — the factory concluded
 # the demanded fix is unnecessary (already fixed historically) or impossible (the
 # producer/generator could not be located) and delivered 0 changed files, yet
@@ -2589,6 +2604,81 @@ def _handle_block(args: dict, **kw) -> str:
                     "genuine business/Freigabe decision that is Till's to make, "
                     "stated as a question in a comment."
                 )
+        # Buried-Zielfrage re-surface gate (F46 recurrence, live probe Karte 47
+        # 't_a58e0a64' 'Strategie für Environment Variables sicher speichern',
+        # art=zielfrage, erwartung=blocked_zielfrage). The factory PREPARED a
+        # clean business Weiche earlier in the history — "Die Varianten sind mit
+        # Aufwand und Risiko aufbereitet … Soll SOPS + age als erste Zielstufe …
+        # festgelegt werden, statt einen zentralen Secret Manager einzuführen?"
+        # (options WITH Kosten/Folgen, a Vorschlag, one business question) — but
+        # then "lospreschte": the specifier kept doing read-only recon and posted
+        # a later recon ?-dump ("… als Prozess-env, Datei/sidecar/template oder
+        # Laufzeit-API erfolgen? … Keine Produktentscheidung getroffen.") that
+        # became the NEWEST ``?``-comment. The observer reads the question from
+        # the newest ``?``-comment (``_letzte_frage``), so the richter judges that
+        # recon dump — a multi-way method question with no aufbereitete Optionen+
+        # Kosten/Folgen — TOR1 JA / TOR3 JA but TOR2 NEIN → rot-ohne-kontext
+        # ("Frage ohne Kontext"), burying the prepared Weiche. The F47 TECH gate
+        # below misses it (the recon ``?`` uses words outside _SPECIFIER_TECH_
+        # REGEX); it is instead a procedural/recon dump (_PROCEDURAL_GO_RE, "keine
+        # Produktentscheidung getroffen"). Re-surface: when the newest ``?``-
+        # comment is NOT a clean business Weiche but an EARLIER ``?``-comment IS,
+        # re-post that clean Zielfrage VERBATIM as the final comment so the
+        # observer reads it → legitime Zielfrage (Regel b). Deterministic — the
+        # card has been churning blocked↔todo for cycles while the Beobachter
+        # re-posts antwort_till each round — so it CONVERGES instead of looping
+        # on another reject. Conservative: it only re-surfaces a Zielfrage the
+        # factory ALREADY prepared (never invents one) and is idempotent (if the
+        # clean Weiche is already newest it is a no-op). Scoped to the scope-owning
+        # roles on a Zielentscheidung card; runs before the F47 gate so a
+        # re-surfaced tech-free Weiche also clears that gate. Worker-side
+        # (re-imported per spawn), live without a gateway restart (cf. F19).
+        if (
+            task
+            and kind in _HUMAN_BLOCK_KINDS
+            and _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            in ("specifier", "orchestrator")
+        ):
+            try:
+                _zc_bodies = [c.body or "" for c in kb.list_comments(conn, tid)]
+            except Exception:  # noqa: BLE001 — best-effort re-surface
+                _zc_bodies = []
+            if _zc_bodies and _card_is_zielentscheidung(
+                task.title, task.body or "", task.category, _zc_bodies
+            ):
+                def _is_clean_weiche(_b: str) -> bool:
+                    # A prepared owner Weiche is concise and free of the
+                    # observer's TECH prefilter, of a procedural Merge/GO, and
+                    # of read-only recon-dump markers — the three things that
+                    # make the newest ``?``-comment judged ROT. A 13 KB recon
+                    # dump with a buried method ``?`` fails ``len`` AND the
+                    # recon-marker test even when it dodges TECH/PROC_GO.
+                    return (
+                        bool(_b)
+                        and "?" in _b
+                        and len(_b) <= 2500
+                        and not _SPECIFIER_TECH_REGEX.search(_b)
+                        and not _PROCEDURAL_GO_RE.search(_b)
+                        and not _RECON_DUMP_RE.search(_b)
+                    )
+
+                _zq = [b for b in _zc_bodies if "?" in b]
+                if _zq and not _is_clean_weiche(_zq[-1]):
+                    _clean_weiche = next(
+                        (b for b in reversed(_zq) if _is_clean_weiche(b)), ""
+                    )
+                    if _clean_weiche:
+                        try:
+                            kb.add_comment(
+                                conn, tid,
+                                author=(
+                                    os.environ.get("HERMES_PROFILE")
+                                    or "specifier"
+                                ),
+                                body=_clean_weiche,
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort re-surface
+                            pass
         # TECH_REGEX Zielfrage-word gate (F47 recurrence, Karte 47
         # t_d356333d 'Strategie für Environment Variables sicher speichern',
         # art=zielfrage, erwartung=blocked_zielfrage). The factory prepared a
