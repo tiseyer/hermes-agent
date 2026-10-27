@@ -1721,6 +1721,45 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def test_archive_refuses_legit_blocked_owner_zielfrage(kanban_home):
+    """F50: a ``blocked`` owner-Zielfrage card RESTS at blocked@till awaiting the
+    owner's GO. A "triage resolution" that self-decides its Zielentscheidung and
+    archives the card is a facade — the owner never decided, the card vanishes
+    from the board, and the Beobachter flags "rot-stuck: haengt in archived".
+    ``archive_task`` must refuse it (twin of the F38/F45 move_to_human guard);
+    a plain done card still archives."""
+    with kb.connect() as conn:
+        # (Z) blocked + category=entscheidung -> protected, archive refused
+        z = kb.create_task(conn, title="Strategie Env-Variablen", assignee="till")
+        _set(conn, z, status="blocked", block_kind="needs_input",
+             category="entscheidung")
+        kb.add_comment(conn, z, "specifier",
+                       "Welcher Tresor soll als Ziel gelten: eigener lokaler "
+                       "Tresor oder gehosteter Dienst?")
+        assert kb.archive_task(conn, z) is False
+        assert kb.get_task(conn, z).status == "blocked"
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND "
+            "kind = 'archive_refused' ORDER BY id DESC LIMIT 1", (z,)
+        ).fetchone()
+        assert ev is not None
+
+        # (B) blocked + no category but a genuine non-tech Zielfrage -> protected
+        b = kb.create_task(conn, title="Z2", assignee="till")
+        _set(conn, b, status="blocked", block_kind="needs_input")
+        kb.add_comment(conn, b, "specifier",
+                       "Soll der lokale Tresor oder ein gehosteter Dienst "
+                       "das Ziel sein?")
+        assert kb.archive_task(conn, b) is False
+        assert kb.get_task(conn, b).status == "blocked"
+
+        # (D) a plain done card still archives normally
+        d = kb.create_task(conn, title="shipped")
+        kb.complete_task(conn, d)
+        assert kb.archive_task(conn, d) is True
+        assert kb.get_task(conn, d).status == "archived"
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")

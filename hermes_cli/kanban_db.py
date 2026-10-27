@@ -3651,6 +3651,34 @@ def _blocked_card_has_zielfrage(
     return not _ZIELFRAGE_TECH_REGEX.search(frage)
 
 
+def _is_protected_owner_decision(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True iff ``task_id`` is a legit blocked owner-decision/Zielfrage card.
+
+    Such a card RESTS in ``blocked`` awaiting the owner's GO/answer — the exact
+    bucket the Beobachter greens for a ``blocked_zielfrage`` card
+    (checks/beobachter.py:861). F38/F45 already stop :func:`move_to_human` from
+    flipping it into ``human``; this is the ARCHIVE twin (F50): a Zielfrage that
+    the factory "resolves" by self-deciding its Zielentscheidung and archiving
+    the owner's open card is a facade — the owner never decided, and the card
+    vanishes from the board while the observer still tracks it ("rot-stuck:
+    haengt in archived"). A card is protected while it is ``blocked`` and either
+    carries a human-decision ``category`` (:data:`_HUMAN_DECISION_CATEGORIES`)
+    or still holds a non-technical business Zielfrage
+    (:func:`_blocked_card_has_zielfrage`).
+    """
+    row = conn.execute(
+        "SELECT status, category FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["status"] != "blocked":
+        return False
+    category = row["category"] if "category" in row.keys() else None
+    if category in _HUMAN_DECISION_CATEGORIES:
+        return True
+    return _blocked_card_has_zielfrage(conn, task_id)
+
+
 def move_to_human(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8189,6 +8217,18 @@ def grant_go(
                         "GO archive targets are already archived: "
                         + ", ".join(already_archived)
                     )
+                # F50: a structured GO archive must not dissolve a legit blocked
+                # owner-Zielfrage card either (twin of the archive_task guard).
+                protected = [
+                    target for target in target_ids
+                    if _is_protected_owner_decision(conn, target)
+                ]
+                if protected:
+                    raise ValueError(
+                        "GO archive cannot target blocked owner-Zielfrage "
+                        "card(s) (they rest at blocked@till): "
+                        + ", ".join(protected)
+                    )
             running = [
                 target for target in target_ids
                 if target_rows[target]["status"] == "running"
@@ -8846,6 +8886,24 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # F50: never archive a legit blocked owner-Zielfrage/decision card. Such a
+    # card RESTS in ``blocked`` awaiting the owner's GO — archiving it (e.g. a
+    # "triage resolution" that self-decides the Zielentscheidung and dissolves
+    # the chain) is a facade: the owner never decided, the card disappears from
+    # the board, and the Beobachter flags "rot-stuck: haengt in archived". Twin
+    # of the F38/F45 move_to_human guard. The card stays blocked@till instead.
+    if _is_protected_owner_decision(conn, task_id):
+        _log.warning(
+            "kanban: F50 refused to archive %s — legit blocked owner-Zielfrage "
+            "(stays blocked@till; factory may not self-decide + archive it)",
+            task_id,
+        )
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_refused",
+                {"reason": "blocked owner-Zielfrage may not be archived (F50)"},
+            )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
