@@ -11740,10 +11740,15 @@ def _go_gate_decision_released(conn: sqlite3.Connection, task_id: str) -> bool:
 
 # Tenant → reviewer profile routing and the repository profile registry are
 # OPERATOR CONFIGURATION, not code. They are loaded from the ``kanban:`` block
-# of config.yaml via _load_routing_config() (defined below, after the
-# RepositoryProfile dataclass). A fresh instance with no such config inherits
-# an EMPTY registry and therefore cannot route or push any card to a foreign
-# git remote (fail-closed). See the loader for the full rationale.
+# of the INSTANCE-ROOT config.yaml via _load_routing_config() (defined below,
+# after the RepositoryProfile dataclass). Exactly three maps are shared by
+# every role profile in one Hermes instance: repository_profiles,
+# tenant_reviewers, and tenant_workdirs — read from the instance root config,
+# never from the active role profile's config (a gleichnamige Map in
+# profiles/<rolle>/config.yaml neither overrides nor augments them). A fresh
+# instance with no such root config inherits an EMPTY registry and therefore
+# cannot route or push any card to a foreign git remote (fail-closed). See the
+# loader for the full rationale.
 
 # ---------------------------------------------------------------------------
 # Repo → role-profile resolution (goal decompose-repo-routing, Aug 2026)
@@ -11788,13 +11793,20 @@ class RepositoryProfileError(ValueError):
 
 # Repository profiles + the tenant→reviewer map are the single source for role
 # routing and git integration, but they are OPERATOR CONFIGURATION, not code.
-# They are read from the ``kanban:`` block of config.yaml so that:
+# They are read from the ``kanban:`` block of the INSTANCE-ROOT config.yaml so
+# that:
 #   * a fresh instance (no kanban config) inherits NOTHING — resolve_* returns
 #     no profile, the card keeps its caller's legacy fallback, and no card can
 #     be routed or pushed to a remote this instance was never told about
 #     (DSGVO multi-instance isolation — see cli-config.yaml.example);
 #   * one codebase serves many customer instances, each declaring exactly its
 #     own repositories, without ever leaking push targets across them.
+#
+# The maps are read from the resolved INSTANCE ROOT (``get_default_hermes_root``
+# / the active-home override), NEVER from the active role profile's
+# ``profiles/<name>/config.yaml``: a gleichnamige Map in a profile config does
+# not override or augment these three root maps. get_config_path()/load_config()
+# stay profile-bound and are intentionally NOT used here.
 #
 # Schema (every profile field is required; omitting one is a fail-closed error
 # surfaced by _validated_repository_profile at resolution time, NOT a silent
@@ -11815,7 +11827,7 @@ class RepositoryProfileError(ValueError):
 
 @dataclass(frozen=True)
 class _RoutingConfig:
-    """Resolved routing tables derived from one instance's config.yaml."""
+    """Resolved routing tables derived from one instance's ROOT config.yaml."""
 
     profiles: dict[str, RepositoryProfile]
     tenant_reviewers: dict[str, str]
@@ -11824,65 +11836,118 @@ class _RoutingConfig:
     prefixes: tuple[str, ...]
 
 
-# Memoized per config path. load_config() is itself mtime-cached, but rebuilding
-# the dataclasses + signature ordering on every resolve would still show up in
-# the dispatch hot loop, so the derived tables are cached here. Keyed on the
-# config path (not a bare singleton) so a profile switch — which repoints
-# get_config_path() at profiles/<name>/config.yaml — serves that profile's
-# routing and never another's. _reset_routing_config_cache() drops the cache
-# for tests (and any caller) that rewrite config.yaml in place.
+# Memoized per RESOLVED ROOT config path. Rebuilding the dataclasses + signature
+# ordering on every resolve would show up in the dispatch hot loop, so the
+# derived tables are cached here. Keyed on the resolved instance-root config
+# path (not a bare singleton, and NOT on get_config_path()) so two custom roots
+# in one process never leak each other's routing. _reset_routing_config_cache()
+# drops the cache for tests (and any caller) that rewrite config.yaml in place.
 _ROUTING_CONFIG_CACHE: dict[str, _RoutingConfig] = {}
 
 
-def _load_routing_config() -> _RoutingConfig:
-    """Build (and memoize) the repository/tenant routing tables from config.yaml.
+def _routing_config_path() -> Path:
+    """Return this context's instance-ROOT config, never a role-profile copy.
 
-    Default when the ``kanban:`` block (or the whole config) is absent or
-    unreadable: EMPTY tables. An instance that was never configured routes
-    nothing — the non-negotiable fail-closed default for multi-instance
-    isolation.
+    Derived solely from the active Hermes home: an explicit context-local
+    override (a ``profiles/<name>`` home collapses to its ``<root>`` grandparent)
+    or, absent one, ``get_default_hermes_root()``. Never ``get_config_path()``,
+    which is profile-bound by design.
     """
-    from hermes_cli.config import get_config_path, load_config
+    from hermes_constants import (
+        get_default_hermes_root,
+        get_hermes_home_override,
+    )
+
+    override = get_hermes_home_override()
+    if override:
+        active_home = Path(override)
+        root = (
+            active_home.parent.parent
+            if active_home.parent.name == "profiles"
+            else active_home
+        )
+    else:
+        root = get_default_hermes_root()
+    return (root / "config.yaml").resolve()
+
+
+def _normalized_string(raw: Any, *, lowercase: bool = False) -> str:
+    """Return a stripped YAML string without coercing other scalar types."""
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    return value.lower() if lowercase else value
+
+
+def _normalized_string_map(raw: Any) -> dict[str, str]:
+    """Normalize an operator map, dropping malformed/empty entries."""
+    result: dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return result
+    for raw_key, raw_value in raw.items():
+        key = _normalized_string(raw_key, lowercase=True)
+        value = _normalized_string(raw_value)
+        if key and value:
+            result[key] = value
+    return result
+
+
+def _load_routing_config() -> _RoutingConfig:
+    """Build (and memoize) the three root-only routing tables, failing closed.
+
+    The maps are read from the resolved INSTANCE-ROOT config.yaml (see
+    ``_routing_config_path``), never a role-profile copy. Default when the root
+    config, its ``kanban:`` block, or any of the three maps is absent, unreadable
+    or malformed: EMPTY tables. An instance that was never configured routes
+    nothing — the non-negotiable fail-closed default for multi-instance
+    isolation. There is no silent fallback to a profile copy, Till's root, a
+    default reviewer or a foreign workdir/push target.
+    """
+    import yaml
 
     try:
-        cache_key = str(get_config_path())
+        config_path = _routing_config_path()
+        cache_key = str(config_path)
     except Exception:
+        config_path = None
         cache_key = ""
     cached = _ROUTING_CONFIG_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     try:
-        cfg = load_config() or {}
-    except Exception:
-        cfg = {}
-    kanban_cfg = cfg.get("kanban") or {}
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError, AttributeError):
+        raw_config = {}
+    kanban_cfg = raw_config.get("kanban", {}) if isinstance(raw_config, dict) else {}
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
 
-    raw_profiles = kanban_cfg.get("repository_profiles") or {}
+    raw_profiles = kanban_cfg.get("repository_profiles", {})
     profiles: dict[str, RepositoryProfile] = {}
     signatures: list[tuple[str, str]] = []
     if isinstance(raw_profiles, dict):
         for raw_name, spec in raw_profiles.items():
             if not isinstance(spec, dict):
                 continue
-            name = str(raw_name).strip().lower()
+            name = _normalized_string(raw_name, lowercase=True)
             if not name:
                 continue
             profiles[name] = RepositoryProfile(
                 name=name,
-                coder=str(spec.get("coder", "") or "").strip(),
-                reviewer=str(spec.get("reviewer", "") or "").strip(),
-                base_ref=str(spec.get("base_ref", "") or "").strip(),
-                merge_target=str(spec.get("merge_target", "") or "").strip(),
-                push_target=str(spec.get("push_target", "") or "").strip(),
-                workdir=str(spec.get("workdir", "") or "").strip(),
+                coder=_normalized_string(spec.get("coder")),
+                reviewer=_normalized_string(spec.get("reviewer")),
+                base_ref=_normalized_string(spec.get("base_ref")),
+                merge_target=_normalized_string(spec.get("merge_target")),
+                push_target=_normalized_string(spec.get("push_target")),
+                workdir=_normalized_string(spec.get("workdir")),
             )
-            raw_sigs = spec.get("signatures") or []
+            raw_sigs = spec.get("signatures", ())
             if isinstance(raw_sigs, str):
-                raw_sigs = [raw_sigs]
+                raw_sigs = (raw_sigs,)
             if isinstance(raw_sigs, (list, tuple)):
                 for sig in raw_sigs:
-                    sig_norm = str(sig).strip().lower()
+                    sig_norm = _normalized_string(sig, lowercase=True)
                     if sig_norm:
                         signatures.append((sig_norm, name))
 
@@ -11893,34 +11958,20 @@ def _load_routing_config() -> _RoutingConfig:
     # secondary key keeps the order deterministic across equal lengths.
     signatures.sort(key=lambda item: (-len(item[0]), item[0]))
 
-    raw_reviewers = kanban_cfg.get("tenant_reviewers") or {}
-    tenant_reviewers: dict[str, str] = {}
-    if isinstance(raw_reviewers, dict):
-        for raw_t, raw_r in raw_reviewers.items():
-            tenant = str(raw_t).strip().lower()
-            reviewer = str(raw_r).strip()
-            if tenant and reviewer:
-                tenant_reviewers[tenant] = reviewer
-
-    # tenant → local repo checkout for coder worktrees. OPERATOR CONFIG, like
-    # the reviewer map: an instance that declares a tenant's checkout path lets
-    # the orchestrator→specifier→coder handoff upgrade the coder's card to a
-    # git worktree (recording branch_name), instead of leaving it a scratch
-    # card whose branch is never recorded on the task. Absent → no upgrade
-    # (card stays scratch, legacy behavior); fail-open, never guesses a path.
-    raw_workdirs = kanban_cfg.get("tenant_workdirs") or {}
-    tenant_workdirs: dict[str, str] = {}
-    if isinstance(raw_workdirs, dict):
-        for raw_t, raw_w in raw_workdirs.items():
-            tenant = str(raw_t).strip().lower()
-            workdir = str(raw_w).strip()
-            if tenant and workdir:
-                tenant_workdirs[tenant] = workdir
-
+    # tenant_workdirs: tenant → local repo checkout for coder worktrees.
+    # OPERATOR CONFIG, like the reviewer map: an instance that declares a
+    # tenant's checkout path lets the orchestrator→specifier→coder handoff
+    # upgrade the coder's card to a git worktree (recording branch_name),
+    # instead of leaving it a scratch card. Absent → no upgrade (card stays
+    # scratch, legacy behavior); fail-open, never guesses a path.
     result = _RoutingConfig(
         profiles=profiles,
-        tenant_reviewers=tenant_reviewers,
-        tenant_workdirs=tenant_workdirs,
+        tenant_reviewers=_normalized_string_map(
+            kanban_cfg.get("tenant_reviewers", {})
+        ),
+        tenant_workdirs=_normalized_string_map(
+            kanban_cfg.get("tenant_workdirs", {})
+        ),
         signature_map=tuple(signatures),
         prefixes=tuple(profiles),
     )
@@ -12102,7 +12153,7 @@ def resolve_repo_profiles(
     Returns ``(coder_profile, reviewer_profile, source)`` where source is
     ``"declared"`` (explicit declaration found in the text — both profiles
     verified to exist) or ``"tenant"`` (tenant-default pair, existence NOT
-    required to mirror the legacy ``_TENANT_REVIEWER_MAP`` behavior), or
+    required to mirror the configured tenant-reviewer fallback behavior), or
     ``None`` when neither applies (caller falls back as before).
 
     An explicit declaration must resolve to configured, installed role profiles;
