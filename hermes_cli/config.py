@@ -318,6 +318,10 @@ import yaml
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
+from hermes_cli.default_preferences import (
+    DEFAULT_PREFERENCES_MD,
+    is_legacy_template_preferences,
+)
 
 
 # =============================================================================
@@ -913,6 +917,65 @@ def _ensure_default_soul_md(home: Path) -> None:
     _secure_file(soul_path)
 
 
+def _ensure_default_preferences_md(home: Path, *, dry_run: bool = False) -> dict:
+    """Seed a default PRAEFERENZEN.md into ``home``, upgrading legacy templates.
+
+    PRAEFERENZEN.md carries Tills stehende Präferenzen (positive Weg-Defaults):
+    the shared factory-autonomy rule injected into every role's system prompt
+    after the role SOUL. NOTE on scope: the runtime only *reads* this file from
+    the Hermes ROOT home (``agent/prompt_builder.py::load_preferences_md`` →
+    ``get_default_hermes_root() / "PRAEFERENZEN.md"``). We nonetheless seed it
+    into whichever ``home`` is bootstrapped — root AND named-profile homes, the
+    same way SOUL.md is seeded — so the versioned default is materialized
+    consistently and a future profile-scoped read would also find it. Only the
+    root copy affects behavior today.
+
+    Idempotent, exactly like ``_ensure_default_soul_md``:
+      * First run (no file): write DEFAULT_PREFERENCES_MD.
+      * Legacy/empty comment-only scaffold (``is_legacy_template_preferences``):
+        back it up to ``PRAEFERENZEN.md.bak`` and upgrade in place.
+      * A file the user actually customized: NEVER touched.
+
+    Set ``dry_run=True`` to compute and report the action WITHOUT writing
+    anything (no file, no backup). Returns a dict describing the decision:
+    ``{"action": "seed"|"upgrade"|"skip", "path": <str>, "backup": <str|None>,
+    "dry_run": <bool>}`` — ``action`` is what would happen; with ``dry_run`` the
+    side effects are suppressed but the decision is identical.
+    """
+    pref_path = home / "PRAEFERENZEN.md"
+    result = {
+        "action": "skip",
+        "path": str(pref_path),
+        "backup": None,
+        "dry_run": dry_run,
+    }
+    if pref_path.exists():
+        try:
+            existing = pref_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return result
+        if not is_legacy_template_preferences(existing):
+            # User-customized (or already the real default) -> leave untouched.
+            return result
+        # Legacy empty template -> back up then upgrade to the real default.
+        result["action"] = "upgrade"
+        backup_path = pref_path.with_name(pref_path.name + ".bak")
+        result["backup"] = str(backup_path)
+        if not dry_run:
+            try:
+                backup_path.write_text(existing, encoding="utf-8")
+                _secure_file(backup_path)
+            except OSError:
+                # Backup is best-effort; never lose the upgrade over a bak write.
+                pass
+    else:
+        result["action"] = "seed"
+    if not dry_run:
+        pref_path.write_text(DEFAULT_PREFERENCES_MD, encoding="utf-8")
+        _secure_file(pref_path)
+    return result
+
+
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists with secure permissions.
 
@@ -947,6 +1010,7 @@ def ensure_hermes_home():
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
         _ensure_default_soul_md(home)
+        _ensure_default_preferences_md(home)
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -969,6 +1033,7 @@ def _ensure_hermes_home_managed(home: Path):
     (home / "logs" / "curator").mkdir(parents=True, exist_ok=True)
     # Inside umask(0o007) scope — SOUL.md will be created as 0660
     _ensure_default_soul_md(home)
+    _ensure_default_preferences_md(home)
 
 
 # =============================================================================

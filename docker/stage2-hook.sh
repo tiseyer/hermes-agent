@@ -406,6 +406,11 @@ seed_one() {
 seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
 seed_one "SOUL.md" "docker/SOUL.md"
+# PRAEFERENZEN.md: Tills stehende Präferenzen (shared factory-autonomy rule).
+# The runtime reads this only from the ROOT home ($HERMES_HOME here); seeded the
+# same first-boot-only way as SOUL.md. Must match DEFAULT_PREFERENCES_MD in
+# hermes_cli/default_preferences.py (the runtime self-heals a legacy scaffold).
+seed_one "PRAEFERENZEN.md" "docker/PRAEFERENZEN.md"
 
 # .env holds API keys and secrets — restrict to owner-only access. Applied
 # unconditionally (not only on first-seed) so a host-mounted .env that was

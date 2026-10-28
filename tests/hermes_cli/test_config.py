@@ -90,6 +90,106 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == mixed
 
+    def test_creates_default_preferences_md_if_missing(self, tmp_path):
+        from hermes_cli.default_preferences import DEFAULT_PREFERENCES_MD
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            ensure_hermes_home()
+            pref_path = tmp_path / "PRAEFERENZEN.md"
+            assert pref_path.exists()
+            assert pref_path.read_text(encoding="utf-8") == DEFAULT_PREFERENCES_MD
+
+    def test_does_not_overwrite_existing_preferences_md(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            pref_path = tmp_path / "PRAEFERENZEN.md"
+            pref_path.write_text("meine eigenen Regeln", encoding="utf-8")
+            ensure_hermes_home()
+            assert pref_path.read_text(encoding="utf-8") == "meine eigenen Regeln"
+
+    def test_upgrades_legacy_template_preferences_md(self, tmp_path):
+        # An installer could have seeded a comment-only scaffold that shadowed
+        # the real shared rule. A PRAEFERENZEN.md still matching that scaffold
+        # carries no binding preference and should be upgraded in place.
+        from hermes_cli.default_preferences import (
+            DEFAULT_PREFERENCES_MD,
+            _LEGACY_TEMPLATE_PREFERENCES,
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            pref_path = tmp_path / "PRAEFERENZEN.md"
+            pref_path.write_text(
+                _LEGACY_TEMPLATE_PREFERENCES[0] + "\n", encoding="utf-8"
+            )
+            ensure_hermes_home()
+            assert pref_path.read_text(encoding="utf-8") == DEFAULT_PREFERENCES_MD
+
+    def test_upgrade_preferences_md_writes_backup(self, tmp_path):
+        # Upgrading a legacy scaffold must leave a .bak with the prior content.
+        from hermes_cli.config import _ensure_default_preferences_md
+        from hermes_cli.default_preferences import (
+            DEFAULT_PREFERENCES_MD,
+            _LEGACY_TEMPLATE_PREFERENCES,
+        )
+
+        legacy = _LEGACY_TEMPLATE_PREFERENCES[0] + "\n"
+        pref_path = tmp_path / "PRAEFERENZEN.md"
+        pref_path.write_text(legacy, encoding="utf-8")
+        result = _ensure_default_preferences_md(tmp_path)
+        assert result["action"] == "upgrade"
+        assert result["backup"] == str(tmp_path / "PRAEFERENZEN.md.bak")
+        assert pref_path.read_text(encoding="utf-8") == DEFAULT_PREFERENCES_MD
+        bak = tmp_path / "PRAEFERENZEN.md.bak"
+        assert bak.exists()
+        assert bak.read_text(encoding="utf-8") == legacy
+
+    def test_preserves_legacy_preferences_with_user_rule(self, tmp_path):
+        # If the user typed a preference alongside the scaffold, the content no
+        # longer matches the known empty template — leave it untouched.
+        from hermes_cli.default_preferences import _LEGACY_TEMPLATE_PREFERENCES
+
+        mixed = _LEGACY_TEMPLATE_PREFERENCES[0] + "\n## 1. Meine Regel\nText."
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            pref_path = tmp_path / "PRAEFERENZEN.md"
+            pref_path.write_text(mixed, encoding="utf-8")
+            ensure_hermes_home()
+            assert pref_path.read_text(encoding="utf-8") == mixed
+
+    def test_dry_run_preferences_md_seed_writes_nothing(self, tmp_path):
+        from hermes_cli.config import _ensure_default_preferences_md
+
+        pref_path = tmp_path / "PRAEFERENZEN.md"
+        result = _ensure_default_preferences_md(tmp_path, dry_run=True)
+        assert result["action"] == "seed"
+        assert result["dry_run"] is True
+        assert not pref_path.exists()
+
+    def test_dry_run_preferences_md_upgrade_writes_nothing(self, tmp_path):
+        from hermes_cli.config import _ensure_default_preferences_md
+        from hermes_cli.default_preferences import _LEGACY_TEMPLATE_PREFERENCES
+
+        legacy = _LEGACY_TEMPLATE_PREFERENCES[0] + "\n"
+        pref_path = tmp_path / "PRAEFERENZEN.md"
+        pref_path.write_text(legacy, encoding="utf-8")
+        result = _ensure_default_preferences_md(tmp_path, dry_run=True)
+        # Decision is the real one (upgrade + planned backup path) but nothing
+        # is written: file unchanged and no .bak created.
+        assert result["action"] == "upgrade"
+        assert result["backup"] == str(tmp_path / "PRAEFERENZEN.md.bak")
+        assert pref_path.read_text(encoding="utf-8") == legacy
+        assert not (tmp_path / "PRAEFERENZEN.md.bak").exists()
+
+    def test_preferences_md_idempotent_second_run_is_skip(self, tmp_path):
+        from hermes_cli.config import _ensure_default_preferences_md
+        from hermes_cli.default_preferences import DEFAULT_PREFERENCES_MD
+
+        first = _ensure_default_preferences_md(tmp_path)
+        assert first["action"] == "seed"
+        second = _ensure_default_preferences_md(tmp_path)
+        assert second["action"] == "skip"
+        assert (tmp_path / "PRAEFERENZEN.md").read_text(
+            encoding="utf-8"
+        ) == DEFAULT_PREFERENCES_MD
+
     def test_existing_named_profile_still_bootstraps_subdirs(self, tmp_path):
         profile_home = tmp_path / ".hermes" / "profiles" / "coder"
         profile_home.mkdir(parents=True)
