@@ -181,6 +181,43 @@ def test_needs_input_loop_without_zielfrage_still_triages(
         assert kb.get_task(conn, tid).status == "triage"
 
 
+def _running_merger_task(conn, title="Integrate feature-X"):
+    """A Merger card driven to ``running`` so block_task can act."""
+    tid = kb.create_task(conn, title=title, assignee="merger")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="merger") is not None
+    return tid
+
+
+def test_merger_card_loop_stays_blocked_not_triage(kanban_home: Path) -> None:
+    """W3-03: a Merger card that trips the block loop must NOT be routed to
+    ``triage``. ``triage`` auto-decomposes (gateway kanban_watchers), which
+    specifies the card back to ``todo`` ('Specified … promoted to todo') and
+    triggers a SECOND merger run on already-merged work. A merger card is a
+    terminal integration card — re-running it is the bug. Park it as
+    ``blocked`` for a human instead, keeping it out of the decompose path."""
+    with kb.connect_closing() as conn:
+        tid = _running_merger_task(conn)
+        kb.block_task(conn, tid, reason="merge conflict", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="merge conflict again",
+                      kind="capability")
+        t = kb.get_task(conn, tid)
+        # Must NOT land in triage (would auto-decompose → re-merge).
+        assert t.status != "triage"
+        assert t.status == "blocked"
+        assert t.block_recurrences == 2
+        # The auto-decomposer only ever picks up ``triage`` cards, so a merger
+        # card that never enters triage can never be specified back to todo.
+        triage_ids = [row.id for row in kb.list_tasks(conn, status="triage")]
+        assert tid not in triage_ids
+        # No triage-routing event — the loop was parked, not quarantined.
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "block_loop_detected" not in kinds
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------

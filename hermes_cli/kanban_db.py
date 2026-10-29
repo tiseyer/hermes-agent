@@ -7752,7 +7752,68 @@ def block_task(
                 kind in _ZIELFRAGE_BLOCK_KINDS
                 and _card_has_nontech_zielfrage(conn, task_id)
             )
-            if _owner_loop:
+            # W3-03: a MERGER card must never enter the ``triage`` quarantine.
+            # ``triage`` auto-decomposes (gateway ``kanban_watchers``), which
+            # specifies the card back to ``todo`` ("Specified … promoted to
+            # todo") and fires a SECOND merger run on already-merged work
+            # (live repro: run 750 → triage → todo → re-run). A merger card is
+            # the terminal branch-integration card — it carries no decomposable
+            # sub-work, and re-running it against work it already merged is the
+            # bug, not a recovery. A merge loop is a genuine wall (conflict,
+            # unresolvable base, push-gate) that only a human can settle, so
+            # park it as ``blocked`` (not triage, not auto-decompose) exactly
+            # like a truly-blocked ``capability`` wall. Checked BEFORE the F50
+            # owner-loop split: the merger lane is structural (``_is_merger_
+            # profile``), independent of the Zielfrage-vs-triage discriminator.
+            _task_assignee = (
+                cur_row["assignee"] if "assignee" in cur_row.keys() else None
+            )
+            _merger_loop = _is_merger_profile(_task_assignee)
+            if _merger_loop:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id) if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                    )
+                # Sticky ``blocked`` event: a merge wall waits for a human,
+                # not a cron unblock — recompute_ready must not auto-recover it.
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"reason": reason, "kind": kind,
+                     "recurrences": recurrences,
+                     "escalation": "merger_loop"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "merger_loop_escalated",
+                    {"routed_to": "blocked", "recurrences": recurrences,
+                     "limit": BLOCK_RECURRENCE_LIMIT},
+                    run_id=run_id,
+                )
+                routed_to = "blocked"
+            elif _owner_loop:
                 # F54: stamp a durable human-decision ``category`` on the park.
                 # Without it the escalated card rests at ``blocked@till`` with an
                 # EMPTY category; when the Beobachter then posts ``antwort_till``
