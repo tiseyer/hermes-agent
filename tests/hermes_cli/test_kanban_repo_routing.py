@@ -16,6 +16,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from tests.support.kanban_routing import (
+    CANONICAL_REPOSITORY_PROFILES,
     CANONICAL_TENANT_REVIEWERS,
     profiles_with_override as _profiles_with_override,
     seed_canonical,
@@ -923,3 +924,117 @@ def test_loop_brake_unknown_declaration_blocks_needs_input(
     assert task.block_kind == "needs_input"
     assert task.assignee == "voicera-coder"
     assert task_id in result.auto_blocked
+
+
+# ---------------------------------------------------------------------------
+# Harness-workdir routing (resolver fix, card t_19679ae3)
+#
+# A card that names a profile's configured local checkout path — e.g. the
+# harness card body "workdir=/home/till/fabrik-loop" — must route to that
+# profile (fabrik-loop, push origin), NOT to the hermes tenant default
+# (push fork). Before the fix such an undeclared card fell through to the
+# tenant default and the reviewer looked for a non-existent fork branch
+# (gave_up). An absolute checkout path is a safe routing signal: unlike a
+# bare product name ("voicera") it does not appear incidentally in prose,
+# so the deliberate anti-prose contract (prose mentions never reroute) stays
+# intact. Matched as a path token so the sibling repo "/home/till/
+# fabrik-loop-wt" does not match; ambiguous → tenant default (never guesses).
+# ---------------------------------------------------------------------------
+
+HARNESS_WORKDIR = "/home/till/fabrik-loop"
+HERMES_WORKDIR = "/home/till/.hermes/hermes-agent"
+
+
+def _workdir_profiles():
+    """Canonical six + per-profile ``workdir`` + a fabrik-loop harness profile.
+
+    Mirrors Till's live config, where fabrik-loop (push origin) and hermes
+    (push fork) both carry a ``workdir`` path.
+    """
+    profiles = {k: dict(v) for k, v in CANONICAL_REPOSITORY_PROFILES.items()}
+    profiles["hermes"]["workdir"] = HERMES_WORKDIR
+    profiles["fabrik-loop"] = {
+        "coder": "fabrik-loop-coder", "reviewer": "fabrik-loop-reviewer",
+        "base_ref": "origin/main", "merge_target": "main",
+        "push_target": "origin", "signatures": ["fabrik-loop"],
+        "workdir": HARNESS_WORKDIR,
+    }
+    return profiles
+
+
+@pytest.fixture
+def workdir_home(kanban_home):
+    _write_kanban_config(
+        kanban_home, _workdir_profiles(), CANONICAL_TENANT_REVIEWERS,
+    )
+    return kanban_home
+
+
+def _resolve_profile(*, title="t", body="", tenant="hermes", repository=None):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title=title, body=body, tenant=tenant, repository=repository,
+        )
+        return kb.resolve_task_repository_profile(conn, tid)
+
+
+def test_harness_workdir_path_routes_to_fabrik_loop(workdir_home):
+    """The real trigger (t_19679ae3): undeclared harness card → fabrik-loop/origin."""
+    prof = _resolve_profile(
+        title="Harness-Repo-Profil-Resolver: fabrik-loop-Karten",
+        body="PROBLEM: Karte mit workdir=/home/till/fabrik-loop loeste fork-Profil auf.",
+        tenant="hermes",
+    )
+    assert prof is not None
+    assert prof.name == "fabrik-loop"
+    assert prof.push_target == "origin"
+
+
+def test_harness_workdir_subpath_routes_to_fabrik_loop(workdir_home):
+    prof = _resolve_profile(
+        body="Anker siehe /home/till/fabrik-loop/checks/beobachter.py", tenant="voicera",
+    )
+    assert prof is not None
+    assert prof.name == "fabrik-loop"
+
+
+def test_code_worktree_sibling_path_does_not_match_harness(workdir_home):
+    """'/home/till/fabrik-loop-wt' is a DIFFERENT repo (loop/fabrik); the
+    harness workdir must not match it as a bare prefix."""
+    prof = _resolve_profile(
+        body="baue in /home/till/fabrik-loop-wt (loop/fabrik)", tenant="hermes",
+    )
+    assert prof is not None
+    assert prof.name == "hermes"  # tenant default, unchanged
+
+
+def test_prose_product_name_does_not_reroute(workdir_home):
+    """A bare product-name mention ('voicera-os') in prose must NOT reroute a
+    hermes card — the deliberate anti-prose contract stays intact."""
+    prof = _resolve_profile(
+        body="siehe auch voicera-os integration fuer kontext", tenant="hermes",
+    )
+    assert prof is not None
+    assert prof.name == "hermes"
+
+
+def test_ambiguous_two_workdir_paths_keep_tenant_default(workdir_home):
+    """Two distinct checkout paths named → ambiguous → never guess, keep tenant."""
+    prof = _resolve_profile(
+        body="vergleiche /home/till/fabrik-loop und /home/till/.hermes/hermes-agent",
+        tenant="voicera",
+    )
+    assert prof is not None
+    assert prof.name == "voicera"
+
+
+def test_explicit_repository_line_still_wins(workdir_home):
+    prof = _resolve_profile(body="Repository: fabrik-loop\nirgendwas", tenant="hermes")
+    assert prof is not None
+    assert prof.name == "fabrik-loop"
+
+
+def test_structural_repository_field_still_wins(workdir_home):
+    prof = _resolve_profile(body="kein pfad hier", tenant="hermes", repository="fabrik-loop")
+    assert prof is not None
+    assert prof.name == "fabrik-loop"

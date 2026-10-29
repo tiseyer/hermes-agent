@@ -12171,6 +12171,40 @@ def resolve_repository_profile(
     return _validated_repository_profile(profile)
 
 
+def _repository_profile_from_workdir_mention(
+    text: Optional[str],
+) -> Optional[RepositoryProfile]:
+    """Route by an absolute checkout path named in the card text.
+
+    A card that names a repository profile's configured local ``workdir``
+    (e.g. ``workdir=/home/till/fabrik-loop`` in a harness card body) is
+    unambiguously about that repository even without a ``Repository:``
+    declaration line. Unlike a bare product-name signature (``voicera``),
+    which appears incidentally in prose, an absolute checkout path does not —
+    so this is a safe last-resort routing signal, applied AFTER explicit
+    declarations/structural fields and BEFORE the tenant default. It keeps the
+    deliberate anti-prose contract (prose mentions never reroute) intact.
+
+    The path is matched as a path token — a trailing ``[A-Za-z0-9_-]`` rejects
+    it — so ``/home/till/fabrik-loop`` does not match the sibling repo
+    ``/home/till/fabrik-loop-wt``. Returns a profile only when exactly one
+    distinct profile's workdir matches; ambiguous (two profiles) or no match →
+    ``None`` so the caller keeps its tenant fallback (fail-safe, never guesses).
+    """
+    if not text:
+        return None
+    matched: dict[str, RepositoryProfile] = {}
+    for profile in _repository_profiles().values():
+        workdir = profile.workdir.strip()
+        if not workdir:
+            continue
+        if re.search(re.escape(workdir) + r"(?![A-Za-z0-9_-])", text):
+            matched[profile.name] = profile
+    if len(matched) != 1:
+        return None
+    return _validated_repository_profile(next(iter(matched.values())))
+
+
 def resolve_task_repository_profile(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[RepositoryProfile]:
@@ -12202,6 +12236,16 @@ def resolve_task_repository_profile(
         profile = resolve_repository_profile(text, None)
         if profile is not None:
             return profile
+    # Undeclared card that names a profile's checkout path in its own text
+    # (harness cards: "workdir=/home/till/fabrik-loop") routes there before
+    # the tenant default, so a harness card under tenant=hermes stops
+    # resolving the fork-push hermes profile. Own title+body only — the
+    # structural ``repository`` inheritance above already covers children.
+    profile = _repository_profile_from_workdir_mention(
+        (row["title"] or "") + "\n" + (row["body"] or "")
+    )
+    if profile is not None:
+        return profile
     return resolve_repository_profile(None, row["tenant"])
 
 
