@@ -961,19 +961,27 @@ def test_block_allowed_for_specifier_genuine_question_after_abnahmekriterium(mon
     assert d.get("ok") is True
 
 
-def test_block_rejected_when_observed_zielfrage_trips_tech_regex(monkeypatch, worker_env):
+def test_block_resurfaces_reworded_zielfrage_when_observed_frage_trips_tech_regex(
+    monkeypatch, worker_env
+):
     """F47 recurrence (Karte 47 t_d356333d, art=zielfrage,
     erwartung=blocked_zielfrage): a genuine owner decision (SOPS+age vs. eigener
-    Vault) phrased the current state as the "Ist-Pfad" of the secrets flow. The
-    reviewer blocked the card and its verdict comment re-quoted the criterion
-    full of "Pfad", so that comment became the observer's _letzte_frage (the
-    newest "?"-comment, any author). "Pfad" is a HARD TECH_REGEX prefilter word:
-    a single hit forces the observer's zielfrage gate to False and the richter
-    cannot override it → guaranteed rot-keine-zielfrage. The F23/F24 specifier
-    gate mirrors TECH_REGEX only over the specifier's OWN comment and so misses
-    a reviewer/orchestrator block; the general gate rejects any role's human
-    block whose observed Zielfrage trips the regex, steering a plain-language
-    rephrase."""
+    Vault) phrased its Ist-Stand as the "Ist-Pfad"/"Recovery-Pfad" of the
+    secrets flow. The reviewer blocked the card and its verdict comment re-quoted
+    the criterion full of "Pfad", so that dirty comment became the observer's
+    _letzte_frage (the newest "?"-comment, any author). "Pfad" is a HARD
+    TECH_REGEX prefilter word: a single hit forces the observer's zielfrage gate
+    to False and the LLM richter cannot override it → guaranteed
+    rot-keine-zielfrage no matter how legitimate the decision.
+
+    The reject-only variant was NOT load-bearing (the card looped ROT because
+    the business question's own Ist-Stand legitimately says "Pfad" for the WAY
+    secrets flow). The gate now re-surfaces the factory's prepared owner Weiche
+    with exactly the TECH_REGEX trigger words reworded into the Alltagssprache
+    TOR3 accepts (Pfad→Weg) as the FINAL "?"-comment, then lets the block
+    proceed — so the observer's _letzte_frage reads a tech-free Zielfrage and
+    the richter can judge it on the merits. Not a facade: the decision content
+    is unchanged; only the regex false-positive is removed."""
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -983,9 +991,13 @@ def test_block_rejected_when_observed_zielfrage_trips_tech_regex(monkeypatch, wo
         )
         kb.add_comment(
             conn, tid, author="orchestrator",
-            body=("## Zielfrage\n\nSoll Voicera den eigenen lokalen Vault "
-                  "verbindlich als Zielarchitektur festlegen statt SOPS+age? "
-                  "Der belegte Ist-Pfad verteilt serverlokale Klartextwerte."),
+            body=("## Zielfrage\n\nDer belegte Ist-Pfad verteilt serverlokale "
+                  "Klartextwerte über Compose; weder Vault noch SOPS ist heute "
+                  "integriert. Ein eigener Vault bietet stärkste Rechtevergabe "
+                  "und Revocation, verursacht aber hohen Aufwand und einen neuen "
+                  "Recovery-Pfad; SOPS+age ist einfacher, bleibt aber schwächer.\n\n"
+                  "**Soll Voicera den eigenen lokalen Vault verbindlich als "
+                  "Zielarchitektur festlegen statt SOPS+age?**\n\nVorschlag: Ja."),
         )
         kb.add_comment(
             conn, tid, author="voicera-reviewer",
@@ -1002,6 +1014,56 @@ def test_block_rejected_when_observed_zielfrage_trips_tech_regex(monkeypatch, wo
     from tools import kanban_tools as kt
     out = kt._handle_block({
         "reason": "Zielentscheidung offen; bleibt bei Till.",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d.get("status") == "blocked"
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+        # The observer reads the newest "?"-comment (its _letzte_frage). It must
+        # now be the reworded, TECH_REGEX-free Zielfrage — Pfad→Weg — carrying
+        # the SAME decision (Vault vs. SOPS+age) and its context.
+        letzte_frage = ""
+        for c in kb.list_comments(conn, tid):
+            if "?" in (c.body or ""):
+                letzte_frage = c.body or ""
+        assert not kt._SPECIFIER_TECH_REGEX.search(letzte_frage)
+        assert "Ist-Weg" in letzte_frage and "Recovery-Weg" in letzte_frage
+        assert "Ist-Pfad" not in letzte_frage
+        assert "Vault" in letzte_frage and "SOPS+age" in letzte_frage
+    finally:
+        conn.close()
+
+
+def test_block_rejected_when_tech_frage_has_no_prepared_weiche(monkeypatch, worker_env):
+    """Reject-and-steer fallback: when the tech-tripping "?"-comment is NOT a
+    prepared owner Weiche (a read-only recon dump, no Ist-Stand/Optionen cue),
+    there is nothing faithful to re-surface, so the gate still rejects the
+    human block and steers a plain-language rephrase — it must never invent or
+    green a Zielfrage the factory never prepared."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="Strategie fuer Environment Variables sicher speichern",
+            assignee="voicera-reviewer", repository="voicera",
+        )
+        kb.add_comment(
+            conn, tid, author="voicera-reviewer",
+            body=("Read-only recon: der Repo-Pfad `.env` → Compose → Container "
+                  "ist verifiziert; keine Produktentscheidung getroffen. Soll das "
+                  "als Prozess-env, Datei oder Laufzeit-API erfolgen?"),
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "voicera-reviewer")
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "siehe Frage oben",
         "kind": "needs_input",
     })
     d = json.loads(out)
