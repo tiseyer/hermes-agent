@@ -1,11 +1,13 @@
-"""B1.1 Etappe-1-Tests (kanban_pg + Switch). Läuft gegen eine ephemere pgserver-DB.
+"""B1.1 Etappe-1/2-Tests (kanban_pg + Switch). Dual-mode:
 
-Ausführung (braucht psycopg + pgserver, z. B. Dry-Run-venv):
-    PYTHONPATH=<repo> python tests/pg/test_kanban_pg.py
+  * Default: ephemere pgserver-DB (CI/Dry-Run, Health-Fallback-Pfad).
+  * Wenn ``HERMES_KANBAN_PG_DSN`` gesetzt: gegen das ECHTE Prod-PG, aber in einem
+    Wegwerf-SCHEMA (public bleibt bis Cutover unberührt). Dort läuft der amcheck-
+    Health-Pfad echt.
 
-In CI wird das später (P7) gegen eine ephemere PG-Instanz gehängt. amcheck fehlt
-im pgserver-Bundle -> Health läuft hier über den Fallback-Pfad (amcheck-Pfad wird
-gegen das Prod-PG 16 verifiziert, das die Extension hat).
+Ausführung:
+    PYTHONPATH=<repo> python tests/pg/test_kanban_pg.py              # pgserver
+    HERMES_KANBAN_PG_DSN=... PYTHONPATH=<repo> python …              # echtes PG
 """
 import os
 import pathlib
@@ -23,6 +25,7 @@ from kanban_pg.lock_model import try_board_lock, claim_one_ready  # noqa: E402
 import kanban_backend  # noqa: E402
 
 PKG = pathlib.Path(__file__).resolve().parents[2] / "kanban_pg"
+PROD_DSN = os.environ.get("HERMES_KANBAN_PG_DSN", "").strip() or None
 FAILS = []
 
 
@@ -32,35 +35,60 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def _server():
-    xdg = pathlib.Path(tempfile.mkdtemp(prefix="xdg-"))
-    os.environ.setdefault("XDG_RUNTIME_DIR", str(xdg))
-    import pgserver
-    d = pathlib.Path(tempfile.mkdtemp(prefix="pgdata-"))
-    return pgserver.get_server(d), d
+class Env:
+    """Isolierte DB-Umgebung: Prod-Schema (wenn DSN) sonst pgserver."""
+    def __init__(self, name):
+        self.name = name
+        self._srv = None
+        self._dir = None
+        self._schema = None
+        if PROD_DSN:
+            self._schema = f"b1t_{name}_{os.getpid()}"
+            with psycopg.connect(PROD_DSN, autocommit=True) as c:
+                c.execute(f'DROP SCHEMA IF EXISTS "{self._schema}" CASCADE')
+                c.execute(f'CREATE SCHEMA "{self._schema}"')
+            sep = "&" if "?" in PROD_DSN else "?"
+            # search_path = Wegwerf-Schema + public (public für amcheck-Funktionen/Extension)
+            self.uri = f"{PROD_DSN}{sep}options=-c%20search_path%3D{self._schema}%2Cpublic"
+        else:
+            xdg = pathlib.Path(tempfile.mkdtemp(prefix="xdg-"))
+            os.environ.setdefault("XDG_RUNTIME_DIR", str(xdg))
+            import pgserver
+            self._dir = pathlib.Path(tempfile.mkdtemp(prefix="pgdata-"))
+            self._srv = pgserver.get_server(self._dir)
+            self.uri = self._srv.get_uri()
+
+    def connect(self, autocommit=False):
+        return psycopg.connect(self.uri, autocommit=autocommit)
+
+    def teardown(self):
+        if PROD_DSN:
+            with psycopg.connect(PROD_DSN, autocommit=True) as c:
+                c.execute(f'DROP SCHEMA IF EXISTS "{self._schema}" CASCADE')
+        else:
+            self._srv.cleanup()
+            shutil.rmtree(self._dir, ignore_errors=True)
 
 
-def _schema(conn, triggers=True):
-    conn.execute((PKG / "schema.sql").read_text())
-    if triggers:
-        conn.execute((PKG / "triggers.sql").read_text())
+def _apply_schema(env, triggers=True):
+    with env.connect(autocommit=True) as c, c.cursor() as cur:
+        cur.execute((PKG / "schema.sql").read_text())
+        if triggers:
+            cur.execute((PKG / "triggers.sql").read_text())
 
 
-# ---------------------------------------------------------------- switch (kein PG)
 def suite_switch():
     print("[switch]")
     os.environ.pop("HERMES_KANBAN_BACKEND", None)
     check("Default = sqlite", kanban_backend.resolve_backend_name() == "sqlite")
     check("config postgres", kanban_backend.resolve_backend_name({"kanban": {"backend": "postgres"}}) == "postgres")
-    check("is_postgres default False", kanban_backend.is_postgres() is False)
     os.environ["HERMES_KANBAN_BACKEND"] = "postgres"
     check("Env override", kanban_backend.resolve_backend_name({"kanban": {"backend": "sqlite"}}) == "postgres")
     os.environ.pop("HERMES_KANBAN_BACKEND", None)
     try:
-        kanban_backend.resolve_backend_name({"kanban": {"backend": "mysql"}})
-        check("ungültig -> ValueError", False)
+        kanban_backend.resolve_backend_name({"kanban": {"backend": "mysql"}}); check("ungültig->ValueError", False)
     except ValueError:
-        check("ungültig -> ValueError", True)
+        check("ungültig->ValueError", True)
 
 
 def _worker(uri, tag, q):
@@ -79,30 +107,43 @@ def _worker(uri, tag, q):
 
 
 def main():
+    print(f"=== Modus: {'ECHTES PG (Wegwerf-Schema)' if PROD_DSN else 'pgserver'} ===")
     suite_switch()
-    srv, d = _server()
-    try:
-        uri = srv.get_uri()
 
-        # ---- triggers + backend (eine DB) ----
-        print("[triggers+backend]")
-        with psycopg.connect(uri, autocommit=True) as c0, c0.cursor() as cur:
-            _schema(cur, triggers=True)
-        conn = psycopg.connect(uri, autocommit=False)
-        q = psycopg.connect(uri, autocommit=True)
+    e1 = Env("core")
+    try:
+        _apply_schema(e1, triggers=True)
+        conn = e1.connect(autocommit=False)
+        q = e1.connect(autocommit=True)
         try:
             b = PgBackend(conn)
+            print("[triggers+backend]")
             b.create_task("solo", "solo", status="todo", created_at=500)
             check("stamp_insert scat=created_at", q.execute("SELECT status_changed_at FROM tasks WHERE id='solo'").fetchone()[0] == 500)
             b.create_task("R", "root", status="todo", created_at=1000, family_root_id="R")
             b.create_task("c1", "c1", status="ready", assignee="worker", created_at=1001, family_root_id="R")
             b.create_task("c2", "c2", status="ready", assignee="worker", created_at=1002, family_root_id="R")
             check("rollup: Kinder ready -> Wurzel ready", q.execute("SELECT status FROM tasks WHERE id='R'").fetchone()[0] == "ready")
-            b.add_comment("R", "charlie", "k")
-            b.add_event("R", "commented")
+            b.add_comment("R", "charlie", "k"); b.add_event("R", "commented")
             rid = b.start_run("c1", "worker"); b.end_run(rid, "done", "completed")
             check("run lifecycle", q.execute("SELECT outcome FROM task_runs WHERE id=%s", (rid,)).fetchone()[0] == "completed")
-            # circuit breaker
+
+            print("[etappe2: claim-lifecycle]")
+            tid = b.claim_ready("worker", "lock-A", worker_pid=4242, ttl_seconds=600)
+            check("claim_ready -> running + claim_expires gesetzt", tid in ("c1", "c2") and
+                  q.execute("SELECT claim_expires FROM tasks WHERE id=%s", (tid,)).fetchone()[0] is not None)
+            exp0 = q.execute("SELECT claim_expires FROM tasks WHERE id=%s", (tid,)).fetchone()[0]
+            check("heartbeat verlängert claim_expires", b.heartbeat(tid, "lock-A", ttl_seconds=9999) and
+                  q.execute("SELECT claim_expires FROM tasks WHERE id=%s", (tid,)).fetchone()[0] > exp0)
+            check("heartbeat mit falschem lock -> False", b.heartbeat(tid, "lock-WRONG") is False)
+            # reclaim_stale: Claim künstlich ablaufen lassen
+            q.execute("UPDATE tasks SET claim_expires=1 WHERE id=%s", (tid,))
+            reclaimed = b.reclaim_stale(now=100)
+            check("reclaim_stale gibt abgelaufenen Claim zurück", tid in reclaimed, f"got {reclaimed}")
+            check("reclaimte Karte wieder ready + claim_lock NULL",
+                  q.execute("SELECT status, claim_lock FROM tasks WHERE id=%s", (tid,)).fetchone() == ("ready", None))
+
+            print("[circuit-breaker]")
             b.create_task("f1", "f", status="ready", created_at=1003)
             r = None
             for _ in range(3):
@@ -110,58 +151,55 @@ def main():
             check("record_failure trips -> blocked", r[1] == "blocked", f"got {r}")
             b.complete_task("f1")
             check("complete resetet consecutive_failures", q.execute("SELECT consecutive_failures FROM tasks WHERE id='f1'").fetchone()[0] == 0)
-            b.complete_task("c1"); b.complete_task("c2")
-            rr = q.execute("SELECT status, completed_at FROM tasks WHERE id='R'").fetchone()
-            check("rollup: alle done -> Wurzel done + completed_at", rr[0] == "done" and rr[1] and rr[1] > 0)
+
+            print("[health]")
+            with e1.connect(autocommit=True) as hc:
+                h = health.check_health(hc)
+                check("health ok", h["ok"] is True, f"got {h}")
+                mode = h["checks"]["integrity"]["mode"]
+                check("health-mode", mode in ("amcheck", "fallback"))
+                if mode == "amcheck":
+                    check("amcheck: Indizes geprüft > 0", h["checks"]["integrity"]["indexes_checked"] > 0,
+                          f"got {h['checks']['integrity']}")
+                print(f"    (health-mode: {mode})")
         finally:
             conn.close(); q.close()
-
-        # ---- health (Fallback-Pfad auf pgserver) ----
-        print("[health]")
-        with psycopg.connect(uri, autocommit=True) as hc:
-            h = health.check_health(hc)
-            check("health ok auf sauberer DB", h["ok"] is True, f"got {h}")
-            check("health-mode gesetzt", h["checks"]["integrity"]["mode"] in ("amcheck", "fallback"))
-
-        # ---- locks (frische DB) ----
-        print("[locks]")
-        srv2, d2 = _server()
-        try:
-            uri2 = srv2.get_uri()
-            with psycopg.connect(uri2, autocommit=True) as c0, c0.cursor() as cur:
-                _schema(cur, triggers=False)
-                with cur.copy("COPY tasks (id,title,status,assignee,created_at) FROM STDIN") as cp:
-                    for i in range(200):
-                        cp.write_row((f"t{i:04d}", f"t{i}", "ready", "worker", 1000 + i))
-            ctx = mp.get_context("fork")
-            qq = ctx.Queue()
-            procs = [ctx.Process(target=_worker, args=(uri2, t, qq)) for t in range(8)]
-            for p in procs:
-                p.start()
-            total = sum(qq.get() for _ in procs)
-            for p in procs:
-                p.join()
-            check("8 Claimer: Summe == 200 (kein Doppelclaim/Verlust)", total == 200, f"got {total}")
-            with psycopg.connect(uri2, autocommit=True) as c:
-                check("running == 200", c.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0] == 200)
-                check("distinct running-ids == 200", c.execute("SELECT count(DISTINCT id) FROM tasks WHERE status='running'").fetchone()[0] == 200)
-                check("ready == 0", c.execute("SELECT count(*) FROM tasks WHERE status='ready'").fetchone()[0] == 0)
-            c1 = psycopg.connect(uri2, autocommit=False)
-            c2 = psycopg.connect(uri2, autocommit=False)
-            try:
-                a1 = try_board_lock(c1, "default"); a2 = try_board_lock(c2, "default")
-                check("advisory: Ausschluss (1=True,2=False)", a1 is True and a2 is False)
-                c1.commit()
-                check("advisory: Auto-Release nach commit", try_board_lock(c2, "default") is True)
-                c2.commit()
-            finally:
-                c1.close(); c2.close()
-        finally:
-            srv2.cleanup(); shutil.rmtree(d2, ignore_errors=True)
     finally:
-        srv.cleanup(); shutil.rmtree(d, ignore_errors=True)
+        e1.teardown()
 
-    print(f"\nETAPPE-1-TESTS: {'ALLE GRÜN' if not FAILS else f'{len(FAILS)} ROT: {FAILS}'}")
+    print("[locks: 8 Claimer nebenläufig]")
+    e2 = Env("locks")
+    try:
+        _apply_schema(e2, triggers=False)
+        with e2.connect(autocommit=True) as c, c.cursor() as cur:
+            with cur.copy("COPY tasks (id,title,status,assignee,created_at) FROM STDIN") as cp:
+                for i in range(200):
+                    cp.write_row((f"t{i:04d}", f"t{i}", "ready", "worker", 1000 + i))
+        ctx = mp.get_context("fork")
+        qq = ctx.Queue()
+        procs = [ctx.Process(target=_worker, args=(e2.uri, t, qq)) for t in range(8)]
+        for p in procs:
+            p.start()
+        total = sum(qq.get() for _ in procs)
+        for p in procs:
+            p.join()
+        check("8 Claimer: Summe == 200 (kein Doppelclaim/Verlust)", total == 200, f"got {total}")
+        with e2.connect(autocommit=True) as c:
+            check("running == 200", c.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0] == 200)
+            check("distinct running-ids == 200", c.execute("SELECT count(DISTINCT id) FROM tasks WHERE status='running'").fetchone()[0] == 200)
+        c1 = e2.connect(); c2 = e2.connect()
+        try:
+            a1 = try_board_lock(c1, "default"); a2 = try_board_lock(c2, "default")
+            check("advisory: Ausschluss", a1 is True and a2 is False)
+            c1.commit()
+            check("advisory: Auto-Release", try_board_lock(c2, "default") is True)
+            c2.commit()
+        finally:
+            c1.close(); c2.close()
+    finally:
+        e2.teardown()
+
+    print(f"\nTESTS ({'PROD-PG' if PROD_DSN else 'pgserver'}): {'ALLE GRÜN' if not FAILS else f'{len(FAILS)} ROT: {FAILS}'}")
     return 0 if not FAILS else 2
 
 

@@ -74,11 +74,39 @@ class PgBackend:
         self.conn.execute("UPDATE tasks SET assignee=%s WHERE id=%s", (profile, task_id))
         self.conn.commit()
 
-    # ---- claim (DB-seitig serialisiert, ersetzt flock-Claim) ----
-    def claim_ready(self, assignee, claim_lock, worker_pid=None):
-        tid = claim_one_ready(self.conn, assignee, claim_lock, now_epoch(), worker_pid)
+    # ---- claim-Lebenszyklus (DB-seitig serialisiert, ersetzt flock-Claim) ----
+    def claim_ready(self, assignee, claim_lock, worker_pid=None, ttl_seconds=600):
+        tid = claim_one_ready(self.conn, assignee, claim_lock, now_epoch(),
+                              worker_pid, ttl_seconds)
         self.conn.commit()
         return tid
+
+    def heartbeat(self, task_id, claim_lock, ttl_seconds=600):
+        """Verlängert den Claim einer laufenden, zum claim_lock passenden Karte.
+        Gibt True, wenn die Karte noch uns gehört (sonst False = reclaimt/weg)."""
+        cur = self.conn.execute(
+            "UPDATE tasks SET last_heartbeat_at=%s, claim_expires=%s "
+            "WHERE id=%s AND status='running' AND claim_lock=%s RETURNING id",
+            (now_epoch(), now_epoch() + ttl_seconds, task_id, claim_lock),
+        )
+        ok = cur.fetchone() is not None
+        self.conn.commit()
+        return ok
+
+    def reclaim_stale(self, now=None):
+        """Gibt abgelaufene running-Claims zurück an 'ready' (Dispatcher-Watchdog).
+        Gibt die Liste der reclaimten ids zurück."""
+        now = now if now is not None else now_epoch()
+        cur = self.conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, worker_pid=NULL, "
+            "claim_expires=NULL "
+            "WHERE status='running' AND claim_expires IS NOT NULL AND claim_expires < %s "
+            "RETURNING id",
+            (now,),
+        )
+        ids = [r[0] for r in cur.fetchall()]
+        self.conn.commit()
+        return ids
 
     # ---- comments / events ----
     def add_comment(self, task_id, author, body):

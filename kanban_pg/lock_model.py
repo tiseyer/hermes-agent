@@ -31,15 +31,17 @@ def try_board_lock(conn, board: str) -> bool:
 
 
 def claim_one_ready(conn, assignee: str, claim_lock: str, now_epoch: int,
-                    worker_pid: int | None = None) -> str | None:
+                    worker_pid: int | None = None, ttl_seconds: int = 600) -> str | None:
     """Claimt EINE ready-Karte des Assignees atomar. Gibt die id oder None.
 
+    Setzt ``claim_expires = now + ttl_seconds`` (Grundlage für reclaim_stale).
     Muss in einer Transaktion laufen (conn autocommit=False); der Aufrufer
     committet danach (gibt die FOR-UPDATE-Sperre frei + macht 'running' sichtbar).
     """
     cur = conn.execute(
         """
-        UPDATE tasks SET status='running', claim_lock=%s, started_at=%s, worker_pid=%s
+        UPDATE tasks SET status='running', claim_lock=%s, started_at=%s,
+               worker_pid=%s, claim_expires=%s
         WHERE id = (
             SELECT id FROM tasks
             WHERE status='ready' AND assignee=%s
@@ -49,7 +51,7 @@ def claim_one_ready(conn, assignee: str, claim_lock: str, now_epoch: int,
         )
         RETURNING id
         """,
-        (claim_lock, now_epoch, worker_pid, assignee),
+        (claim_lock, now_epoch, worker_pid, now_epoch + ttl_seconds, assignee),
     )
     row = cur.fetchone()
     return row[0] if row else None

@@ -18,9 +18,10 @@ KANBAN_TABLES = [
 ]
 
 
-def amcheck_available(conn) -> bool:
+def amcheck_present(conn) -> bool:
+    """True, wenn die amcheck-Extension installiert ist (sagt noch nichts über
+    EXECUTE-Recht der aktuellen Rolle)."""
     try:
-        conn.execute("CREATE EXTENSION IF NOT EXISTS amcheck")
         row = conn.execute(
             "SELECT 1 FROM pg_extension WHERE extname='amcheck'"
         ).fetchone()
@@ -43,15 +44,26 @@ def _btree_indexes(conn) -> list[str]:
     return [r[0] for r in rows]
 
 
-def run_amcheck(conn) -> dict:
+def _amcheck_or_none(conn):
+    """Führt amcheck über alle B-Baum-Indizes aus. Gibt ein Ergebnis-dict zurück —
+    oder None, wenn amcheck für diese Rolle NICHT nutzbar ist (Extension fehlt oder
+    EXECUTE verweigert, weil amcheck superuser-only ist und kein GRANT gesetzt wurde).
+    Beim Permission-Fehler fällt check_health auf den Konsistenz-Check zurück.
+    """
+    if not amcheck_present(conn):
+        return None
     failures = []
     checked = 0
     for idx in _btree_indexes(conn):
         try:
             conn.execute(f"SELECT bt_index_check('{idx}'::regclass)")
             checked += 1
-        except Exception as e:  # pragma: no cover - nur bei echtem Schaden
-            failures.append(f"{idx}: {e}")
+        except Exception as e:
+            msg = str(e).lower()
+            if "permission denied" in msg or "must be superuser" in msg:
+                # Rolle darf amcheck nicht ausführen -> nicht nutzbar, Fallback.
+                return None
+            failures.append(f"{idx}: {e}")  # echter Index-Schaden
     return {"mode": "amcheck", "indexes_checked": checked, "failures": failures,
             "ok": not failures}
 
@@ -86,10 +98,10 @@ def check_health(conn) -> dict:
         out["ok"] = False
         return out
 
-    if amcheck_available(conn):
-        res = run_amcheck(conn)
-    else:
+    res = _amcheck_or_none(conn)
+    if res is None:
         res = fallback_consistency(conn)
+        res["amcheck"] = "nicht nutzbar (fehlt oder kein EXECUTE-Recht für die Rolle)"
     out["checks"]["integrity"] = res
     out["ok"] = bool(out["checks"]["connectivity"] and res.get("ok"))
     return out
