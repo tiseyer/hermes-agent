@@ -163,6 +163,13 @@ def main():
             check("unsubscribe entfernt Sub", b.notify_unsubscribe("solo", "telegram", "chat1") is True)
             check("claim nach unsubscribe leer", b.claim_unseen_events("solo", "telegram", "chat1") == [])
 
+            print("[etappe5: auto-heartbeat / tools]")
+            b.create_task("hb1", "hb", status="running", created_at=1004)
+            b.bump_heartbeat("hb1")
+            check("bump_heartbeat setzt last_heartbeat_at", q.execute("SELECT last_heartbeat_at FROM tasks WHERE id='hb1'").fetchone()[0] is not None)
+            b.block_task("hb1", kind="needs_input")
+            check("block_task -> blocked + block_kind", q.execute("SELECT status, block_kind FROM tasks WHERE id='hb1'").fetchone() == ("blocked", "needs_input"))
+
             print("[health]")
             with e1.connect(autocommit=True) as hc:
                 h = health.check_health(hc)

@@ -21,6 +21,16 @@ class ClaimsMixin:
         self.conn.commit()
         return ok
 
+    def bump_heartbeat(self, task_id):
+        """Auto-Heartbeat (Worker-Tools, #31752): nur last_heartbeat_at der laufenden
+        Karte bumpen (Liveness), ohne claim_lock-Prüfung. Ersetzt den ungelockten
+        B-Pfad-Schreiber aus tools/kanban_tools.py."""
+        self.conn.execute(
+            "UPDATE tasks SET last_heartbeat_at=%s WHERE id=%s AND status='running'",
+            (now_epoch(), task_id),
+        )
+        self.conn.commit()
+
     def reclaim_stale(self, now=None):
         """Abgelaufene running-Claims zurück auf 'ready' (Dispatcher-Watchdog)."""
         now = now if now is not None else now_epoch()
