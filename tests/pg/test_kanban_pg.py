@@ -170,6 +170,16 @@ def main():
             b.block_task("hb1", kind="needs_input")
             check("block_task -> blocked + block_kind", q.execute("SELECT status, block_kind FROM tasks WHERE id='hb1'").fetchone() == ("blocked", "needs_input"))
 
+            print("[etappe6: dashboard-reads]")
+            t = b.get_task("R")
+            check("get_task liefert dict", isinstance(t, dict) and t["id"] == "R")
+            check("get_task None bei unbekannt", b.get_task("nope") is None)
+            check("list_tasks(status=done) enthält c1", any(x["id"] == "c1" for x in b.list_tasks(status="done")))
+            check("list_comments(R) >= 1", len(b.list_comments("R")) >= 1)
+            check("list_events(R) >= 1", len(b.list_events("R")) >= 1)
+            st = b.stats_by_status()
+            check("stats_by_status summiert", sum(st.values()) == q.execute("SELECT count(*) FROM tasks").fetchone()[0])
+
             print("[health]")
             with e1.connect(autocommit=True) as hc:
                 h = health.check_health(hc)
