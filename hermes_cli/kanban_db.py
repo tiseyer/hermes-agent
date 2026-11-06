@@ -4294,6 +4294,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # ---------------------------------------------------------------------------
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).link_tasks(parent_id, child_id)
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -4370,6 +4373,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unlink_tasks(parent_id, child_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -8601,6 +8607,11 @@ def specify_triage_task(
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).specify_triage_task(
+            task_id, title=title, body=body,
+            assignee=_canonical_assignee(assignee), author=author)
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -8719,6 +8730,13 @@ def decompose_triage_task(
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: Repo→Profil-Routing der Kind-assignees + Routing-Preflight-Park
+        # laufen nicht im PG-Kern (Config-Routing).
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).decompose_triage_task(
+            task_id, root_assignee=_canonical_assignee(root_assignee),
+            children=children, author=author, auto_promote=auto_promote)
     if not children:
         return None
     if root_assignee is not None:
