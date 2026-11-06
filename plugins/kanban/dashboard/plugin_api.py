@@ -1111,6 +1111,20 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
+                # Mirror the worker-tool _handle_complete F39/F53 guard at this
+                # operator entry point (which calls complete_task directly): a
+                # Zielentscheidung card may never be flipped to `done`, not even
+                # by a dashboard triage — the Beobachter marks that
+                # rot-zielentscheid-selbst.
+                try:
+                    from tools.kanban_tools import (
+                        operator_complete_zielentscheidung_block as _ze_block,
+                    )
+                    steer = _ze_block(conn, task_id)
+                except Exception:
+                    steer = None
+                if steer:
+                    raise HTTPException(status_code=409, detail=steer)
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,

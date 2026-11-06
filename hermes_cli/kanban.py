@@ -2150,6 +2150,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Mirror the worker-tool _handle_complete F39/F53 guard at this
+            # operator entry point (which calls complete_task directly): a
+            # Zielentscheidung card may never be flipped to `done`, not even by
+            # a manual triage — the Beobachter marks that rot-zielentscheid-selbst.
+            try:
+                from tools.kanban_tools import (
+                    operator_complete_zielentscheidung_block as _ze_block,
+                )
+                steer = _ze_block(conn, tid)
+            except Exception:
+                steer = None
+            if steer:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {steer}", file=sys.stderr)
+                continue
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,

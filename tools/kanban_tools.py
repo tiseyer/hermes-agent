@@ -726,6 +726,57 @@ def _card_is_zielentscheidung(
     return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
 
 
+def operator_complete_zielentscheidung_block(conn, task_id: str) -> Optional[str]:
+    """Return a steering message when an OPERATOR completion path (the CLI
+    ``hermes kanban complete`` or the dashboard ``PATCH /tasks …status=done``)
+    is about to flip a Zielentscheidung card to ``done`` — else ``None``.
+
+    F47/F53 recurrence (live Karte 47 t_37d39856 'Strategie fuer Environment
+    Variables sicher speichern', art=zielfrage, erwartung=blocked_zielfrage).
+    The worker tool :func:`_handle_complete` already mirrors the Beobachter's
+    necessary condition — a decision card the OWNER must make has exactly one
+    green terminal, ``blocked`` with the prepared Zielfrage (Regel b); a ``done``
+    is ALWAYS ``rot-zielentscheid-selbst`` ("Fabrik hat Zielentscheidung selbst
+    getroffen (done statt blocked)"). But the two OPERATOR entry points call
+    :func:`hermes_cli.kanban_db.complete_task` DIRECTLY, bypassing that guard:
+    here a manual triage ("obsolet + Dublette …") completed the card and the
+    Beobachter promptly marked the feature ROT. A duplicate/obsolete decision
+    card does NOT belong in ``done`` — it rests at ``blocked`` with its owner
+    Zielfrage (the Beobachter rejects ``done`` AND ``archived`` for these, F50),
+    so the factory stays honest regardless of who presses the button. Enforce
+    the same necessary condition at these bypass points (a UI/CLI affordance is
+    not load-bearing, cf. F01). Conservative: only a card detected as a
+    Zielentscheidung that is NOT already terminal is refused; a genuine build
+    card (``_card_is_zielentscheidung`` False) completes untouched.
+    """
+    from hermes_cli import kanban_db as kb
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return None
+    # Only guard a live transition TO done — never reopen a card that is
+    # already done/archived (that is not this guard's job).
+    if (task.status or "").strip().lower() in ("done", "archived"):
+        return None
+    comment_bodies = [c.body or "" for c in kb.list_comments(conn, task_id)]
+    if not _card_is_zielentscheidung(
+        task.title, task.body or "", task.category, comment_bodies
+    ):
+        return None
+    return (
+        f"{task_id} is a Zielentscheidung — a business/product decision that is "
+        "the owner's to make, not the factory's. Completing it `done` means the "
+        "factory took the owner's decision itself, which the Beobachter rejects "
+        "as rot-zielentscheid-selbst (\"Fabrik hat Zielentscheidung selbst "
+        "getroffen (done statt blocked)\"). A decision card has exactly one "
+        "green terminal: `blocked` with the prepared Zielfrage for Till. If this "
+        "card is an obsolete duplicate, it still rests at `blocked` with its "
+        "owner Zielfrage (the Beobachter rejects `done` AND `archived` for these "
+        "cards) — do NOT complete it. Prepare the options + consequences + "
+        "context as a comment, then block it with the Zielfrage stated AS A "
+        "QUESTION (\"?\") for Till."
+    )
+
+
 # F53: a PROCEDURAL ``?``-comment — a merge/deploy/release/smoke "Freigabe (GO)"
 # question (e.g. the F30/F31 reviewer Merge-GO "… merged nach develop. Soll dieser
 # Merge freigegeben werden (GO)?"). It is NOT the owner's strategic Zielentscheidung

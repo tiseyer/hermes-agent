@@ -532,6 +532,49 @@ def test_complete_rejected_for_zielentscheidung_by_category(monkeypatch, worker_
         conn.close()
 
 
+def test_operator_complete_guard_refuses_zielentscheidung(monkeypatch, worker_env):
+    """F47/F53: the CLI (`hermes kanban complete`) and dashboard
+    (`PATCH /tasks …status=done`) call kanban_db.complete_task DIRECTLY, bypassing
+    the _handle_complete F39/F53 guard. A manual triage flipped the live Karte 47
+    (t_37d39856, erwartung=blocked_zielfrage) to `done` → beobachter
+    rot-zielentscheid-selbst. operator_complete_zielentscheidung_block mirrors the
+    worker guard at these bypass points: a decision card (content OR category)
+    that is not already terminal is refused; a plain build card completes."""
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import operator_complete_zielentscheidung_block as g
+    conn = kb.connect()
+    try:
+        # (a) content-signal decision card, in `ready` → refused
+        zid = kb.create_task(
+            conn, title="Strategie fuer Secrets",
+            body=("Bitte die zwei Wege (eigener Vault oder SOPS+age) mit Aufwand "
+                  "und Risiko darstellen und eine Weiche vorbereiten."),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (zid,))
+        # (b) category=entscheidung decision card, plain wording → refused
+        cid = kb.create_task(conn, title="Produktweiche", body="Weiter so?")
+        conn.execute(
+            "UPDATE tasks SET status='ready', category='entscheidung' WHERE id=?",
+            (cid,),
+        )
+        # (c) plain build card → allowed (None)
+        bid = kb.create_task(conn, title="Tippfehler im README", body="Nur ein Fix.")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (bid,))
+        conn.commit()
+
+        msg_a = g(conn, zid)
+        assert msg_a and "Zielentscheidung" in msg_a and "blocked" in msg_a
+        assert "Zielentscheidung" in (g(conn, cid) or "")
+        assert g(conn, bid) is None
+
+        # (d) idempotent: an already-done decision card is NOT reopened/refused
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (zid,))
+        conn.commit()
+        assert g(conn, zid) is None
+    finally:
+        conn.close()
+
+
 def test_complete_allowed_for_non_decision_no_branch_card(monkeypatch, worker_env):
     """F39 must not leak to an ordinary no-branch analysis/recon card: a recon
     card ('Recon: leereTexte usage') carries none of the Zielentscheidung signals
