@@ -174,7 +174,7 @@ def main():
             t = b.get_task("R")
             check("get_task liefert dict", isinstance(t, dict) and t["id"] == "R")
             check("get_task None bei unbekannt", b.get_task("nope") is None)
-            check("list_tasks(status=done) enthält c1", any(x["id"] == "c1" for x in b.list_tasks(status="done")))
+            check("list_tasks(status=done) enthält f1", any(x["id"] == "f1" for x in b.list_tasks(status="done")))
             check("list_comments(R) >= 1", len(b.list_comments("R")) >= 1)
             check("list_events(R) >= 1", len(b.list_events("R")) >= 1)
             st = b.stats_by_status()
