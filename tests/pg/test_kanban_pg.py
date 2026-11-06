@@ -152,6 +152,17 @@ def main():
             b.complete_task("f1")
             check("complete resetet consecutive_failures", q.execute("SELECT consecutive_failures FROM tasks WHERE id='f1'").fetchone()[0] == 0)
 
+            print("[etappe4: notifier-cursor]")
+            b.notify_subscribe("solo", "telegram", "chat1", user_id="u1")
+            b.add_event("solo", "n1"); b.add_event("solo", "n2")
+            evs = b.claim_unseen_events("solo", "telegram", "chat1")
+            check("claim_unseen liefert neue Events", len(evs) == 2, f"got {len(evs)}")
+            check("claim_unseen 2. Mal leer (Cursor vorgeschoben)", b.claim_unseen_events("solo", "telegram", "chat1") == [])
+            b.add_event("solo", "n3")
+            check("nach neuem Event wieder 1", len(b.claim_unseen_events("solo", "telegram", "chat1")) == 1)
+            check("unsubscribe entfernt Sub", b.notify_unsubscribe("solo", "telegram", "chat1") is True)
+            check("claim nach unsubscribe leer", b.claim_unseen_events("solo", "telegram", "chat1") == [])
+
             print("[health]")
             with e1.connect(autocommit=True) as hc:
                 h = health.check_health(hc)

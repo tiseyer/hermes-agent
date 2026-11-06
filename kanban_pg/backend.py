@@ -15,6 +15,7 @@ from .ops_claims import ClaimsMixin
 from .ops_comments import CommentsEventsMixin
 from .ops_runs import RunsMixin
 from .ops_links import LinksMixin
+from .ops_notify import NotifyMixin
 
 
 class PgBackend(
@@ -23,6 +24,7 @@ class PgBackend(
     CommentsEventsMixin,
     RunsMixin,
     LinksMixin,
+    NotifyMixin,
 ):
     """Schmales Schreib-/Lese-Backend über eine psycopg3-Verbindung (autocommit=False)."""
 
