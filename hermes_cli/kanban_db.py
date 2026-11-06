@@ -2012,7 +2012,14 @@ def connect(
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # B1.7: steady-state fast path has NO cross-process init lock,
+                # so it must never WRITE journal_mode (concurrent WAL activation
+                # across gateway + api + dashboard clobbers sqlite_master — see
+                # corruption #8, 2026-11-06). Read-only + fail loud; WAL is set
+                # once on the slow path / offline and persists in the header.
+                apply_wal_with_fallback(
+                    conn, db_label=f"kanban.db ({path.name})", enforce_preset=True
+                )
                 conn.execute("PRAGMA synchronous=FULL")
                 # 100 -> 1000 (2026-08-19): with gateway threads + N workers
                 # + dashboard + bridge API all holding connections, a ~400KB

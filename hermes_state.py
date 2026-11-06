@@ -390,6 +390,7 @@ def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
+    enforce_preset: bool = False,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -413,14 +414,36 @@ def apply_wal_with_fallback(
     """
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
+    current_mode = None
     try:
-        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        current_mode = row[0] if row else None
+        if current_mode == "wal":
             _apply_macos_checkpoint_barrier(conn)
             _enforce_macos_synchronous_full(conn)
             return "wal"
     except sqlite3.OperationalError:
-        pass
+        if enforce_preset:
+            raise
+        current_mode = None
+
+    if enforce_preset:
+        # B1.7 (kanban.db corruption #8, 2026-11-06): the steady-state kanban
+        # connect() fast path runs WITHOUT the cross-process init lock, so when
+        # several processes (gateway dispatcher + voicera-api + dashboard) open
+        # connections at once and the file is not already WAL, each one races to
+        # run "PRAGMA journal_mode=WAL" — a schema/header write that clobbers
+        # sqlite_master and corrupts the DB. On this path we therefore NEVER
+        # write journal_mode: WAL is set once offline and must already live in
+        # the file header. If it does not, fail loudly instead of self-healing
+        # into the race. (NFS/SMB/FUSE deployments that legitimately run in
+        # DELETE mode must not pass enforce_preset=True.)
+        raise RuntimeError(
+            f"{db_label}: expected journal_mode=wal on an already-initialized "
+            f"connection but found {current_mode!r}. Refusing to set WAL on the "
+            f"steady-state path (B1.7 connect-race guard). Set it once offline "
+            f"with: sqlite3 <db> 'PRAGMA journal_mode=WAL;'"
+        )
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")
