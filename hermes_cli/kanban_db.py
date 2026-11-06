@@ -15000,6 +15000,11 @@ def add_notify_sub(
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).add_notify_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=user_id, notifier_profile=notifier_profile)
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
@@ -15027,6 +15032,9 @@ def add_notify_sub(
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).list_notify_subs(task_id)
     if task_id is not None:
         rows = conn.execute(
             "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
@@ -15044,6 +15052,10 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).remove_notify_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id, thread_id=thread_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
@@ -15068,6 +15080,11 @@ def unseen_events_for_sub(
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unseen_events_for_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, kinds=kinds)
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
         "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -15125,6 +15142,11 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).claim_unseen_events_for_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, kinds=kinds)
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
@@ -15162,6 +15184,11 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).advance_notify_cursor(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, new_cursor=new_cursor)
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
@@ -15186,6 +15213,11 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).rewind_notify_cursor(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
