@@ -3266,6 +3266,23 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # B1.1 Postgres-Routing (inert @ sqlite): der Guard sitzt NACH der Policy-
+    # Resolution (projects/skills/repo/board-default = D5-Grenze, oben erledigt)
+    # und VOR der Insert-Schleife; er delegiert den faithful DB-Kern (Status-
+    # Auflösung/Family/Hierarchie/Insert/Links/created-Event) ans PG-Backend.
+    if not isinstance(conn, sqlite3.Connection):
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).create_task_full(
+            title=title, body=body, assignee=assignee, created_by=created_by,
+            workspace_kind=workspace_kind, workspace_path=workspace_path,
+            branch_name=branch_name, tenant=tenant, repository=repository,
+            priority=priority, parents=parents, triage=triage,
+            idempotency_key=idempotency_key, max_runtime_seconds=max_runtime_seconds,
+            skills_list=skills_list, max_retries=max_retries, goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns, merge_group=merge_group,
+            initial_status=initial_status, session_id=session_id, project_id=project_id,
+            parent_task_id=parent_task_id, initiative_id=initiative_id,
+            child_role=child_role)
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3727,6 +3744,11 @@ def move_to_human(
     :func:`create_human_card` — overflow RAISES ``ValueError`` rather than
     silently clipping.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).move_to_human(
+            task_id, title=title, kurzbeschreibung=kurzbeschreibung,
+            category=category, actor=actor, planned_step=planned_step)
     if title is not None:
         if not title.strip():
             raise ValueError("title is required")
@@ -4069,6 +4091,10 @@ def relabel_task(
     ``ValueError`` if neither field is given, if ``title`` is empty/blank, or if
     either field exceeds its length limit.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).relabel_task(
+            task_id, title=title, kurzbeschreibung=kurzbeschreibung, actor=actor)
     if title is None and kurzbeschreibung is None:
         raise ValueError(
             "relabel needs at least one of title / kurzbeschreibung"
@@ -4234,6 +4260,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).assign_task(task_id, profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -5605,6 +5634,11 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).reassign_task_full(
+            task_id, _canonical_assignee(profile),
+            reclaim_first=reclaim_first, reason=reason)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6165,6 +6199,13 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: created_cards-/done-Evidence-Verifikation, Artefakt-Persistenz,
+        # Prose-Scan, workspace-cleanup, Lifecycle-Hook laufen NICHT im PG-DB-Kern.
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).complete_task_full(
+            task_id, result=result, summary=summary, metadata=metadata,
+            expected_run_id=expected_run_id)
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -7103,6 +7144,10 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).edit_completed_task_result(
+            task_id, result=result, summary=summary, metadata=metadata)
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -7196,6 +7241,12 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: Review-Repo-Routing (resolve_task_repo_profiles) via
+        # reviewer_resolver; F43/F56-dependency-owner-fold-Zweige nicht im Kern.
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).block_task_full(
+            task_id, reason=reason, kind=kind, expected_run_id=expected_run_id)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -8048,6 +8099,10 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).promote_task(
+            task_id, actor=actor, reason=reason, force=force, dry_run=dry_run)
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -8462,6 +8517,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unblock_task(task_id)
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -8987,6 +9045,9 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).archive_task(task_id)
     # F50: never archive a legit blocked owner-Zielfrage/decision card. Such a
     # card RESTS in ``blocked`` awaiting the owner's GO — archiving it (e.g. a
     # "triage resolution" that self-decides the Zielentscheidung and dissolves
@@ -9670,6 +9731,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_workspace_path(task_id, path)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
@@ -9680,6 +9744,9 @@ def set_workspace_path(
 def set_workspace_kind(
     conn: sqlite3.Connection, task_id: str, kind: str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_workspace_kind(task_id, kind)
     if kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -9695,6 +9762,9 @@ def set_workspace_kind(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_branch_name(task_id, branch_name)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
@@ -9716,6 +9786,10 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).schedule_task(
+            task_id, reason=reason, expected_run_id=expected_run_id)
     with write_txn(conn):
         # F55: an owner/human DECISION card must rest in ``blocked@till`` (the
         # Beobachter's ``blocked_zielfrage`` bucket), NEVER in ``scheduled``.
