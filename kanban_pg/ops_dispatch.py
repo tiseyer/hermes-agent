@@ -693,7 +693,8 @@ class DispatchMixin:
         injiziert (default no-op); der Rückgabewert wird als worker_pid
         gestempelt. Gibt {'reclaimed','promoted','spawned','spawn_failed'} zurück.
         """
-        result = {"reclaimed": 0, "promoted": 0, "spawned": 0, "spawn_failed": 0}
+        result = {"reclaimed": 0, "promoted": 0, "spawned": 0, "spawn_failed": 0,
+                  "spawned_ids": []}
         if not try_board_session_lock(self.conn, board):
             # Commit, damit der (lesende) Lock-Versuch keine Transaktion offen lässt.
             self.conn.commit()
@@ -743,6 +744,7 @@ class DispatchMixin:
                             "UPDATE tasks SET worker_pid=%s WHERE id=%s", (pid, tid),
                         )
                 result["spawned"] += 1
+                result["spawned_ids"].append(tid)
                 running_count += 1
             return result
         finally:

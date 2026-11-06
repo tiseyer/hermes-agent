@@ -19,3 +19,15 @@ class RunsMixin:
             (status, outcome, ended_at if ended_at is not None else now_epoch(), run_id),
         )
         self.conn.commit()
+
+    def latest_run_full(self, task_id):
+        """SELECT-*-dict des jüngsten Runs (für kanban_db.latest_run-Guard →
+        Run.from_row). Faithful: ORDER BY started_at DESC, id DESC."""
+        cur = self.conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=%s "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        )
+        cols = [d[0] for d in cur.description]
+        row = cur.fetchone()
+        return dict(zip(cols, row)) if row else None

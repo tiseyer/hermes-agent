@@ -113,6 +113,45 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
+                      spawn_fn=None):
+    """B1.1 PG-Dispatcher-Tick (D4). Rewired Call-Site für den Postgres-Modus:
+    der strukturelle DB-Kern läuft über ``PgBackend.dispatch_once`` (Session-
+    Advisory-Lock statt Datei-flock). Worker-*Spawn* und OS-Kill sind injizierte
+    Grenzen — Default ``spawn_fn`` ist der echte Gateway-Spawn
+    (``kanban_db._default_spawn``); Tests reichen einen Stub durch.
+
+    Adaptiert das dict-Ergebnis des PG-Ticks auf ``DispatchResult`` (die
+    Watcher-Telemetrie liest ``.spawned``/``.reclaimed``/``.promoted``).
+
+    GRENZE/Folgekarte: die Pre-Spawn-Workspace-/Worktree-Auflösung und die
+    ``max_in_progress``[``_per_profile``]-/stale-timeout-Policy des SQLite-
+    ``_dispatch_once_locked`` sind noch NICHT in den PG-Tick portiert (nur
+    ``max_spawn``). Inert bis Cutover (Default sqlite).
+    """
+    import kanban_backend as _kbk
+
+    if spawn_fn is None:
+        def spawn_fn(task_dict):
+            t = _kb.Task.from_row(task_dict)
+            ws = task_dict.get("workspace_path") or ""
+            return _kb._default_spawn(t, ws, board=slug)
+
+    d = _kbk.make_pg_backend(conn).dispatch_once(
+        spawn_fn=spawn_fn,
+        failure_limit=failure_limit,
+        board=slug,
+        max_spawn=max_spawn,
+    )
+    if d.get("locked_out"):
+        return _kb.DispatchResult(skipped_locked=True)
+    return _kb.DispatchResult(
+        reclaimed=d.get("reclaimed", 0),
+        promoted=d.get("promoted", 0),
+        spawned=[(tid, "", "") for tid in d.get("spawned_ids", [])],
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1028,6 +1067,15 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                if not isinstance(conn, sqlite3.Connection):
+                    # B1.1 PG-Tick (D4): strukturellen DB-Kern + Result-Adaption
+                    # kapselt der modulweite Helfer (testbar). Default-spawn_fn =
+                    # echter Gateway-Spawn.
+                    return _pg_dispatch_tick(
+                        _kb, conn, slug,
+                        max_spawn=max_spawn,
+                        failure_limit=failure_limit,
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,

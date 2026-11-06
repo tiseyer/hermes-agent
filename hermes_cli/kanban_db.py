@@ -815,7 +815,12 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
+
+    B1.1 PG-Modus: EIN Store. Postgres hält alle Karten in einem Schema
+    (kein Datei-pro-Board), also enumerieren wir genau den ``default``-Board.
     """
+    if _kanban_is_postgres():
+        return [read_board_metadata(DEFAULT_BOARD)]
     entries: list[dict] = []
     seen: set[str] = set()
 
@@ -1704,7 +1709,15 @@ def write_serialize_lock(db_path: Path, timeout: float = 10.0):
     Refuses outright (raises :class:`KanbanWriteHalted`) when the board's
     ``<db>.halt`` flag is present, so a canary-detected corruption stops every
     serialised writer from touching the file instead of re-quarantining it.
+
+    B1.1 PG-Modus: No-op. Postgres serialisiert Schreiber DB-seitig (MVCC /
+    Row-Locks / Session-Advisory im Dispatcher-Tick); es gibt keine
+    WAL-Datei und keine ``<db>.dispatch.lock``, gegen die zu flock wäre. Der
+    Canary-Halt-Pfad ist ebenfalls datei-gebunden und entfällt.
     """
+    if _kanban_is_postgres():
+        yield True
+        return
     if dispatch_halt_active(db_path):
         raise KanbanWriteHalted(
             f"kanban writes halted: {dispatch_halt_path(db_path).name} present "
@@ -1966,11 +1979,69 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+# ---------------------------------------------------------------------------
+# B1.1 Postgres-Routing (Welle 3). Default sqlite → komplett inert: solange
+# ``kanban.backend`` nicht auf ``postgres`` steht (Env höchste Priorität),
+# läuft jeder Pfad unverändert über SQLite. Erst beim Cutover (GO-pflichtig)
+# liefert ``connect()`` eine psycopg-Verbindung — dann greifen die in Welle 1/2
+# gesetzten conn-Typ-Guards in den Schreib-/Lesefunktionen automatisch.
+# ---------------------------------------------------------------------------
+_PG_CFG_UNSET = object()
+_PG_CFG_CACHE: Any = _PG_CFG_UNSET
+
+
+def _kanban_root_config() -> dict:
+    """INSTANCE-ROOT config.yaml, einmal pro Prozess gecacht (nur wenn die
+    Env ``HERMES_KANBAN_BACKEND`` NICHT gesetzt ist — dann entscheidet Env
+    allein und wir laden gar keine Config, bleiben also auf dem heißen
+    SQLite-Pfad kostenfrei)."""
+    global _PG_CFG_CACHE
+    if _PG_CFG_CACHE is _PG_CFG_UNSET:
+        try:
+            from hermes_cli.config import load_config
+            _PG_CFG_CACHE = load_config() or {}
+        except Exception:
+            _PG_CFG_CACHE = {}
+    return _PG_CFG_CACHE
+
+
+def _kanban_is_postgres() -> bool:
+    """True iff das Kanban-Board auf Postgres zeigt. Env-first (validiert,
+    fail-fast bei ungültigem Wert via resolve_backend_name), Config nur wenn
+    Env leer."""
+    import kanban_backend
+    if os.environ.get("HERMES_KANBAN_BACKEND", "").strip():
+        return kanban_backend.is_postgres(None)
+    return kanban_backend.is_postgres(_kanban_root_config())
+
+
+def _kanban_pg_dsn() -> str:
+    dsn = os.environ.get("HERMES_KANBAN_PG_DSN", "").strip()
+    if dsn:
+        return dsn
+    cfg = _kanban_root_config()
+    dsn = str((cfg.get("kanban") or {}).get("pg_dsn", "") or "").strip()
+    if not dsn:
+        raise RuntimeError(
+            "kanban.backend=postgres, aber keine DSN: setze Env "
+            "HERMES_KANBAN_PG_DSN oder config kanban.pg_dsn."
+        )
+    return dsn
+
+
+def _pg_connect():
+    """psycopg3-Verbindung (autocommit=False) im PG-Modus. Das Schema muss
+    existieren (Prod ``public`` erst nach Migration; Tests nutzen ein
+    Wegwerf-Schema via search_path in der DSN)."""
+    import psycopg
+    return psycopg.connect(_kanban_pg_dsn(), autocommit=False)
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
+):
     """Open (and initialize if needed) the kanban DB.
 
     WAL mode is enabled on every connection; it's a no-op after the first
@@ -1988,7 +2059,14 @@ def connect(
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
+
+    B1.1: Im PG-Modus (``kanban.backend=postgres``) wird EINE psycopg-
+    Verbindung geliefert (ein Store, kein Datei-pro-Board); ``db_path``/
+    ``board`` sind dann gegenstandslos. Alle in Welle 1/2 gesetzten
+    conn-Typ-Guards routen damit automatisch nach Postgres.
     """
+    if _kanban_is_postgres():
+        return _pg_connect()
     if db_path is not None:
         path = db_path
     else:
@@ -4183,6 +4261,10 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        row = kanban_backend.make_pg_backend(conn).get_task_full(task_id)
+        return Task.from_row(row) if row else None
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
@@ -4214,6 +4296,33 @@ def list_tasks(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
 ) -> list[Task]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        # Validierung + Order-Auflösung bleiben kanban_db-seitig (fail-fast
+        # identisch zum SQLite-Pfad); das Order-Fragment ist danach vertraut.
+        if status is not None and status not in VALID_STATUSES:
+            raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+        if order_by is not None:
+            ob = order_by.strip().lower()
+            if ob not in VALID_SORT_ORDERS:
+                raise ValueError(
+                    f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}"
+                )
+            order_fragment = VALID_SORT_ORDERS[ob]
+        else:
+            order_fragment = "priority DESC, created_at ASC"
+        rows = kanban_backend.make_pg_backend(conn).list_tasks_full(
+            assignee=_canonical_assignee(assignee) if assignee is not None else None,
+            status=status,
+            tenant=tenant,
+            session_id=session_id,
+            workflow_template_id=workflow_template_id,
+            current_step_key=current_step_key,
+            include_archived=include_archived,
+            limit=limit,
+            order_fragment=order_fragment,
+        )
+        return [Task.from_row(r) for r in rows]
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
@@ -4438,6 +4547,9 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).add_comment_full(task_id, author, body)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -4454,6 +4566,19 @@ def add_comment(
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_comments_full(task_id)
+        return [
+            Comment(
+                id=r["id"],
+                task_id=r["task_id"],
+                author=r["author"],
+                body=r["body"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
@@ -4697,6 +4822,26 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_events_full(task_id)
+        out = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append(
+                Event(
+                    id=r["id"],
+                    task_id=r["task_id"],
+                    kind=r["kind"],
+                    payload=payload,
+                    created_at=r["created_at"],
+                    run_id=(int(r["run_id"]) if r.get("run_id") is not None else None),
+                )
+            )
+        return out
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -12719,6 +12864,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+def active_work_child_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Anzahl nicht-archivierter ``work``-Kinder (parent_id ODER family_root_id)
+    außer der Karte selbst. Von den Worker-Tools (complete/block) genutzt, um
+    eine branch-lose Repo-Karte ohne Build-Kinder zu erkennen. Eigener
+    geguardeter Read, damit der Tool-Handler backend-agnostisch bleibt
+    (ersetzt vormals inline eingebettetes rohes SQL)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).active_work_child_count(task_id)
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE id != ? "
+        "AND child_role = 'work' AND status != 'archived' "
+        "AND (parent_id = ? OR family_root_id = ?)",
+        (task_id, task_id, task_id),
+    ).fetchone()[0])
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -12738,6 +12900,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "AND claim_lock IS NULL"
     ).fetchall()
+    if not isinstance(conn, sqlite3.Connection):  # B1.1: psycopg liefert Tupel
+        rows = [{"id": r[0], "assignee": r[1]} for r in rows]
     candidates = [
         row for row in rows
         if get_spawn_rejection_reason(conn, row["id"]) is None
@@ -12778,6 +12942,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    if not isinstance(conn, sqlite3.Connection):  # B1.1: psycopg liefert Tupel
+        rows = [{"assignee": r[0]} for r in rows]
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
@@ -15560,6 +15726,10 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        row = kanban_backend.make_pg_backend(conn).latest_run_full(task_id)
+        return Run.from_row(row) if row else None
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? "
         "ORDER BY started_at DESC, id DESC LIMIT 1",

@@ -56,3 +56,78 @@ class ReadsMixin:
     def stats_by_status(self):
         cur = self.conn.execute("SELECT status, count(*) FROM tasks GROUP BY status")
         return dict(cur.fetchall())
+
+    def active_work_child_count(self, task_id):
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != %s "
+            "AND child_role = 'work' AND status != 'archived' "
+            "AND (parent_id = %s OR family_root_id = %s)",
+            (task_id, task_id, task_id),
+        )
+        return int(cur.fetchone()[0])
+
+    # ------------------------------------------------------------------
+    # Full-row reads (Welle 3): liefern SELECT-*-dicts, damit die
+    # kanban_db-Read-Guards sie 1:1 in Task/Comment/Event wrappen können
+    # (Rückgabe-Typ-Parität zum SQLite-Pfad — Consumer bleiben unverändert).
+    # Die schlanken Projektionen oben bleiben für Bridge/Direktnutzung.
+    # ------------------------------------------------------------------
+    def get_task_full(self, task_id):
+        cur = self.conn.execute("SELECT * FROM tasks WHERE id=%s", (task_id,))
+        rows = _dicts(cur)
+        return rows[0] if rows else None
+
+    def list_tasks_full(
+        self,
+        *,
+        assignee=None,
+        status=None,
+        tenant=None,
+        session_id=None,
+        workflow_template_id=None,
+        current_step_key=None,
+        include_archived=False,
+        limit=None,
+        order_fragment="priority DESC, created_at ASC",
+    ):
+        """Faithful-Spiegel von kanban_db.list_tasks (Filter + Order).
+
+        ``order_fragment`` ist bereits vom Guard gegen VALID_SORT_ORDERS
+        validiert (kein User-Input) und wird unverändert nach ORDER BY
+        gesetzt; die Spaltennamen gelten in beiden Backends.
+        """
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        if assignee is not None:
+            query += " AND assignee = %s"; params.append(assignee)
+        if status is not None:
+            query += " AND status = %s"; params.append(status)
+        if tenant is not None:
+            query += " AND tenant = %s"; params.append(tenant)
+        if session_id is not None:
+            query += " AND session_id = %s"; params.append(session_id)
+        if workflow_template_id is not None:
+            query += " AND workflow_template_id = %s"; params.append(workflow_template_id)
+        if current_step_key is not None:
+            query += " AND current_step_key = %s"; params.append(current_step_key)
+        if not include_archived and status != "archived":
+            query += " AND status != 'archived'"
+        query += f" ORDER BY {order_fragment}"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        cur = self.conn.execute(query, params)
+        return _dicts(cur)
+
+    def list_comments_full(self, task_id):
+        cur = self.conn.execute(
+            "SELECT * FROM task_comments WHERE task_id=%s ORDER BY created_at ASC",
+            (task_id,),
+        )
+        return _dicts(cur)
+
+    def list_events_full(self, task_id):
+        cur = self.conn.execute(
+            "SELECT * FROM task_events WHERE task_id=%s ORDER BY created_at ASC, id ASC",
+            (task_id,),
+        )
+        return _dicts(cur)
