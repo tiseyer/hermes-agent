@@ -30,6 +30,25 @@ def try_board_lock(conn, board: str) -> bool:
     return bool(cur.fetchone()[0])
 
 
+def try_board_session_lock(conn, board: str) -> bool:
+    """Session-gebundenes Try-Lock (NICHT txn-gebunden).
+
+    Ersatz für den Dispatcher-Tick-Datei-flock (``<db>.dispatch.lock``): der
+    Tick committet intern pro Teiloperation (reclaim/recompute/claim), ein
+    txn-gebundener Lock würde beim ersten Commit fallen. Ein Session-Lock hält
+    über diese Commits hinweg, bis :func:`release_board_session_lock`. MUSS
+    explizit freigegeben werden (anders als try_board_lock). True = erhalten.
+    """
+    cur = conn.execute("SELECT pg_try_advisory_lock(%s)", (board_lock_key(board),))
+    return bool(cur.fetchone()[0])
+
+
+def release_board_session_lock(conn, board: str) -> bool:
+    """Gibt den Session-Advisory-Lock frei. True wenn er gehalten wurde."""
+    cur = conn.execute("SELECT pg_advisory_unlock(%s)", (board_lock_key(board),))
+    return bool(cur.fetchone()[0])
+
+
 def claim_one_ready(conn, assignee: str, claim_lock: str, now_epoch: int,
                     worker_pid: int | None = None, ttl_seconds: int = 600) -> str | None:
     """Claimt EINE ready-Karte des Assignees atomar. Gibt die id oder None.

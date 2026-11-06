@@ -4935,6 +4935,14 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
     """
+    # B1.1 Postgres-Routing (inert bei backend=sqlite): ein psycopg-``conn``
+    # (nur von den migrierten Call-Sites nach Cutover übergeben) wird an das
+    # faithful PG-Äquivalent delegiert; ein sqlite3.Connection kann NIE nach PG
+    # routen (fail-closed). Siehe HANDOFF-PORT.md D4.
+    if not isinstance(conn, sqlite3.Connection):
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).recompute_ready(
+            failure_limit=failure_limit)
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
@@ -5067,6 +5075,9 @@ def get_spawn_rejection_reason(
     call sites disagree: family roots never run and unfinished parents gate a
     child even if a racy writer marked it ready.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).get_spawn_rejection_reason(task_id)
     row = conn.execute(
         "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -5113,6 +5124,12 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        # PG-Pfad liefert einen Row-dict (Reads sind dict-basiert) statt Task —
+        # die Konsumenten-Wellen (watchers/dashboard) greifen per Key zu. D4.
+        return kanban_backend.make_pg_backend(conn).claim_task(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5246,6 +5263,10 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).claim_review_task(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5319,6 +5340,10 @@ def heartbeat_claim(
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).heartbeat_claim(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
@@ -5368,6 +5393,10 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).release_stale_claims(
+            signal_fn=signal_fn)
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5502,6 +5531,10 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).reclaim_task(
+            task_id, reason=reason, signal_fn=signal_fn)
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -10151,6 +10184,10 @@ def heartbeat_worker(
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).heartbeat_worker(
+            task_id, note=note, expected_run_id=expected_run_id)
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:

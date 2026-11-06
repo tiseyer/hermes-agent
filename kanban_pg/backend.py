@@ -12,6 +12,7 @@ from ._base import now_epoch  # noqa: F401 (re-export)
 from .lock_model import claim_one_ready, try_board_lock  # noqa: F401 (re-export)
 from .ops_tasks import TasksMixin
 from .ops_claims import ClaimsMixin
+from .ops_dispatch import DispatchMixin
 from .ops_comments import CommentsEventsMixin
 from .ops_runs import RunsMixin
 from .ops_links import LinksMixin
@@ -22,6 +23,7 @@ from .ops_reads import ReadsMixin
 class PgBackend(
     TasksMixin,
     ClaimsMixin,
+    DispatchMixin,
     CommentsEventsMixin,
     RunsMixin,
     LinksMixin,
