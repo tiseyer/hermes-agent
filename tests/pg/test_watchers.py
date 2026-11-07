@@ -106,6 +106,75 @@ def main():
         os.environ.pop("HERMES_KANBAN_DB", None)
         e.teardown()
 
+    # ---- W4-B PG-Tick-Policy: max_in_progress / per_profile / stale-timeout ----
+    e2 = PgEnv("watch2")
+    os.environ["HERMES_KANBAN_DB"] = os.path.join(tempfile.mkdtemp(prefix="w3watch2-"), "kanban.db")
+    try:
+        e2.apply_schema(triggers=True)
+        e2.activate_routing()
+        from hermes_cli import kanban_db as kb  # noqa: F811
+        from gateway.kanban_watchers import _pg_dispatch_tick  # noqa: F811
+        sb = PgBackend(e2.connect(autocommit=False))
+        conn2 = kb.connect()
+
+        def _count_running():
+            with e2.connect(autocommit=True) as c:
+                return c.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
+
+        def noop_spawn(task_dict):
+            return 123
+
+        try:
+            print("[W4-B max_in_progress: globaler Deckel]")
+            for i in range(3):
+                sb.create_task(f"mi{i}", f"mi{i}", status="ready", assignee="worker", created_at=600 + i)
+            r = _pg_dispatch_tick(kb, conn2, "default", max_in_progress=1, spawn_fn=noop_spawn)
+            check("max_in_progress=1 -> genau 1 gespawnt", len(r.spawned) == 1 and _count_running() == 1,
+                  f"spawned={len(r.spawned)} running={_count_running()}")
+
+            print("[W4-B max_in_progress_per_profile: pro assignee]")
+            e3 = PgEnv("watch3")
+            try:
+                e3.apply_schema(triggers=True)
+                os.environ["HERMES_KANBAN_PG_DSN"] = e3.uri  # Routing auf e3 umhängen
+                sb3 = PgBackend(e3.connect(autocommit=False))
+                conn3 = kb.connect()
+                sb3.create_task("pa", "pa", status="ready", assignee="alpha", created_at=610)
+                sb3.create_task("pb", "pb", status="ready", assignee="alpha", created_at=611)
+                sb3.create_task("pc", "pc", status="ready", assignee="beta", created_at=612)
+                r3 = _pg_dispatch_tick(kb, conn3, "default",
+                                       max_in_progress_per_profile=1, spawn_fn=noop_spawn)
+                spawned_ids = {t[0] for t in r3.spawned}
+                check("per_profile=1: alpha nur 1x, beta 1x (2 gesamt)",
+                      len(spawned_ids) == 2 and ("pc" in spawned_ids)
+                      and len(spawned_ids & {"pa", "pb"}) == 1,
+                      f"spawned={spawned_ids}")
+                conn3.close()
+            finally:
+                os.environ["HERMES_KANBAN_PG_DSN"] = e2.uri  # zurück auf e2
+                e3.teardown()
+
+            print("[W4-B stale-timeout: Heartbeat-Stale -> reclaim]")
+            sb.create_task("st1", "st1", status="ready", assignee="worker", created_at=620)
+            sb.claim_task("st1", claimer="hermes:x")
+            with e2.connect(autocommit=True) as c:
+                c.execute("UPDATE tasks SET last_heartbeat_at=%s WHERE id='st1'", (1,))  # uralt
+            r4 = _pg_dispatch_tick(kb, conn2, "default", stale_timeout_seconds=60, spawn_fn=noop_spawn)
+            with e2.connect(autocommit=True) as c:
+                st1_status = c.execute("SELECT status FROM tasks WHERE id='st1'").fetchone()[0]
+            check("stale-timeout reclaimt st1 (running -> ready/respawnt)",
+                  r4.reclaimed >= 1, f"reclaimed={r4.reclaimed}")
+            check("reclaimed-Event (heartbeat_stale) auf st1",
+                  "reclaimed" in [x[0] for x in e2.connect(autocommit=True).execute(
+                      "SELECT kind FROM task_events WHERE task_id='st1' ORDER BY id").fetchall()])
+            _ = st1_status
+        finally:
+            conn2.close()
+            sb.conn.close()
+    finally:
+        os.environ.pop("HERMES_KANBAN_DB", None)
+        e2.teardown()
+
     print(f"\nTESTS watchers: {'ALLE GRÜN' if not check.fails else f'{len(check.fails)} ROT: {check.fails}'}")
     return 0 if not check.fails else 2
 

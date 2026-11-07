@@ -114,7 +114,8 @@ def _release_singleton_lock(handle) -> None:
 
 
 def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
-                      spawn_fn=None):
+                      spawn_fn=None, max_in_progress=None,
+                      max_in_progress_per_profile=None, stale_timeout_seconds=0):
     """B1.1 PG-Dispatcher-Tick (D4). Rewired Call-Site für den Postgres-Modus:
     der strukturelle DB-Kern läuft über ``PgBackend.dispatch_once`` (Session-
     Advisory-Lock statt Datei-flock). Worker-*Spawn* und OS-Kill sind injizierte
@@ -142,6 +143,9 @@ def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
         failure_limit=failure_limit,
         board=slug,
         max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        stale_timeout_seconds=stale_timeout_seconds,
     )
     if d.get("locked_out"):
         return _kb.DispatchResult(skipped_locked=True)
@@ -1075,6 +1079,9 @@ class GatewayKanbanWatchersMixin:
                         _kb, conn, slug,
                         max_spawn=max_spawn,
                         failure_limit=failure_limit,
+                        max_in_progress=max_in_progress,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        stale_timeout_seconds=stale_timeout_seconds,
                     )
                 return _kb.dispatch_once(
                     conn,

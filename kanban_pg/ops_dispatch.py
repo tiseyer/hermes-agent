@@ -682,19 +682,62 @@ class DispatchMixin:
         return blocked
 
     # ----- Tick (DB-Kern): advisory-lock -> reclaim -> promote -> claim ---
+    def reclaim_heartbeat_stale(self, stale_timeout_seconds):
+        """DB-Kern des Heartbeat-Stale-Backstops (#29747/#31752): ein running-Task,
+        dessen ``last_heartbeat_at`` älter als ``stale_timeout_seconds`` ist, macht
+        keinen beobachtbaren Fortschritt → zurück auf ready (reclaimed-Event).
+        GRENZE: die started_at-elapsed-Obergrenze + Rate-Limit-/Auto-Block-Policy
+        von detect_crashed_workers/enforce_max_runtime bleiben injizierte D4-Detektoren.
+        Gibt die Zahl der reclaimten Tasks zurück."""
+        if not stale_timeout_seconds or stale_timeout_seconds <= 0:
+            return 0
+        cutoff = now_epoch() - int(stale_timeout_seconds)
+        reclaimed = 0
+        rows = self.conn.execute(
+            "SELECT id FROM tasks WHERE status='running' "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at < %s",
+            (cutoff,),
+        ).fetchall()
+        for (tid,) in rows:
+            with self._txn():
+                cur = self.conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL WHERE id=%s AND status='running'",
+                    (tid,),
+                )
+                if cur.rowcount != 1:
+                    continue
+                run_id = self._end_run(tid, outcome="reclaimed", status="reclaimed",
+                                       error="heartbeat_stale")
+                self._append_event(
+                    tid, "reclaimed",
+                    {"reason": "heartbeat_stale",
+                     "stale_timeout_seconds": int(stale_timeout_seconds)},
+                    run_id=run_id,
+                )
+                reclaimed += 1
+        return reclaimed
+
     def dispatch_once(self, *, spawn_fn=None, ttl_seconds=None,
                       failure_limit=DEFAULT_FAILURE_LIMIT, board="default",
-                      max_spawn=None, pid_alive_fn=None):
+                      max_spawn=None, pid_alive_fn=None, max_in_progress=None,
+                      max_in_progress_per_profile=None, stale_timeout_seconds=0):
         """EIN Dispatcher-Tick (DB-Kern). Session-Advisory-Lock statt Datei-flock.
 
         GRENZE (D4): Crash-/Timeout-Detektoren (detect_crashed_workers /
         enforce_max_runtime / reap_worker_zombies) und der Worker-*Spawn* sind
         OS-seitige Grenzen. ``spawn_fn(task_dict) -> Optional[int]`` wird
-        injiziert (default no-op); der Rückgabewert wird als worker_pid
-        gestempelt. Gibt {'reclaimed','promoted','spawned','spawn_failed'} zurück.
+        injiziert (default no-op); der Rückgabewert wird als worker_pid gestempelt.
+
+        Concurrency-Caps (Welle 4, DB-Kern): ``max_spawn`` + ``max_in_progress``
+        sind beides Deckel auf die laufenden Nicht-Root-Tasks (wirksam = min);
+        ``max_in_progress_per_profile`` begrenzt zusätzlich pro assignee.
+        ``stale_timeout_seconds>0`` fährt vor dem Spawn den Heartbeat-Stale-Reclaim.
+        Gibt {'reclaimed','promoted','spawned','spawn_failed','spawned_ids',
+        'skipped_per_profile_capped'} zurück.
         """
         result = {"reclaimed": 0, "promoted": 0, "spawned": 0, "spawn_failed": 0,
-                  "spawned_ids": []}
+                  "spawned_ids": [], "skipped_per_profile_capped": []}
         if not try_board_session_lock(self.conn, board):
             # Commit, damit der (lesende) Lock-Versuch keine Transaktion offen lässt.
             self.conn.commit()
@@ -702,24 +745,47 @@ class DispatchMixin:
             return result
         try:
             result["reclaimed"] = self.release_stale_claims(pid_alive_fn=pid_alive_fn)
+            result["reclaimed"] += self.reclaim_heartbeat_stale(stale_timeout_seconds)
             result["promoted"] = self.recompute_ready(failure_limit=failure_limit)
+
+            # Wirksamer globaler Deckel = min(max_spawn, max_in_progress) über die
+            # laufenden Nicht-Root-Tasks (running_count wächst pro Spawn mit).
+            _caps = [c for c in (max_spawn, max_in_progress) if c is not None]
+            cap = min(_caps) if _caps else None
             running_count = 0
-            if max_spawn is not None:
+            if cap is not None:
                 running_count = int(self.conn.execute(
                     "SELECT COUNT(*) FROM tasks WHERE status='running' "
                     "AND (family_root_id IS NULL OR id <> family_root_id)"
                 ).fetchone()[0])
+
+            per_cap = max_in_progress_per_profile if (
+                isinstance(max_in_progress_per_profile, int)
+                and max_in_progress_per_profile > 0) else None
+            per_running = {}
+            if per_cap is not None:
+                for a, n in self.conn.execute(
+                    "SELECT assignee, COUNT(*) FROM tasks WHERE status='running' "
+                    "AND assignee IS NOT NULL "
+                    "AND (family_root_id IS NULL OR id <> family_root_id) "
+                    "GROUP BY assignee"
+                ).fetchall():
+                    per_running[a] = int(n)
             self.conn.commit()
+
             ready_rows = self.conn.execute(
-                "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL "
+                "SELECT id, assignee FROM tasks WHERE status='ready' AND claim_lock IS NULL "
                 "AND assignee IS NOT NULL "
                 "AND (family_root_id IS NULL OR id <> family_root_id) "
                 "ORDER BY priority DESC, created_at ASC"
             ).fetchall()
             self.conn.commit()
-            for (tid,) in ready_rows:
-                if max_spawn is not None and running_count >= max_spawn:
+            for tid, row_assignee in ready_rows:
+                if cap is not None and running_count >= cap:
                     break
+                if per_cap is not None and per_running.get(row_assignee, 0) >= per_cap:
+                    result["skipped_per_profile_capped"].append(tid)
+                    continue
                 task = self.claim_task(tid, ttl_seconds=ttl_seconds)
                 if task is None:
                     continue
@@ -746,6 +812,8 @@ class DispatchMixin:
                 result["spawned"] += 1
                 result["spawned_ids"].append(tid)
                 running_count += 1
+                if per_cap is not None:
+                    per_running[row_assignee] = per_running.get(row_assignee, 0) + 1
             return result
         finally:
             release_board_session_lock(self.conn, board)
