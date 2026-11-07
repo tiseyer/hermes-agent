@@ -3056,11 +3056,9 @@ def _handle_handoff(args: dict, **kw) -> str:
                     f"completes the card."
                 )
             if ws_kind is None and to_profile and to_profile.endswith("-coder"):
-                row = conn.execute(
-                    "SELECT tenant, repository FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                tenant = (row[0] if row else None) or ""
-                repo = (row[1] if row and len(row) > 1 else None) or ""
+                _t = kb.get_task(conn, tid)  # geguardet → sqlite|PG (B1.1)
+                tenant = (_t.tenant if _t else None) or ""
+                repo = (_t.repository if _t else None) or ""
                 # A declared repository beats the tenant default for the
                 # checkout: its repo-specific workdir has the remote the
                 # profile's base_ref/push_target name; the tenant checkout may
