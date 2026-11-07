@@ -4760,6 +4760,18 @@ def add_attachment(
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_attachments_full(task_id)
+        return [
+            Attachment(
+                id=r["id"], task_id=r["task_id"], filename=r["filename"],
+                stored_path=r["stored_path"], content_type=r["content_type"],
+                size=r["size"] or 0, uploaded_by=r["uploaded_by"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
     rows = conn.execute(
         "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -4780,6 +4792,17 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
 
 
 def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        r = kanban_backend.make_pg_backend(conn).get_attachment_full(attachment_id)
+        if r is None:
+            return None
+        return Attachment(
+            id=r["id"], task_id=r["task_id"], filename=r["filename"],
+            stored_path=r["stored_path"], content_type=r["content_type"],
+            size=r["size"] or 0, uploaded_by=r["uploaded_by"],
+            created_at=r["created_at"],
+        )
     r = conn.execute(
         "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
     ).fetchone()
@@ -12490,11 +12513,17 @@ def resolve_task_repository_profile(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[RepositoryProfile]:
     """Resolve a card's repo profile, inheriting its parent/root declaration."""
-    row = conn.execute(
-        "SELECT title, body, tenant, repository, parent_id, initiative_id "
-        "FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
+    _pg = not isinstance(conn, sqlite3.Connection)  # B1.1 PG-Routing (inert @ sqlite)
+    if _pg:
+        import kanban_backend
+        _be = kanban_backend.make_pg_backend(conn)
+        row = _be.get_task_full(task_id)
+    else:
+        row = conn.execute(
+            "SELECT title, body, tenant, repository, parent_id, initiative_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
     if not row:
         return None
     profile = _repository_profile_from_name(row["repository"])
@@ -12505,9 +12534,12 @@ def resolve_task_repository_profile(
     for rel in (row["parent_id"], row["initiative_id"]):
         if rel and rel not in seen_rel and rel != task_id:
             seen_rel.add(rel)
-            parent = conn.execute(
-                "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
-            ).fetchone()
+            parent = (
+                _be.get_task_full(rel) if _pg
+                else conn.execute(
+                    "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
+                ).fetchone()
+            )
             if parent:
                 profile = _repository_profile_from_name(parent["repository"])
                 if profile is not None:
@@ -15039,11 +15071,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-        (task_id,),
-    ).fetchall()
-    parent_ids = [r["parent_id"] for r in parent_rows]
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        parent_ids = kanban_backend.make_pg_backend(conn).parent_ids(task_id)
+    else:
+        parent_rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+        parent_ids = [r["parent_id"] for r in parent_rows]
 
     if parent_ids:
         wrote_header = False
@@ -15100,14 +15136,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
-        role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
-            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-            "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
-        ).fetchall()
+        if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+            import kanban_backend
+            role_rows = kanban_backend.make_pg_backend(conn).role_history(
+                task.assignee, task_id, limit=5)
+        else:
+            role_rows = conn.execute(
+                "SELECT t.id, t.title, r.summary, r.ended_at "
+                "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+                "WHERE r.profile = ? AND r.task_id != ? "
+                "  AND r.outcome = 'completed' "
+                "ORDER BY r.ended_at DESC LIMIT 5",
+                (task.assignee, task_id),
+            ).fetchall()
         if role_rows:
             lines.append(f"## Recent work by @{task.assignee}")
             for row in role_rows:
@@ -15705,6 +15746,12 @@ def list_runs(
     if state_type is not None:
         if state_type not in ("status", "outcome"):
             raise ValueError("state_type must be 'status' or 'outcome'")
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_runs_full(
+            task_id, include_active=include_active,
+            state_type=state_type, state_name=state_name)
+        return [Run.from_row(r) for r in rows]
     q = "SELECT * FROM task_runs WHERE task_id = ?"
     params: list[Any] = [task_id]
     if not include_active:
@@ -15751,6 +15798,9 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     Picks the most recent run by ``ended_at`` (falling back to ``id``
     for ties or unfinished rows). Returns None if no run has a summary.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).latest_summary(task_id)
     row = conn.execute(
         "SELECT summary FROM task_runs "
         "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
@@ -15777,6 +15827,9 @@ def latest_summaries(
     ids = list(task_ids)
     if not ids:
         return {}
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).latest_summaries(ids)
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"""
@@ -15813,6 +15866,9 @@ def go_gated_task_ids(conn: sqlite3.Connection) -> set[str]:
     ``_dispatch_once_locked``). A card stops counting as GO-gated as
     soon as it completes or a human re-assigns it.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).go_gated_task_ids()
     rows = conn.execute(
         "SELECT DISTINCT e.task_id FROM task_events e "
         "JOIN tasks t ON t.id = e.task_id "
@@ -15829,6 +15885,10 @@ def initiative_members(conn: sqlite3.Connection, initiative_id: str) -> list[Tas
     by ``task_links``. Dependency edges between members therefore cannot
     change what belongs to an initiative.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).initiative_members_full(initiative_id)
+        return [Task.from_row(r) for r in rows]
     rows = conn.execute(
         "SELECT * FROM tasks WHERE initiative_id = ? AND id != ? "
         "ORDER BY created_at ASC, id ASC",
@@ -15867,20 +15927,24 @@ def initiative_rollups(
     deliberately never consulted — dependencies must not influence the
     focus view.
     """
-    where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
-    params: list = []
-    if tenant:
-        # Filter over the ROOT card's tenant: the initiative belongs to its
-        # root, and legacy member rows may predate tenant inheritance.
-        where += (
-            " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
-        )
-        params.append(tenant)
-    rows = conn.execute(
-        f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
-        "ORDER BY created_at ASC, id ASC",
-        params,
-    ).fetchall()
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).initiative_rollup_rows(tenant)
+    else:
+        where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
+        params: list = []
+        if tenant:
+            # Filter over the ROOT card's tenant: the initiative belongs to its
+            # root, and legacy member rows may predate tenant inheritance.
+            where += (
+                " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
+            )
+            params.append(tenant)
+        rows = conn.execute(
+            f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
+            "ORDER BY created_at ASC, id ASC",
+            params,
+        ).fetchall()
     go_ids = go_gated_task_ids(conn)
 
     rollups: dict[str, dict] = {}

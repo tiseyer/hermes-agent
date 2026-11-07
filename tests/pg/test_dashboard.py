@@ -98,6 +98,60 @@ def main():
             total = _scalar(e, "SELECT count(*) FROM tasks")
             check("stats summieren == Gesamtzahl", sum(st.values()) == total, f"{st} vs {total}")
 
+            print("[W4-A Rich-Reads: runs/summaries/attachments/initiative/go-gate/worker-context]")
+            # Runs mit Summaries für t1 (zwei Attempts).
+            with e.connect(autocommit=False) as w, w.cursor() as cur:
+                cur.execute("INSERT INTO task_runs (task_id,profile,status,started_at,"
+                            "ended_at,outcome,summary) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            ("t1", "reviewer", "reclaimed", 500, 510, "reclaimed", "erster Versuch"))
+                cur.execute("INSERT INTO task_runs (task_id,profile,status,started_at,"
+                            "ended_at,outcome,summary) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            ("t1", "reviewer", "done", 520, 530, "completed", "zweiter Versuch"))
+                cur.execute("INSERT INTO task_attachments (task_id,filename,stored_path,"
+                            "content_type,size,uploaded_by,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            ("t1", "log.txt", "/tmp/log.txt", "text/plain", 42, "dash", 540))
+                w.commit()
+            check("latest_summary = jüngster", kb.latest_summary(conn, "t1") == "zweiter Versuch")
+            sums = kb.latest_summaries(conn, ["t1", "t2"])
+            check("latest_summaries enthält t1", sums.get("t1") == "zweiter Versuch")
+            runs = kb.list_runs(conn, "t1")
+            check("list_runs -> 2 Run-Objekte in Startreihenfolge",
+                  len(runs) == 2 and all(isinstance(r, kb.Run) for r in runs)
+                  and runs[0].started_at <= runs[1].started_at)
+            closed = kb.list_runs(conn, "t1", include_active=False)
+            check("list_runs(include_active=False) -> nur beendete", len(closed) == 2)
+            atts = kb.list_attachments(conn, "t1")
+            check("list_attachments -> 1 Attachment", len(atts) == 1 and atts[0].filename == "log.txt")
+            check("get_attachment per id", kb.get_attachment(conn, atts[0].id).filename == "log.txt")
+
+            # GO-Gate: Karte an 'till' + go_gate_held-Event.
+            seed.create_task("gg", "GO-Karte", status="blocked", assignee="till", created_at=541)
+            with seed._txn():
+                seed._append_event("gg", "go_gate_held", {})
+            check("go_gated_task_ids enthält gg", "gg" in kb.go_gated_task_ids(conn))
+
+            # Initiative + Mitglieder.
+            seed.create_task("ini", "Initiative-Root", status="running", created_at=542)
+            for mid, st in [("m1", "done"), ("m2", "running"), ("m3", "todo")]:
+                seed.create_task(mid, f"Mitglied {mid}", status=st, created_at=543)
+                seed.conn.execute("UPDATE tasks SET initiative_id=%s WHERE id=%s", ("ini", mid))
+            seed.conn.execute("UPDATE tasks SET initiative_id=%s WHERE id=%s", ("ini", "ini"))
+            seed.conn.commit()
+            members = kb.initiative_members(conn, "ini")
+            check("initiative_members -> 3 (ohne Root)",
+                  len(members) == 3 and all(isinstance(m, kb.Task) for m in members)
+                  and "ini" not in {m.id for m in members})
+            roll = kb.initiative_rollups(conn)
+            check("initiative_rollups aggregiert ini (total/done/running)",
+                  "ini" in roll and roll["ini"]["total"] == 3
+                  and roll["ini"]["done"] == 1 and roll["ini"]["running"] == 1,
+                  f"got {roll.get('ini')}")
+
+            # build_worker_context komponiert aus den geguardeten Reads.
+            ctx = kb.build_worker_context(conn, "t1")
+            check("build_worker_context -> String mit Titel + Summary",
+                  isinstance(ctx, str) and "Erste Karte" in ctx and "zweiter Versuch" in ctx)
+
             print("[MVCC: Reader blockiert nicht an offenem Writer]")
             writer = e.connect(autocommit=False)
             try:
