@@ -18,6 +18,7 @@ from .ops_runs import RunsMixin
 from .ops_links import LinksMixin
 from .ops_notify import NotifyMixin
 from .ops_reads import ReadsMixin
+from .ops_dashboard import DashboardMixin
 
 
 class PgBackend(
@@ -29,6 +30,7 @@ class PgBackend(
     LinksMixin,
     NotifyMixin,
     ReadsMixin,
+    DashboardMixin,
 ):
     """Schmales Schreib-/Lese-Backend über eine psycopg3-Verbindung (autocommit=False)."""
 

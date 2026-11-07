@@ -185,6 +185,17 @@ def _write_locked(board: Optional[str] = None):
             conn.close()
 
 
+def _pg(conn) -> bool:
+    """True iff ``conn`` ist eine psycopg-(PG-)Verbindung (B1.1). Im PG-Modus
+    routen die dashboard-internen Roh-Queries über kanban_pg.DashboardMixin."""
+    return not isinstance(conn, sqlite3.Connection)
+
+
+def _pgbe(conn):
+    import kanban_backend
+    return kanban_backend.make_pg_backend(conn)
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -336,15 +347,21 @@ def _compute_task_diagnostics(
     if task_ids is not None:
         if not task_ids:
             return {}
-        placeholders = ",".join(["?"] * len(task_ids))
-        rows = conn.execute(
-            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
-            tuple(task_ids),
-        ).fetchall()
+        if _pg(conn):
+            rows = _pgbe(conn).tasks_by_ids(task_ids)
+        else:
+            placeholders = ",".join(["?"] * len(task_ids))
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+                tuple(task_ids),
+            ).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
-        ).fetchall()
+        if _pg(conn):
+            rows = _pgbe(conn).tasks_unarchived()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status != 'archived'",
+            ).fetchall()
 
     if not rows:
         return {}
@@ -354,18 +371,25 @@ def _compute_task_diagnostics(
     # (hundreds of tasks), but we can add pagination / filtering later
     # if profiling shows it's a hotspot.
     row_ids = [r["id"] for r in rows]
-    placeholders = ",".join(["?"] * len(row_ids))
+    if _pg(conn):
+        be = _pgbe(conn)
+        ev_rows = be.events_by_task_ids(row_ids)
+        run_rows = be.runs_by_task_ids(row_ids)
+    else:
+        placeholders = ",".join(["?"] * len(row_ids))
+        ev_rows = conn.execute(
+            f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(row_ids),
+        ).fetchall()
+        run_rows = conn.execute(
+            f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(row_ids),
+        ).fetchall()
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for ev_row in conn.execute(
-        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
+    for ev_row in ev_rows:
         events_by_task.setdefault(ev_row["task_id"], []).append(ev_row)
     runs_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for run_row in conn.execute(
-        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
+    for run_row in run_rows:
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
     out: dict[str, list[dict]] = {}
@@ -423,6 +447,9 @@ def _warnings_summary_from_diagnostics(
 
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
+    if _pg(conn):
+        be = _pgbe(conn)
+        return {"parents": be.parent_ids(task_id), "children": be.child_ids(task_id)}
     parents = [
         r["parent_id"]
         for r in conn.execute(
@@ -528,10 +555,25 @@ def get_board(
                 "rollup": rollups.get(initiative),
             }
         # Pre-fetch link counts per task (cheap: one query).
+        if _pg(conn):
+            _be_board = _pgbe(conn)
+            _link_rows = [{"parent_id": p, "child_id": c} for p, c in _be_board.all_links()]
+            comment_counts: dict[str, int] = _be_board.comment_counts()
+            _prog_rows = [{"pid": pid, "cstatus": cs}
+                          for pid, cs in _be_board.child_status_by_parent()]
+        else:
+            _link_rows = conn.execute(
+                "SELECT parent_id, child_id FROM task_links").fetchall()
+            comment_counts = {
+                r["task_id"]: r["n"]
+                for r in conn.execute(
+                    "SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id")
+            }
+            _prog_rows = conn.execute(
+                "SELECT l.parent_id AS pid, t.status AS cstatus "
+                "FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall()
         link_counts: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
-        ).fetchall():
+        for row in _link_rows:
             link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
                 "children"
             ] += 1
@@ -539,22 +581,9 @@ def get_board(
                 "parents"
             ] += 1
 
-        # Comment + event counts (both cheap aggregates).
-        comment_counts: dict[str, int] = {
-            r["task_id"]: r["n"]
-            for r in conn.execute(
-                "SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id"
-            )
-        }
-
         # Progress rollup: for each parent, how many children are done / total.
-        # One pass over task_links joined with child status — cheaper than
-        # N per-task queries and the plugin uses it to render "N/M".
         progress: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT l.parent_id AS pid, t.status AS cstatus "
-            "FROM task_links l JOIN tasks t ON t.id = l.child_id"
-        ).fetchall():
+        for row in _prog_rows:
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
             if row["cstatus"] == "done":
@@ -566,9 +595,11 @@ def get_board(
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
 
-        latest_event_id = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-        ).fetchone()["m"]
+        latest_event_id = (
+            _pgbe(conn).max_event_id() if _pg(conn)
+            else conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+        )
 
         family_children: dict[str, list[kanban_db.Task]] = defaultdict(list)
         if family_view:
@@ -632,21 +663,25 @@ def get_board(
         # Stable per-column ordering already applied by list_tasks
         # (priority DESC, created_at ASC), keep as-is.
 
-        # List of known tenants for the UI filter dropdown.
-        tenants = [
-            r["tenant"]
-            for r in conn.execute(
-                "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
-            )
-        ]
-        # List of distinct assignees for the lane-by-profile sub-grouping.
-        assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
-        ]
+        # List of known tenants + distinct assignees for the UI dropdowns.
+        if _pg(conn):
+            _be_ta = _pgbe(conn)
+            tenants = _be_ta.distinct_tenants()
+            assignees = _be_ta.distinct_assignees_unarchived()
+        else:
+            tenants = [
+                r["tenant"]
+                for r in conn.execute(
+                    "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
+                )
+            ]
+            assignees = [
+                r["assignee"]
+                for r in conn.execute(
+                    "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
+                    "AND status != 'archived' ORDER BY assignee"
+                )
+            ]
 
         return {
             "columns": [
@@ -734,13 +769,16 @@ def get_task(
             root_task = task if flow_root_id == task.id else kanban_db.get_task(conn, flow_root_id)
             go_ids = kanban_db.go_gated_task_ids(conn)
             member_ids = [m.id for m in members]
-            ph = ",".join("?" for _ in member_ids)
-            dep_rows = conn.execute(
-                f"SELECT l.child_id AS cid, t.id AS pid, t.title AS ptitle, t.status AS pstatus "
-                f"FROM task_links l JOIN tasks t ON t.id = l.parent_id "
-                f"WHERE l.child_id IN ({ph})",
-                member_ids,
-            ).fetchall()
+            if _pg(conn):
+                dep_rows = _pgbe(conn).deps_for_members(member_ids)
+            else:
+                ph = ",".join("?" for _ in member_ids)
+                dep_rows = conn.execute(
+                    f"SELECT l.child_id AS cid, t.id AS pid, t.title AS ptitle, t.status AS pstatus "
+                    f"FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                    f"WHERE l.child_id IN ({ph})",
+                    member_ids,
+                ).fetchall()
             waits: dict[str, list[str]] = {}
             for r in dep_rows:
                 if r["pstatus"] != "done" and r["pid"] != flow_root_id:
@@ -1179,39 +1217,46 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
-            with kanban_db.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
-                    (int(payload.priority), task_id),
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
-                )
+            if _pg(conn):
+                _pgbe(conn).update_priority(task_id, int(payload.priority))
+            else:
+                with kanban_db.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET priority = ? WHERE id = ?",
+                        (int(payload.priority), task_id),
+                    )
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'reprioritized', ?, ?)",
+                        (task_id, json.dumps({"priority": int(payload.priority)}),
+                         int(time.time())),
+                    )
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            if payload.title is not None and not payload.title.strip():
+                raise HTTPException(status_code=400, detail="title cannot be empty")
+            if _pg(conn):
+                _pgbe(conn).update_title_body(
+                    task_id, title=payload.title, body=payload.body)
+            else:
+                with kanban_db.write_txn(conn):
+                    sets, vals = [], []
+                    if payload.title is not None:
+                        sets.append("title = ?")
+                        vals.append(payload.title.strip())
+                    if payload.body is not None:
+                        sets.append("body = ?")
+                        vals.append(payload.body)
+                    vals.append(task_id)
+                    conn.execute(
+                        f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+                    )
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'edited', NULL, ?)",
+                        (task_id, int(time.time())),
+                    )
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -1242,12 +1287,15 @@ def _parents_blocking_ready(
     no-op.  Returns ``[]`` when nothing blocks the transition (e.g. no
     parents, or all parents already done).
     """
-    rows = conn.execute(
-        "SELECT t.id, t.title, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
-        (task_id,),
-    ).fetchall()
+    if _pg(conn):
+        rows = _pgbe(conn).parents_not_done(task_id)
+    else:
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ? AND t.status != 'done'",
+            (task_id,),
+        ).fetchall()
     return [
         {"id": r["id"], "title": r["title"], "status": r["status"]}
         for r in rows
@@ -1267,6 +1315,8 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    if _pg(conn):  # B1.1: faithful composite Writer im PG-Backend
+        return _pgbe(conn).set_status_direct(task_id, new_status)
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1504,17 +1554,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     except RuntimeError as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
-                    with kanban_db.write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
-                            (int(payload.priority), tid),
-                        )
-                        conn.execute(
-                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
-                        )
+                    if _pg(conn):
+                        _pgbe(conn).update_priority(tid, int(payload.priority))
+                    else:
+                        with kanban_db.write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET priority = ? WHERE id = ?",
+                                (int(payload.priority), tid),
+                            )
+                            conn.execute(
+                                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                                "VALUES (?, 'reprioritized', ?, ?)",
+                                (tid, json.dumps({"priority": int(payload.priority)}),
+                                 int(time.time())),
+                            )
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
@@ -1566,14 +1619,17 @@ def list_diagnostics(
         # Pull the task rows we need in one query so we can include
         # titles/statuses without a per-task lookup.
         ids = list(diags_by_task.keys())
-        placeholders = ",".join(["?"] * len(ids))
-        rows = {
-            r["id"]: r
-            for r in conn.execute(
-                f"SELECT id, title, status, assignee FROM tasks WHERE id IN ({placeholders})",
-                tuple(ids),
-            ).fetchall()
-        }
+        if _pg(conn):
+            rows = {r["id"]: r for r in _pgbe(conn).tasks_by_ids(ids)}
+        else:
+            placeholders = ",".join(["?"] * len(ids))
+            rows = {
+                r["id"]: r
+                for r in conn.execute(
+                    f"SELECT id, title, status, assignee FROM tasks WHERE id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchall()
+            }
 
         out = []
         for tid, dl in diags_by_task.items():
@@ -1631,29 +1687,32 @@ def list_active_workers(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        rows = conn.execute(
-            """
-            SELECT
-                r.id          AS run_id,
-                r.task_id,
-                t.title       AS task_title,
-                t.status      AS task_status,
-                t.assignee    AS task_assignee,
-                r.profile,
-                r.worker_pid,
-                r.started_at,
-                r.claim_lock,
-                r.claim_expires,
-                r.last_heartbeat_at,
-                r.max_runtime_seconds
-            FROM task_runs r
-            JOIN tasks t ON t.id = r.task_id
-            WHERE r.ended_at IS NULL
-              AND r.worker_pid IS NOT NULL
-              AND t.status = 'running'
-            ORDER BY r.started_at ASC
-            """,
-        ).fetchall()
+        if _pg(conn):
+            rows = _pgbe(conn).active_workers()
+        else:
+            rows = conn.execute(
+                """
+                SELECT
+                    r.id          AS run_id,
+                    r.task_id,
+                    t.title       AS task_title,
+                    t.status      AS task_status,
+                    t.assignee    AS task_assignee,
+                    r.profile,
+                    r.worker_pid,
+                    r.started_at,
+                    r.claim_lock,
+                    r.claim_expires,
+                    r.last_heartbeat_at,
+                    r.max_runtime_seconds
+                FROM task_runs r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE r.ended_at IS NULL
+                  AND r.worker_pid IS NOT NULL
+                  AND t.status = 'running'
+                ORDER BY r.started_at ASC
+                """,
+            ).fetchall()
         workers = [
             {
                 "run_id": row["run_id"],
@@ -2258,11 +2317,16 @@ class RenameBoardBody(BaseModel):
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
     try:
-        path = kanban_db.kanban_db_path(board=slug)
-        if not path.exists():
-            return {}
+        # B1.1: im PG-Modus gibt es keine Datei-pro-Board (ein Store) — der
+        # path.exists()-Kurzschluss würde dort immer {} liefern.
+        if not kanban_db._kanban_is_postgres():
+            path = kanban_db.kanban_db_path(board=slug)
+            if not path.exists():
+                return {}
         conn = kanban_db.connect(board=slug)
         try:
+            if _pg(conn):
+                return {k: int(v) for k, v in _pgbe(conn).stats_by_status().items()}
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
@@ -2709,11 +2773,14 @@ async def stream_events(ws: WebSocket):
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
             try:
-                rows = conn.execute(
-                    "SELECT id, task_id, run_id, kind, payload, created_at "
-                    "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
-                    (cursor_val,),
-                ).fetchall()
+                if _pg(conn):
+                    rows = _pgbe(conn).events_after(cursor_val, limit=200)
+                else:
+                    rows = conn.execute(
+                        "SELECT id, task_id, run_id, kind, payload, created_at "
+                        "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
+                        (cursor_val,),
+                    ).fetchall()
                 out: list[dict] = []
                 new_cursor = cursor_val
                 for r in rows:
