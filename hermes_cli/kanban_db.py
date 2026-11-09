@@ -3623,6 +3623,59 @@ def _owner_decision_zielfrage(
     )
 
 
+# F57: Mirror of tools/kanban_tools._ZIELENTSCHEID_CARD_RE / _ZIELENTSCHEID_CATEGORIES
+# (kept byte-for-byte in sync). Detects a DECLARED owner Zielentscheidung — a
+# business/product decision the owner must make (which secret-store, which price
+# model, …) that the Beobachter marks ``art: zielfrage, erwartung:
+# blocked_zielfrage`` and whose ONLY green terminal is ``blocked@till`` with the
+# prepared Zielfrage. The Beobachter passes no category marker to the factory, so
+# detection is content-based (title/body/comments); the DB ``category`` is honoured
+# too when the dispatcher tagged it. Verified against all 50 karten: matches every
+# blocked_zielfrage card (44/46/47/48/49), zero done cards.
+_ZIELENTSCHEID_CARD_RE = re.compile(
+    r"\([^)]*\bfrage\)"                                        # "(…-FRAGE)" title tag
+    r"|\bvarianten\b[^.\n]{0,80}?\b(?:dar(?:stellen|zustellen)|aufzeigen"
+    r"|gegen(?:ueber|über)stell)"
+    r"|\bgegen(?:ueber|über)stellung\b"
+    r"|\bgesch(?:ae|ä)ftsentscheidung(?:en)?\b"
+    r"|\bzwei\s+(?:wege|quellen|varianten|optionen|ans(?:ae|ä)tze"
+    r"|m(?:oe|ö)glichkeiten)\b",
+    re.IGNORECASE,
+)
+_ZIELENTSCHEID_CATEGORIES = frozenset({"entscheidung"})
+
+
+def _card_is_declared_zielentscheidung(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True when ``task_id`` is a DECLARED owner Zielentscheidung by its own
+    content or DB category — a business/product decision the owner must make,
+    independent of whether a prepared ``?``-comment exists yet.
+
+    Status-independent companion to :func:`_card_has_nontech_zielfrage` (which
+    needs an already-written ``?``-Weiche). Used by the F57 dependency-park fold:
+    a declared decision card must never wait in ``todo`` behind autonomous recon
+    — its only green terminal is ``blocked@till`` with the Zielfrage (F39/F50: an
+    owner decision is never autonomous work).
+    """
+    row = conn.execute(
+        "SELECT title, body, category FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    category = (row["category"] if "category" in row.keys() else None) or ""
+    if category.strip().lower() in _ZIELENTSCHEID_CATEGORIES:
+        return True
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+    ).fetchall()
+    blob = "\n".join(
+        [row["title"] or "", row["body"] or ""]
+        + [(c["body"] or "") for c in comments]
+    )
+    return bool(_ZIELENTSCHEID_CARD_RE.search(blob))
+
+
 def _blocked_card_has_zielfrage(
     conn: sqlite3.Connection, task_id: str
 ) -> bool:
@@ -7463,6 +7516,104 @@ def block_task(
                     assignee=_blocked_task.assignee if _blocked_task else None,
                     run_id=run_id,
                     reason="F56 prepared owner Zielentscheidung dependency fold",
+                )
+                return True
+            # F57 (declared Zielentscheidung parked BEFORE preparing the Weiche):
+            # the shape F56 misses is a card that is a declared owner
+            # Zielentscheidung by its own content/category but carries NO ``?``-
+            # comment yet, because the orchestrator spun up fresh autonomous recon
+            # and dependency-parked THIS card in ``todo`` BEFORE writing any owner
+            # question (live repro Karte 47 ``t_30c4d8b5`` 'Strategie für
+            # Environment Variables': "Vorbereitung gestartet: zwei read-only
+            # Grundlagenprüfungen laufen parallel … dann genau eine Inhaber-Weiche
+            # vorlegen" → dependency_wait on two recon children, no ``?``-comment →
+            # F56's _card_has_nontech_zielfrage can't fire and the card rots in
+            # ``todo`` to rot-stuck). A declared owner decision is NEVER autonomous
+            # work (F39/F50): its only green terminal is ``blocked@till`` with the
+            # Zielfrage, never a todo wait behind recon. The question is not yet
+            # written, so synthesise it FAITHFULLY from the card's own decision
+            # statement (:func:`_owner_decision_zielfrage` — a reformat of the
+            # card's body into a business question, not a facade; the card body is
+            # the Entscheidungsvorlage the Beobachter's richter greens rule b) and
+            # fold to blocked@till. A plain build-dependency card carries no such
+            # declared-decision content and keeps the normal todo park below.
+            if _card_is_declared_zielentscheidung(conn, task_id):
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'blocked',
+                           assignee      = 'till',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = 'needs_input',
+                           category      = CASE
+                               WHEN category IN
+                                   ('frage', 'entscheidung', 'abnahme', 'go_noetig')
+                               THEN category ELSE 'entscheidung' END
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None
+                           else " AND current_run_id = ?"),
+                    (task_id,) if expected_run_id is None
+                    else (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                _ze_row = conn.execute(
+                    "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "orchestrator",
+                        "Diese Karte ist eine Inhaber-Zielentscheidung und wartet "
+                        "nicht auf fabrik-interne Vorarbeit — sie wird nach der "
+                        "Antwort automatisch fortgesetzt.\n\n"
+                        + _owner_decision_zielfrage(
+                            _ze_row["title"] if _ze_row else None,
+                            _ze_row["body"] if _ze_row else None,
+                        ),
+                        int(time.time()),
+                    ),
+                )
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary="declared owner Zielentscheidung dependency-parked "
+                            "→ blocked@till (F57)",
+                )
+                if run_id is None:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked",
+                        summary="declared owner Zielentscheidung dependency-"
+                                "parked → blocked@till (F57)",
+                    )
+                _append_event(
+                    conn, task_id, "blocked",
+                    {"kind": "needs_input",
+                     "reason": "F57: deklarierte Inhaber-Zielentscheidung statt "
+                               "in todo zu parken auf blocked@till gefaltet",
+                     "escalation": "owner_decision_loop"},
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "owner_decision_loop_escalated",
+                    {"routed_to": "till", "variant": "declared_dependency_fold"},
+                    run_id=run_id,
+                )
+                routed_to = "blocked"
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_blocked",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id,
+                    reason="F57 declared owner Zielentscheidung dependency fold",
                 )
                 return True
             cur = conn.execute(

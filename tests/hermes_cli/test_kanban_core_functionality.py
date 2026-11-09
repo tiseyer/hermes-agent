@@ -5169,3 +5169,98 @@ def test_dependency_park_folds_prepared_owner_zielentscheidung(kanban_home):
             "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (main,)
         ).fetchone()[0]
         assert n_comments == 1, n_comments
+
+
+def test_dependency_park_folds_declared_zielentscheidung_without_comment(
+    kanban_home,
+):
+    """F57: a DECLARED owner Zielentscheidung (by its own content) that the
+    orchestrator dependency-parks in ``todo`` BEFORE writing any ``?``-comment —
+    it spun up fresh recon first (live Karte 47 ``t_30c4d8b5`` 'Strategie für
+    Environment Variables': "Vorbereitung gestartet … dann genau eine Inhaber-
+    Weiche vorlegen" → dependency_wait on two recon children, no owner question
+    yet). F56 can't fire (no ``?``-comment to preserve); the card must still fold
+    to blocked@till with a Zielfrage synthesised faithfully from its own body."""
+    with kb.connect() as conn:
+        main = kb.create_task(
+            conn,
+            title="Strategie fuer Environment Variables sicher speichern",
+            body=("Secrets liegen heute in .env-Dateien auf den Servern. "
+                  "Varianten: Vault/Secret-Manager, SOPS-verschluesselte Dateien "
+                  "im Repo, oder verschluesselte .env mit Schluessel auf dem Host. "
+                  "Bitte Varianten mit Aufwand und Risiko darstellen."),
+            assignee="orchestrator",
+        )
+        # No owner ``?``-comment exists yet — the orchestrator parked it first.
+        assert kb._card_has_nontech_zielfrage(conn, main) is False
+        assert kb._card_is_declared_zielentscheidung(conn, main) is True
+
+        # Fresh autonomous recon child (still working — NOT a held human block).
+        recon = kb.create_task(conn, title="Recon realer Secret-Ablauf",
+                               assignee="recon")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (recon,))
+        kb.link_tasks(conn, recon, main)
+
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (main,))
+        assert kb.block_task(conn, main, kind="dependency",
+                             reason="warte auf Recon, danach Weiche vorlegen") is True
+
+        t = kb.get_task(conn, main)
+        assert t.status == "blocked", t.status
+        assert t.assignee == "till", t.assignee
+        assert t.block_kind == "needs_input", t.block_kind
+        assert t.category == "entscheidung", t.category  # F54 durable marker
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (main,)
+            )
+        ]
+        assert "owner_decision_loop_escalated" in kinds
+        assert kinds[-1] != "dependency_wait"  # not the todo-park path
+        assert kb._has_sticky_block(conn, main) is True
+
+        # A Zielfrage was synthesised from the card's own body — a ``?``-comment
+        # the Beobachter's ``_letzte_frage`` can read, free of the observer's
+        # TECH_REGEX terms.
+        comments = [
+            r["body"] for r in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? "
+                "ORDER BY created_at ASC", (main,)
+            )
+        ]
+        assert any("?" in c for c in comments), comments
+        assert kb._card_has_nontech_zielfrage(conn, main) is True
+
+
+def test_dependency_park_plain_build_card_still_parks_todo(kanban_home):
+    """F57 negative: a plain build-dependency card (no declared-decision
+    content) keeps the normal todo-park — the declared-Zielentscheidung fold
+    must not hijack an ordinary library/file-conflict wait."""
+    with kb.connect() as conn:
+        main = kb.create_task(
+            conn, title="Formatierung der Token-Anzeige korrigieren",
+            body="Rundungsfehler bei k/M-Grenzen in formatTokens beheben.",
+            assignee="voicera-coder",
+        )
+        assert kb._card_is_declared_zielentscheidung(conn, main) is False
+        running_parent = kb.create_task(conn, title="Shared-Util umbauen",
+                                        assignee="voicera-coder")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?",
+                     (running_parent,))
+        kb.link_tasks(conn, running_parent, main)
+
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (main,))
+        assert kb.block_task(conn, main, kind="dependency",
+                             reason="file-conflict mit Shared-Util") is True
+
+        t = kb.get_task(conn, main)
+        assert t.status == "todo", t.status
+        assert t.block_kind == "dependency", t.block_kind
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (main,)
+            )
+        ]
+        assert "dependency_wait" in kinds
+        assert "owner_decision_loop_escalated" not in kinds
