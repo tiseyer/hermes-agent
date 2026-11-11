@@ -1039,6 +1039,17 @@ class GatewayKanbanWatchersMixin:
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
             """
+            # Corruption halt: if the board's <db>.halt flag is present, do not
+            # even open the DB. connect() runs the R/W integrity probe, which on
+            # a corrupt-but-mutating file would mint another quarantine backup
+            # every tick (2026-11-11 disk-fill incident). dispatch_once already
+            # honours the flag, but only *after* connect() — too late once the
+            # file is corrupt, because connect() raises first.
+            try:
+                if _kb.dispatch_halt_active(_kb.kanban_db_path(slug)):
+                    return None
+            except Exception:
+                pass
             conn = None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)

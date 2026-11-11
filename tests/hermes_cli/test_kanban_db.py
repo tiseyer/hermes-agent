@@ -4867,14 +4867,15 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
+def test_repeated_corrupt_open_does_not_amplify_backups(tmp_path):
+    """Repeated quarantines must not amplify disk usage — even when the corrupt
+    bytes change on every open (the 2026-11-11 disk-fill failure mode).
 
-    Regression for the gateway dispatcher's 5-min retry loop on shared kanban
-    DBs across multi-profile fleets: each retry on an unchanged corrupt file
-    used to create a fresh ``.corrupt.<timestamp>.bak`` until disk filled. The
-    content-addressed backup name is deterministic in the DB's sha256, so
-    N retries of the same bytes share one backup.
+    The content-addressed name dedupes identical bytes; the 6h time throttle
+    caps backups when the bytes MUTATE. On 2026-11-11 the gateway's R/W
+    integrity probe checkpointed the corrupt DB's WAL on every open, so its
+    sha256 changed every ~30s tick, defeating the content-addressed dedup, and
+    ~1965 fresh 45 MB ``.corrupt.<hash>.bak`` files filled the disk.
     """
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
@@ -4887,22 +4888,103 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
         assert excinfo.value.backup_path is not None
         backups.add(excinfo.value.backup_path)
 
-    assert len(backups) == 1, f"expected 1 deterministic backup, got {len(backups)}"
+    assert len(backups) == 1, f"expected 1 backup, got {len(backups)}"
     (backup,) = backups
     assert backup.exists()
     assert backup.read_bytes() == original
 
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
-    with db_path.open("r+b") as f:
-        f.seek(4096)
-        f.write(b"\xAB" * 64)
+    # Reproduce today's course: mutate the corrupt bytes, then re-open. WITHIN
+    # the 6h throttle window this must still NOT mint a second backup — a
+    # mutating corrupt file can no longer amplify disk usage.
+    for seek_to in (120, 200, 300):
+        with db_path.open("r+b") as f:
+            f.seek(seek_to)
+            f.write(b"\xAB" * 32)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError):
+            kb.connect(db_path=db_path)
+    on_disk = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(on_disk) == 1, f"throttle breached, disk amplified: {on_disk}"
+
+
+def test_corrupt_connect_sets_write_halt_flag(tmp_path):
+    """A detected corruption drops the board-scoped ``<db>.halt`` flag so every
+    serialised writer and the dispatcher stand down (instead of re-probing the
+    file every tick)."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
+
+    assert not kb.dispatch_halt_active(db_path)
+    with pytest.raises(kb.KanbanDbCorruptError):
         kb.connect(db_path=db_path)
-    second_backup = excinfo2.value.backup_path
-    assert second_backup is not None
-    assert second_backup != backup
-    assert second_backup.exists()
+    assert kb.dispatch_halt_active(db_path), "corrupt connect must set <db>.halt"
+    assert kb.dispatch_halt_path(db_path).exists()
+
+
+def test_corrupt_backup_new_one_only_after_throttle_window(tmp_path):
+    """Once the newest backup is older than the 6h window, a changed corrupt
+    file is allowed exactly one fresh backup."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+    first = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(first) == 1
+
+    # Age the existing backup past the throttle window.
+    old = time.time() - (kb._CORRUPT_BACKUP_MIN_INTERVAL_S + 60)
+    os.utime(first[0], (old, old))
+    # Change the bytes so a new content hash is produced.
+    with db_path.open("r+b") as f:
+        f.seek(140)
+        f.write(b"\xCD" * 48)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+    after = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(after) == 2, f"expected a 2nd backup after 6h, got {after}"
+
+
+def test_corrupt_backup_skipped_when_disk_low(tmp_path, monkeypatch):
+    """No quarantine copy is written when free space is below the 5 GB floor —
+    the backup must never deepen the disk pressure it is reacting to."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    class _LowUsage:
+        total = 100 * 1024 ** 3
+        used = 99 * 1024 ** 3
+        free = 1 * 1024 ** 3  # < 5 GB floor
+
+    monkeypatch.setattr(kb.shutil, "disk_usage", lambda *_a, **_k: _LowUsage)
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == [], "copied despite low disk"
+
+
+def test_corrupt_backups_pruned_to_five(tmp_path):
+    """At most five ``.corrupt.*.bak`` are kept; a sixth copy prunes the oldest."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    # Seed six distinct old backups, all aged past the throttle window so the
+    # next real corruption is allowed to copy (and then prune).
+    base = time.time() - (kb._CORRUPT_BACKUP_MIN_INTERVAL_S + 3600)
+    for i in range(6):
+        p = tmp_path / f"kanban.db.corrupt.{i:016x}.bak"
+        p.write_bytes(b"old backup " + str(i).encode())
+        os.utime(p, (base - i * 60, base - i * 60))
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+
+    remaining = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(remaining) == kb._CORRUPT_BACKUP_MAX_KEEP, remaining
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):

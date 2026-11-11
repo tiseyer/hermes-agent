@@ -1867,18 +1867,78 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+# Corrupt-DB quarantine-backup bounds (2026-11-11 disk-fill incident). A
+# corrupt file that keeps mutating — the R/W integrity probe checkpoints its
+# WAL on every open, and parallel writers kept committing — gave a *new*
+# sha256 on every ~30s dispatcher tick, defeating BOTH the content-addressed
+# dedup below AND the dispatcher's fingerprint quarantine. ~1965 fresh 45 MB
+# ``.corrupt.<hash>.bak`` files filled the disk. These three bounds cap the
+# backups independently of whether the corrupt bytes change.
+_CORRUPT_BACKUP_MIN_INTERVAL_S = 6 * 3600        # at most one new backup per 6h
+_CORRUPT_BACKUP_MAX_KEEP = 5                      # keep the 5 newest, prune older
+_CORRUPT_BACKUP_MIN_FREE_BYTES = 5 * 1024 ** 3   # never copy with <5 GB free
+
+
+def _corrupt_backups_for(parent: Path, base_name: str) -> "list[Path]":
+    """``<base>.corrupt.*.bak`` files in *parent*, oldest first (by mtime).
+
+    Confined to *parent*; the ``.bak`` suffix excludes ``-wal``/``-shm``
+    sidecars and the glob's literal ``.corrupt.`` excludes unrelated artefacts
+    like ``<base>.corrupt-preswap-*``.
+    """
+    try:
+        return sorted(
+            (
+                p
+                for p in parent.glob(f"{base_name}.corrupt.*.bak")
+                if p.parent == parent and p.is_file()
+            ),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return []
+
+
+def _prune_corrupt_backups(parent: Path, base_name: str, *, keep: int) -> None:
+    """Delete all but the ``keep`` newest ``<base>.corrupt.*.bak`` backups.
+
+    A pruned backup takes its ``-wal``/``-shm`` sidecars with it. Best-effort:
+    individual unlink failures are swallowed so a locked or vanished file never
+    masks the corruption the caller is about to raise on.
+    """
+    backups = _corrupt_backups_for(parent, base_name)
+    if len(backups) <= keep:
+        return
+    for old in backups[: len(backups) - keep]:
+        for victim in (old, parent / (old.name + "-wal"), parent / (old.name + "-shm")):
+            if victim.parent != parent:
+                continue
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
     The backup filename is deterministic in the main DB's sha256, so repeated
     quarantines of the same corrupt bytes (gateway restarts, dispatcher retries,
     multi-profile fleets all hitting the same shared DB) reuse one backup
-    instead of amplifying disk usage by N. If the corrupt bytes actually
-    change between attempts — e.g. a partial repair or further damage — the
-    fingerprint changes and a separate backup is preserved.
+    instead of amplifying disk usage by N.
 
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
+    Three bounds cap amplification even when the corrupt bytes *do* change on
+    every attempt (the 2026-11-11 failure mode, where a content-addressed name
+    alone was not enough):
+
+    * refuse to copy when the volume has less than
+      ``_CORRUPT_BACKUP_MIN_FREE_BYTES`` free;
+    * at most one new backup per ``_CORRUPT_BACKUP_MIN_INTERVAL_S`` (6h),
+      regardless of byte changes;
+    * keep only the ``_CORRUPT_BACKUP_MAX_KEEP`` newest, pruning older ones.
+
+    Returns the backup path (the newest relevant one) or ``None`` if nothing
+    could be copied or found (the caller still raises loudly in that case).
 
     Writes are confined to the original DB's parent directory. The backup
     basename is derived purely from ``path.name`` and a content hash, never
@@ -1890,13 +1950,41 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+
+    existing = _corrupt_backups_for(parent, base_name)
+
+    # Bound 1 — never deepen disk pressure. If free space is already low,
+    # do not write another copy; hand back the newest existing backup (if any)
+    # so the caller still has a reference.
+    try:
+        free = shutil.disk_usage(parent).free
+    except OSError:
+        free = None
+    if free is not None and free < _CORRUPT_BACKUP_MIN_FREE_BYTES:
+        return existing[-1] if existing else None
+
+    # Bound 2 — time throttle. At most one new backup per interval, even if the
+    # corrupt bytes changed (a mutating corrupt file would otherwise mint a new
+    # content-addressed name every tick).
+    now = time.time()
+    if existing:
+        try:
+            newest_mtime = existing[-1].stat().st_mtime
+        except OSError:
+            newest_mtime = None
+        if (
+            newest_mtime is not None
+            and (now - newest_mtime) < _CORRUPT_BACKUP_MIN_INTERVAL_S
+        ):
+            return existing[-1]
+
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError:
-        return None
+        return existing[-1] if existing else None
     token = digest.hexdigest()[:16]
     candidate = parent / f"{base_name}.corrupt.{token}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -1906,7 +1994,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         try:
             shutil.copy2(resolved, candidate)
         except OSError:
-            return None
+            return existing[-1] if existing else None
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
@@ -1918,6 +2006,9 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+
+    # Bound 3 — keep only the newest N backups (plus their sidecars).
+    _prune_corrupt_backups(parent, base_name, keep=_CORRUPT_BACKUP_MAX_KEEP)
     return candidate
 
 
@@ -1975,6 +2066,18 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+    # Fail-closed: drop the board-scoped write-halt flag so every serialised
+    # writer (CLI, voicera-api bridge, in-process worker tools) AND the gateway
+    # dispatcher stand down, instead of re-opening the file and re-quarantining
+    # it on every tick. The dispatcher skips ticks while this flag is present;
+    # recovery removes it. (2026-11-11: without this the gateway re-probed a
+    # mutating corrupt DB every ~30s and filled the disk with backups.)
+    try:
+        halt = dispatch_halt_path(resolved)
+        if not halt.exists():
+            halt.touch()
+    except OSError:
+        pass
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
