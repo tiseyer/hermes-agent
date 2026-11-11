@@ -475,6 +475,93 @@ def test_go_gate_reparks_leaked_blank_category_owner_decision(
         assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
 
 
+def test_go_gate_parks_fresh_orchestrator_zielentscheidung(
+    kanban_home, all_assignees_spawnable,
+):
+    # F39: a FRESH user-created owner Zielentscheidung routed DIRECTLY to
+    # ready@orchestrator (category NULL, zero events, no comments) — the canonical
+    # "Secret-Haltung Vault vs. SOPS vs. .env" decision the Beobachter greens as a
+    # legit Zielfrage. It never reaches the human sink and carries no decision
+    # category, so the F40/F51/F54 re-park backstops (all keyed on assignee='till')
+    # miss it entirely and it rots in ready@orchestrator until the board scan reads
+    # it as rot-stuck (live Karte 44 t_f4f3f189). The dispatcher must recognise it
+    # by content and park it to blocked@till with a synthesised business Weiche.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Strategie fuer Environment Variables sicher speichern",
+            body=(
+                "Secrets liegen heute in .env-Dateien auf den Servern. Varianten: "
+                "Vault/Secret-Manager, SOPS-verschluesselte Dateien im Repo, oder "
+                "verschluesselte .env mit Schluessel auf dem Host. Bitte Varianten "
+                "mit Aufwand und Risiko darstellen."
+            ),
+            assignee="orchestrator",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        # The owner decision is NOT dispatched as autonomous work.
+        assert spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.assignee == "till"
+        assert task.block_kind == "needs_input"
+        # Stamped with the owner-decision inbox bucket so a future leak is caught
+        # by the ordinary F51 category path (self-sustaining, no re-fire here).
+        assert task.category == "entscheidung"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "go_gate_held"]
+        # A business Weiche is synthesised from the card's own body so the
+        # Beobachter's _letzte_frage reads a legit Zielfrage (not "blocked ohne
+        # Frage"), carrying the owner's options and no TECH_REGEX trigger word.
+        assert kb._card_has_nontech_zielfrage(conn, tid)
+        q = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["body"]
+        assert "?" in q
+        assert "Vault" in q
+
+
+def test_go_gate_ignores_fresh_orchestrator_work_card(
+    kanban_home, all_assignees_spawnable,
+):
+    # F39 over-gating guard: an ORDINARY work card at ready@orchestrator (no
+    # declared-Zielentscheidung content) must still spawn — the content classifier
+    # keys strictly on the owner-decision shape, not on the orchestrator assignee.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Health-Endpoint reparieren",
+            body="Der /health Endpoint liefert 500. Fehler finden und beheben.",
+            assignee="orchestrator",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == [tid]
+        assert kb.get_task(conn, tid).status != "blocked"
+
+
+def test_go_gate_ignores_declared_zielentscheidung_owned_by_worker(
+    kanban_home, all_assignees_spawnable,
+):
+    # F39 over-gating guard: a declared decision card still owned by a real worker
+    # profile (e.g. a specifier actively preparing the Zielfrage) is active work —
+    # the fresh-orchestrator park keys on assignee='orchestrator', not on the
+    # decision content alone, so such a card must still spawn.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Preismodell gegenueberstellung",
+            body="Zwei Varianten gegenueberstellen und darstellen.",
+            assignee="alice",
+        )
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id))
+        assert spawned == [tid]
+        assert kb.get_task(conn, tid).status != "blocked"
+
+
 def test_go_gate_ignores_blank_category_needs_input_without_escalation(
     kanban_home, all_assignees_spawnable,
 ):

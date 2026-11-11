@@ -13163,6 +13163,86 @@ def _dispatch_once_locked(
         # Only consult it on the human sink (the leak target), where the extra
         # per-row event read is cheap (ready@till is rare) and unambiguous.
         _held_owner_dec = _on_human_sink and _held_owner_decision(conn, row["id"])
+        # F39: a FRESH owner Zielentscheidung that lands DIRECTLY on the generic
+        # orchestrator router — a user-created decision card routed to
+        # ready@orchestrator, e.g. "Strategie fuer Environment Variables sicher
+        # speichern … Varianten: Vault/SOPS/.env … darstellen" — must never be
+        # dispatched as autonomous work. Its ONLY green terminal is blocked@till
+        # with the prepared Zielfrage (F50/F57: an owner decision is never factory
+        # work; the Beobachter's own TOR1 example is "Secret-Haltung Vault vs. SOPS
+        # vs. .env"). The F40/F51/F54 re-park backstops all key on the HUMAN SINK
+        # (assignee='till') plus a decision category or sticky owner_decision_loop
+        # event — but this card never reached 'till' or a worker: it sat in
+        # ready@orchestrator from creation (category NULL, zero events), so every
+        # existing backstop misses it and it rots in ready until the board scan
+        # reads it as rot-stuck (live Karte 44 t_f4f3f189). Detect it by content at
+        # the dispatch choke point (same conservative classifier the F57 block_task
+        # fold uses — verified zero done cards across all 50 karten) and park it
+        # directly, synthesising the business Weiche from its own body so the
+        # Beobachter greens rule b. Scoped to assignee='orchestrator' (the generic
+        # entry router): a declared decision card already owned by a real worker
+        # profile is active preparation and must still spawn.
+        _is_fresh_orchestrator_zielentscheid = (
+            (row_assignee or "").strip().lower() == "orchestrator"
+            and _card_is_declared_zielentscheidung(conn, row["id"])
+        )
+        if _is_fresh_orchestrator_zielentscheid and not _go_gate_released(
+            conn, row["id"]
+        ):
+            result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                with write_txn(conn):
+                    # Park as blocked@till (the board invariant: a waiting-on-a-
+                    # human card is ``blocked``, never ``ready``). category
+                    # 'entscheidung' + the sticky owner_decision_loop ``blocked``
+                    # event make any future leak (Beobachter answers → blocked→todo
+                    # → recompute_ready promotes to ready@till) land in the F51/F54
+                    # category/escalation path, so THIS orchestrator-scoped branch
+                    # never re-fires for the same card.
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = 'till', "
+                        "status = 'blocked', block_kind = 'needs_input', "
+                        "category = 'entscheidung' "
+                        "WHERE id = ? AND status = 'ready'",
+                        (row["id"],),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"kind": "needs_input",
+                             "category": "entscheidung",
+                             "escalation": "owner_decision_loop",
+                             "reason": "F39: owner Zielentscheidung routed to "
+                                       "ready@orchestrator — never autonomous "
+                                       "work; parked for owner decision"},
+                        )
+                        _append_event(
+                            conn, row["id"], "go_gate_held",
+                            {"assignee": "till", "status": "blocked",
+                             "resume_assignee": row_assignee,
+                             "kind": "zielentscheidung",
+                             "reason": "owner Zielentscheidung requires an "
+                                       "explicit owner decision"},
+                        )
+                        # Post the prepared Zielfrage ONCE — only if the card has
+                        # no usable non-tech ``?``-comment yet — so the Beobachter's
+                        # _letzte_frage reads a legitimate business Weiche (TOR1/2/3
+                        # green) instead of "blocked ohne Frage".
+                        if not _card_has_nontech_zielfrage(conn, row["id"]):
+                            conn.execute(
+                                "INSERT INTO task_comments "
+                                "(task_id, author, body, created_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    row["id"],
+                                    "orchestrator",
+                                    _owner_decision_zielfrage(
+                                        row["title"], row["body"]
+                                    ),
+                                    int(time.time()),
+                                ),
+                            )
+            continue
         _is_terminal_card = (
             bool(_GO_GATE_RE.search(_title))
             or bool(_GO_GATE_BODY_RE.search(_body))
