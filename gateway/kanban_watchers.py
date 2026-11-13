@@ -946,6 +946,11 @@ class GatewayKanbanWatchersMixin:
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+            try:
+                import hermes_cli.kanban_db as _kdb_id
+                logger.info("kanban dispatcher: STORE %s", _kdb_id.backend_identity())
+            except Exception:  # noqa: BLE001
+                pass
         else:
             logger.warning(
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "

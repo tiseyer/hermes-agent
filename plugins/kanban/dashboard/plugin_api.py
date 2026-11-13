@@ -143,6 +143,12 @@ def _conn(board: Optional[str] = None):
         kanban_db.init_db(board=board)
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
+    if not getattr(_db, "_logged_backend", False):
+        try:
+            log.info("dashboard STORE: %s", kanban_db.backend_identity(board))
+            _db._logged_backend = True
+        except Exception:  # noqa: BLE001
+            pass
     return kanban_db.connect(board=board)
 
 

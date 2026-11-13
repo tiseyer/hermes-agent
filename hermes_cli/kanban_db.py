@@ -2140,6 +2140,24 @@ def _pg_connect():
     return psycopg.connect(_kanban_pg_dsn(), autocommit=False)
 
 
+def backend_identity(board: Optional[str] = None) -> str:
+    """Loggbare Backend-Identität OHNE Geheimnisse — für Start-Protokolle der
+    Dienste (Gateway/Dashboard/Bridge), damit beim Start sofort sichtbar ist, ob
+    einer falsch zeigt. PG: ``backend=postgres schema=<current_schema>``; SQLite:
+    ``backend=sqlite file=<name>``. Kein DSN, kein Passwort."""
+    if _kanban_is_postgres():
+        try:
+            with contextlib.closing(connect(board=board)) as c:
+                schema = c.execute("SELECT current_schema()").fetchone()[0]
+            return f"backend=postgres schema={schema}"
+        except Exception as exc:  # noqa: BLE001
+            return f"backend=postgres schema=? (connect fehlgeschlagen: {type(exc).__name__})"
+    try:
+        return f"backend=sqlite file={kanban_db_path(board).name}"
+    except Exception:  # noqa: BLE001
+        return "backend=sqlite file=?"
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
