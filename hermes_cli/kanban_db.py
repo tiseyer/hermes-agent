@@ -815,7 +815,12 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
+
+    B1.1 PG-Modus: EIN Store. Postgres hält alle Karten in einem Schema
+    (kein Datei-pro-Board), also enumerieren wir genau den ``default``-Board.
     """
+    if _kanban_is_postgres():
+        return [read_board_metadata(DEFAULT_BOARD)]
     entries: list[dict] = []
     seen: set[str] = set()
 
@@ -1704,7 +1709,15 @@ def write_serialize_lock(db_path: Path, timeout: float = 10.0):
     Refuses outright (raises :class:`KanbanWriteHalted`) when the board's
     ``<db>.halt`` flag is present, so a canary-detected corruption stops every
     serialised writer from touching the file instead of re-quarantining it.
+
+    B1.1 PG-Modus: No-op. Postgres serialisiert Schreiber DB-seitig (MVCC /
+    Row-Locks / Session-Advisory im Dispatcher-Tick); es gibt keine
+    WAL-Datei und keine ``<db>.dispatch.lock``, gegen die zu flock wäre. Der
+    Canary-Halt-Pfad ist ebenfalls datei-gebunden und entfällt.
     """
+    if _kanban_is_postgres():
+        yield True
+        return
     if dispatch_halt_active(db_path):
         raise KanbanWriteHalted(
             f"kanban writes halted: {dispatch_halt_path(db_path).name} present "
@@ -1854,18 +1867,78 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+# Corrupt-DB quarantine-backup bounds (2026-11-11 disk-fill incident). A
+# corrupt file that keeps mutating — the R/W integrity probe checkpoints its
+# WAL on every open, and parallel writers kept committing — gave a *new*
+# sha256 on every ~30s dispatcher tick, defeating BOTH the content-addressed
+# dedup below AND the dispatcher's fingerprint quarantine. ~1965 fresh 45 MB
+# ``.corrupt.<hash>.bak`` files filled the disk. These three bounds cap the
+# backups independently of whether the corrupt bytes change.
+_CORRUPT_BACKUP_MIN_INTERVAL_S = 6 * 3600        # at most one new backup per 6h
+_CORRUPT_BACKUP_MAX_KEEP = 5                      # keep the 5 newest, prune older
+_CORRUPT_BACKUP_MIN_FREE_BYTES = 5 * 1024 ** 3   # never copy with <5 GB free
+
+
+def _corrupt_backups_for(parent: Path, base_name: str) -> "list[Path]":
+    """``<base>.corrupt.*.bak`` files in *parent*, oldest first (by mtime).
+
+    Confined to *parent*; the ``.bak`` suffix excludes ``-wal``/``-shm``
+    sidecars and the glob's literal ``.corrupt.`` excludes unrelated artefacts
+    like ``<base>.corrupt-preswap-*``.
+    """
+    try:
+        return sorted(
+            (
+                p
+                for p in parent.glob(f"{base_name}.corrupt.*.bak")
+                if p.parent == parent and p.is_file()
+            ),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return []
+
+
+def _prune_corrupt_backups(parent: Path, base_name: str, *, keep: int) -> None:
+    """Delete all but the ``keep`` newest ``<base>.corrupt.*.bak`` backups.
+
+    A pruned backup takes its ``-wal``/``-shm`` sidecars with it. Best-effort:
+    individual unlink failures are swallowed so a locked or vanished file never
+    masks the corruption the caller is about to raise on.
+    """
+    backups = _corrupt_backups_for(parent, base_name)
+    if len(backups) <= keep:
+        return
+    for old in backups[: len(backups) - keep]:
+        for victim in (old, parent / (old.name + "-wal"), parent / (old.name + "-shm")):
+            if victim.parent != parent:
+                continue
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
     The backup filename is deterministic in the main DB's sha256, so repeated
     quarantines of the same corrupt bytes (gateway restarts, dispatcher retries,
     multi-profile fleets all hitting the same shared DB) reuse one backup
-    instead of amplifying disk usage by N. If the corrupt bytes actually
-    change between attempts — e.g. a partial repair or further damage — the
-    fingerprint changes and a separate backup is preserved.
+    instead of amplifying disk usage by N.
 
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
+    Three bounds cap amplification even when the corrupt bytes *do* change on
+    every attempt (the 2026-11-11 failure mode, where a content-addressed name
+    alone was not enough):
+
+    * refuse to copy when the volume has less than
+      ``_CORRUPT_BACKUP_MIN_FREE_BYTES`` free;
+    * at most one new backup per ``_CORRUPT_BACKUP_MIN_INTERVAL_S`` (6h),
+      regardless of byte changes;
+    * keep only the ``_CORRUPT_BACKUP_MAX_KEEP`` newest, pruning older ones.
+
+    Returns the backup path (the newest relevant one) or ``None`` if nothing
+    could be copied or found (the caller still raises loudly in that case).
 
     Writes are confined to the original DB's parent directory. The backup
     basename is derived purely from ``path.name`` and a content hash, never
@@ -1877,13 +1950,41 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+
+    existing = _corrupt_backups_for(parent, base_name)
+
+    # Bound 1 — never deepen disk pressure. If free space is already low,
+    # do not write another copy; hand back the newest existing backup (if any)
+    # so the caller still has a reference.
+    try:
+        free = shutil.disk_usage(parent).free
+    except OSError:
+        free = None
+    if free is not None and free < _CORRUPT_BACKUP_MIN_FREE_BYTES:
+        return existing[-1] if existing else None
+
+    # Bound 2 — time throttle. At most one new backup per interval, even if the
+    # corrupt bytes changed (a mutating corrupt file would otherwise mint a new
+    # content-addressed name every tick).
+    now = time.time()
+    if existing:
+        try:
+            newest_mtime = existing[-1].stat().st_mtime
+        except OSError:
+            newest_mtime = None
+        if (
+            newest_mtime is not None
+            and (now - newest_mtime) < _CORRUPT_BACKUP_MIN_INTERVAL_S
+        ):
+            return existing[-1]
+
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError:
-        return None
+        return existing[-1] if existing else None
     token = digest.hexdigest()[:16]
     candidate = parent / f"{base_name}.corrupt.{token}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -1893,7 +1994,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         try:
             shutil.copy2(resolved, candidate)
         except OSError:
-            return None
+            return existing[-1] if existing else None
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
@@ -1905,6 +2006,9 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+
+    # Bound 3 — keep only the newest N backups (plus their sidecars).
+    _prune_corrupt_backups(parent, base_name, keep=_CORRUPT_BACKUP_MAX_KEEP)
     return candidate
 
 
@@ -1962,15 +2066,85 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+    # Fail-closed: drop the board-scoped write-halt flag so every serialised
+    # writer (CLI, voicera-api bridge, in-process worker tools) AND the gateway
+    # dispatcher stand down, instead of re-opening the file and re-quarantining
+    # it on every tick. The dispatcher skips ticks while this flag is present;
+    # recovery removes it. (2026-11-11: without this the gateway re-probed a
+    # mutating corrupt DB every ~30s and filled the disk with backups.)
+    try:
+        halt = dispatch_halt_path(resolved)
+        if not halt.exists():
+            halt.touch()
+    except OSError:
+        pass
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
+
+
+# ---------------------------------------------------------------------------
+# B1.1 Postgres-Routing (Welle 3). Default sqlite → komplett inert: solange
+# ``kanban.backend`` nicht auf ``postgres`` steht (Env höchste Priorität),
+# läuft jeder Pfad unverändert über SQLite. Erst beim Cutover (GO-pflichtig)
+# liefert ``connect()`` eine psycopg-Verbindung — dann greifen die in Welle 1/2
+# gesetzten conn-Typ-Guards in den Schreib-/Lesefunktionen automatisch.
+# ---------------------------------------------------------------------------
+_PG_CFG_UNSET = object()
+_PG_CFG_CACHE: Any = _PG_CFG_UNSET
+
+
+def _kanban_root_config() -> dict:
+    """INSTANCE-ROOT config.yaml, einmal pro Prozess gecacht (nur wenn die
+    Env ``HERMES_KANBAN_BACKEND`` NICHT gesetzt ist — dann entscheidet Env
+    allein und wir laden gar keine Config, bleiben also auf dem heißen
+    SQLite-Pfad kostenfrei)."""
+    global _PG_CFG_CACHE
+    if _PG_CFG_CACHE is _PG_CFG_UNSET:
+        try:
+            from hermes_cli.config import load_config
+            _PG_CFG_CACHE = load_config() or {}
+        except Exception:
+            _PG_CFG_CACHE = {}
+    return _PG_CFG_CACHE
+
+
+def _kanban_is_postgres() -> bool:
+    """True iff das Kanban-Board auf Postgres zeigt. Env-first (validiert,
+    fail-fast bei ungültigem Wert via resolve_backend_name), Config nur wenn
+    Env leer."""
+    import kanban_backend
+    if os.environ.get("HERMES_KANBAN_BACKEND", "").strip():
+        return kanban_backend.is_postgres(None)
+    return kanban_backend.is_postgres(_kanban_root_config())
+
+
+def _kanban_pg_dsn() -> str:
+    dsn = os.environ.get("HERMES_KANBAN_PG_DSN", "").strip()
+    if dsn:
+        return dsn
+    cfg = _kanban_root_config()
+    dsn = str((cfg.get("kanban") or {}).get("pg_dsn", "") or "").strip()
+    if not dsn:
+        raise RuntimeError(
+            "kanban.backend=postgres, aber keine DSN: setze Env "
+            "HERMES_KANBAN_PG_DSN oder config kanban.pg_dsn."
+        )
+    return dsn
+
+
+def _pg_connect():
+    """psycopg3-Verbindung (autocommit=False) im PG-Modus. Das Schema muss
+    existieren (Prod ``public`` erst nach Migration; Tests nutzen ein
+    Wegwerf-Schema via search_path in der DSN)."""
+    import psycopg
+    return psycopg.connect(_kanban_pg_dsn(), autocommit=False)
 
 
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
+):
     """Open (and initialize if needed) the kanban DB.
 
     WAL mode is enabled on every connection; it's a no-op after the first
@@ -1988,7 +2162,14 @@ def connect(
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
+
+    B1.1: Im PG-Modus (``kanban.backend=postgres``) wird EINE psycopg-
+    Verbindung geliefert (ein Store, kein Datei-pro-Board); ``db_path``/
+    ``board`` sind dann gegenstandslos. Alle in Welle 1/2 gesetzten
+    conn-Typ-Guards routen damit automatisch nach Postgres.
     """
+    if _kanban_is_postgres():
+        return _pg_connect()
     if db_path is not None:
         path = db_path
     else:
@@ -3266,6 +3447,23 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # B1.1 Postgres-Routing (inert @ sqlite): der Guard sitzt NACH der Policy-
+    # Resolution (projects/skills/repo/board-default = D5-Grenze, oben erledigt)
+    # und VOR der Insert-Schleife; er delegiert den faithful DB-Kern (Status-
+    # Auflösung/Family/Hierarchie/Insert/Links/created-Event) ans PG-Backend.
+    if not isinstance(conn, sqlite3.Connection):
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).create_task_full(
+            title=title, body=body, assignee=assignee, created_by=created_by,
+            workspace_kind=workspace_kind, workspace_path=workspace_path,
+            branch_name=branch_name, tenant=tenant, repository=repository,
+            priority=priority, parents=parents, triage=triage,
+            idempotency_key=idempotency_key, max_runtime_seconds=max_runtime_seconds,
+            skills_list=skills_list, max_retries=max_retries, goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns, merge_group=merge_group,
+            initial_status=initial_status, session_id=session_id, project_id=project_id,
+            parent_task_id=parent_task_id, initiative_id=initiative_id,
+            child_role=child_role)
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3780,6 +3978,11 @@ def move_to_human(
     :func:`create_human_card` — overflow RAISES ``ValueError`` rather than
     silently clipping.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).move_to_human(
+            task_id, title=title, kurzbeschreibung=kurzbeschreibung,
+            category=category, actor=actor, planned_step=planned_step)
     if title is not None:
         if not title.strip():
             raise ValueError("title is required")
@@ -4122,6 +4325,10 @@ def relabel_task(
     ``ValueError`` if neither field is given, if ``title`` is empty/blank, or if
     either field exceeds its length limit.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).relabel_task(
+            task_id, title=title, kurzbeschreibung=kurzbeschreibung, actor=actor)
     if title is None and kurzbeschreibung is None:
         raise ValueError(
             "relabel needs at least one of title / kurzbeschreibung"
@@ -4210,6 +4417,10 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        row = kanban_backend.make_pg_backend(conn).get_task_full(task_id)
+        return Task.from_row(row) if row else None
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
@@ -4241,6 +4452,33 @@ def list_tasks(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
 ) -> list[Task]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        # Validierung + Order-Auflösung bleiben kanban_db-seitig (fail-fast
+        # identisch zum SQLite-Pfad); das Order-Fragment ist danach vertraut.
+        if status is not None and status not in VALID_STATUSES:
+            raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+        if order_by is not None:
+            ob = order_by.strip().lower()
+            if ob not in VALID_SORT_ORDERS:
+                raise ValueError(
+                    f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}"
+                )
+            order_fragment = VALID_SORT_ORDERS[ob]
+        else:
+            order_fragment = "priority DESC, created_at ASC"
+        rows = kanban_backend.make_pg_backend(conn).list_tasks_full(
+            assignee=_canonical_assignee(assignee) if assignee is not None else None,
+            status=status,
+            tenant=tenant,
+            session_id=session_id,
+            workflow_template_id=workflow_template_id,
+            current_step_key=current_step_key,
+            include_archived=include_archived,
+            limit=limit,
+            order_fragment=order_fragment,
+        )
+        return [Task.from_row(r) for r in rows]
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
@@ -4287,6 +4525,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).assign_task(task_id, profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -4318,6 +4559,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # ---------------------------------------------------------------------------
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).link_tasks(parent_id, child_id)
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -4394,6 +4638,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unlink_tasks(parent_id, child_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -4456,6 +4703,9 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).add_comment_full(task_id, author, body)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -4472,6 +4722,19 @@ def add_comment(
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_comments_full(task_id)
+        return [
+            Comment(
+                id=r["id"],
+                task_id=r["task_id"],
+                author=r["author"],
+                body=r["body"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
@@ -4653,6 +4916,18 @@ def add_attachment(
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_attachments_full(task_id)
+        return [
+            Attachment(
+                id=r["id"], task_id=r["task_id"], filename=r["filename"],
+                stored_path=r["stored_path"], content_type=r["content_type"],
+                size=r["size"] or 0, uploaded_by=r["uploaded_by"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
     rows = conn.execute(
         "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -4673,6 +4948,17 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
 
 
 def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        r = kanban_backend.make_pg_backend(conn).get_attachment_full(attachment_id)
+        if r is None:
+            return None
+        return Attachment(
+            id=r["id"], task_id=r["task_id"], filename=r["filename"],
+            stored_path=r["stored_path"], content_type=r["content_type"],
+            size=r["size"] or 0, uploaded_by=r["uploaded_by"],
+            created_at=r["created_at"],
+        )
     r = conn.execute(
         "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
     ).fetchone()
@@ -4715,6 +5001,26 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_events_full(task_id)
+        out = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append(
+                Event(
+                    id=r["id"],
+                    task_id=r["task_id"],
+                    kind=r["kind"],
+                    payload=payload,
+                    created_at=r["created_at"],
+                    run_id=(int(r["run_id"]) if r.get("run_id") is not None else None),
+                )
+            )
+        return out
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -4988,6 +5294,14 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
     """
+    # B1.1 Postgres-Routing (inert bei backend=sqlite): ein psycopg-``conn``
+    # (nur von den migrierten Call-Sites nach Cutover übergeben) wird an das
+    # faithful PG-Äquivalent delegiert; ein sqlite3.Connection kann NIE nach PG
+    # routen (fail-closed). Siehe HANDOFF-PORT.md D4.
+    if not isinstance(conn, sqlite3.Connection):
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).recompute_ready(
+            failure_limit=failure_limit)
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
@@ -5120,6 +5434,9 @@ def get_spawn_rejection_reason(
     call sites disagree: family roots never run and unfinished parents gate a
     child even if a racy writer marked it ready.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).get_spawn_rejection_reason(task_id)
     row = conn.execute(
         "SELECT family_root_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -5166,6 +5483,12 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        # PG-Pfad liefert einen Row-dict (Reads sind dict-basiert) statt Task —
+        # die Konsumenten-Wellen (watchers/dashboard) greifen per Key zu. D4.
+        return kanban_backend.make_pg_backend(conn).claim_task(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5299,6 +5622,10 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).claim_review_task(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5372,6 +5699,10 @@ def heartbeat_claim(
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).heartbeat_claim(
+            task_id, ttl_seconds=ttl_seconds, claimer=claimer)
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
@@ -5421,6 +5752,10 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).release_stale_claims(
+            signal_fn=signal_fn)
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5555,6 +5890,10 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).reclaim_task(
+            task_id, reason=reason, signal_fn=signal_fn)
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -5625,6 +5964,11 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).reassign_task_full(
+            task_id, _canonical_assignee(profile),
+            reclaim_first=reclaim_first, reason=reason)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6185,6 +6529,13 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: created_cards-/done-Evidence-Verifikation, Artefakt-Persistenz,
+        # Prose-Scan, workspace-cleanup, Lifecycle-Hook laufen NICHT im PG-DB-Kern.
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).complete_task_full(
+            task_id, result=result, summary=summary, metadata=metadata,
+            expected_run_id=expected_run_id)
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -7123,6 +7474,10 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).edit_completed_task_result(
+            task_id, result=result, summary=summary, metadata=metadata)
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -7216,6 +7571,12 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: Review-Repo-Routing (resolve_task_repo_profiles) via
+        # reviewer_resolver; F43/F56-dependency-owner-fold-Zweige nicht im Kern.
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).block_task_full(
+            task_id, reason=reason, kind=kind, expected_run_id=expected_run_id)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -8166,6 +8527,10 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).promote_task(
+            task_id, actor=actor, reason=reason, force=force, dry_run=dry_run)
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -8580,6 +8945,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unblock_task(task_id)
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -8661,6 +9029,11 @@ def specify_triage_task(
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).specify_triage_task(
+            task_id, title=title, body=body,
+            assignee=_canonical_assignee(assignee), author=author)
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -8779,6 +9152,13 @@ def decompose_triage_task(
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        # D5-Grenze: Repo→Profil-Routing der Kind-assignees + Routing-Preflight-Park
+        # laufen nicht im PG-Kern (Config-Routing).
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).decompose_triage_task(
+            task_id, root_assignee=_canonical_assignee(root_assignee),
+            children=children, author=author, auto_promote=auto_promote)
     if not children:
         return None
     if root_assignee is not None:
@@ -9105,6 +9485,9 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).archive_task(task_id)
     # F50: never archive a legit blocked owner-Zielfrage/decision card. Such a
     # card RESTS in ``blocked`` awaiting the owner's GO — archiving it (e.g. a
     # "triage resolution" that self-decides the Zielentscheidung and dissolves
@@ -9788,6 +10171,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_workspace_path(task_id, path)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
@@ -9798,6 +10184,9 @@ def set_workspace_path(
 def set_workspace_kind(
     conn: sqlite3.Connection, task_id: str, kind: str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_workspace_kind(task_id, kind)
     if kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -9813,6 +10202,9 @@ def set_workspace_kind(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).set_branch_name(task_id, branch_name)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
@@ -9834,6 +10226,10 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).schedule_task(
+            task_id, reason=reason, expected_run_id=expected_run_id)
     with write_txn(conn):
         # F55: an owner/human DECISION card must rest in ``blocked@till`` (the
         # Beobachter's ``blocked_zielfrage`` bucket), NEVER in ``scheduled``.
@@ -10302,6 +10698,10 @@ def heartbeat_worker(
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).heartbeat_worker(
+            task_id, note=note, expected_run_id=expected_run_id)
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
@@ -12367,11 +12767,17 @@ def resolve_task_repository_profile(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[RepositoryProfile]:
     """Resolve a card's repo profile, inheriting its parent/root declaration."""
-    row = conn.execute(
-        "SELECT title, body, tenant, repository, parent_id, initiative_id "
-        "FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
+    _pg = not isinstance(conn, sqlite3.Connection)  # B1.1 PG-Routing (inert @ sqlite)
+    if _pg:
+        import kanban_backend
+        _be = kanban_backend.make_pg_backend(conn)
+        row = _be.get_task_full(task_id)
+    else:
+        row = conn.execute(
+            "SELECT title, body, tenant, repository, parent_id, initiative_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
     if not row:
         return None
     profile = _repository_profile_from_name(row["repository"])
@@ -12382,9 +12788,12 @@ def resolve_task_repository_profile(
     for rel in (row["parent_id"], row["initiative_id"]):
         if rel and rel not in seen_rel and rel != task_id:
             seen_rel.add(rel)
-            parent = conn.execute(
-                "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
-            ).fetchone()
+            parent = (
+                _be.get_task_full(rel) if _pg
+                else conn.execute(
+                    "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
+                ).fetchone()
+            )
             if parent:
                 profile = _repository_profile_from_name(parent["repository"])
                 if profile is not None:
@@ -12741,6 +13150,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+def active_work_child_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Anzahl nicht-archivierter ``work``-Kinder (parent_id ODER family_root_id)
+    außer der Karte selbst. Von den Worker-Tools (complete/block) genutzt, um
+    eine branch-lose Repo-Karte ohne Build-Kinder zu erkennen. Eigener
+    geguardeter Read, damit der Tool-Handler backend-agnostisch bleibt
+    (ersetzt vormals inline eingebettetes rohes SQL)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).active_work_child_count(task_id)
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE id != ? "
+        "AND child_role = 'work' AND status != 'archived' "
+        "AND (parent_id = ? OR family_root_id = ?)",
+        (task_id, task_id, task_id),
+    ).fetchone()[0])
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -12760,6 +13186,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "AND claim_lock IS NULL"
     ).fetchall()
+    if not isinstance(conn, sqlite3.Connection):  # B1.1: psycopg liefert Tupel
+        rows = [{"id": r[0], "assignee": r[1]} for r in rows]
     candidates = [
         row for row in rows
         if get_spawn_rejection_reason(conn, row["id"]) is None
@@ -12800,6 +13228,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    if not isinstance(conn, sqlite3.Connection):  # B1.1: psycopg liefert Tupel
+        rows = [{"assignee": r[0]} for r in rows]
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
@@ -14975,11 +15405,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-        (task_id,),
-    ).fetchall()
-    parent_ids = [r["parent_id"] for r in parent_rows]
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        parent_ids = kanban_backend.make_pg_backend(conn).parent_ids(task_id)
+    else:
+        parent_rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+        parent_ids = [r["parent_id"] for r in parent_rows]
 
     if parent_ids:
         wrote_header = False
@@ -15036,14 +15470,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
-        role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
-            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-            "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
-        ).fetchall()
+        if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+            import kanban_backend
+            role_rows = kanban_backend.make_pg_backend(conn).role_history(
+                task.assignee, task_id, limit=5)
+        else:
+            role_rows = conn.execute(
+                "SELECT t.id, t.title, r.summary, r.ended_at "
+                "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+                "WHERE r.profile = ? AND r.task_id != ? "
+                "  AND r.outcome = 'completed' "
+                "ORDER BY r.ended_at DESC LIMIT 5",
+                (task.assignee, task_id),
+            ).fetchall()
         if role_rows:
             lines.append(f"## Recent work by @{task.assignee}")
             for row in role_rows:
@@ -15194,6 +15633,11 @@ def add_notify_sub(
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).add_notify_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=user_id, notifier_profile=notifier_profile)
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
@@ -15221,6 +15665,9 @@ def add_notify_sub(
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).list_notify_subs(task_id)
     if task_id is not None:
         rows = conn.execute(
             "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
@@ -15238,6 +15685,10 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).remove_notify_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id, thread_id=thread_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
@@ -15262,6 +15713,11 @@ def unseen_events_for_sub(
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).unseen_events_for_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, kinds=kinds)
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
         "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -15319,6 +15775,11 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).claim_unseen_events_for_sub(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, kinds=kinds)
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
@@ -15356,6 +15817,11 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).advance_notify_cursor(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, new_cursor=new_cursor)
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
@@ -15380,6 +15846,11 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).rewind_notify_cursor(
+            task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
@@ -15609,6 +16080,12 @@ def list_runs(
     if state_type is not None:
         if state_type not in ("status", "outcome"):
             raise ValueError("state_type must be 'status' or 'outcome'")
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).list_runs_full(
+            task_id, include_active=include_active,
+            state_type=state_type, state_name=state_name)
+        return [Run.from_row(r) for r in rows]
     q = "SELECT * FROM task_runs WHERE task_id = ?"
     params: list[Any] = [task_id]
     if not include_active:
@@ -15630,6 +16107,10 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        row = kanban_backend.make_pg_backend(conn).latest_run_full(task_id)
+        return Run.from_row(row) if row else None
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? "
         "ORDER BY started_at DESC, id DESC LIMIT 1",
@@ -15651,6 +16132,9 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     Picks the most recent run by ``ended_at`` (falling back to ``id``
     for ties or unfinished rows). Returns None if no run has a summary.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).latest_summary(task_id)
     row = conn.execute(
         "SELECT summary FROM task_runs "
         "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
@@ -15677,6 +16161,9 @@ def latest_summaries(
     ids = list(task_ids)
     if not ids:
         return {}
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).latest_summaries(ids)
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"""
@@ -15713,6 +16200,9 @@ def go_gated_task_ids(conn: sqlite3.Connection) -> set[str]:
     ``_dispatch_once_locked``). A card stops counting as GO-gated as
     soon as it completes or a human re-assigns it.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).go_gated_task_ids()
     rows = conn.execute(
         "SELECT DISTINCT e.task_id FROM task_events e "
         "JOIN tasks t ON t.id = e.task_id "
@@ -15729,6 +16219,10 @@ def initiative_members(conn: sqlite3.Connection, initiative_id: str) -> list[Tas
     by ``task_links``. Dependency edges between members therefore cannot
     change what belongs to an initiative.
     """
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).initiative_members_full(initiative_id)
+        return [Task.from_row(r) for r in rows]
     rows = conn.execute(
         "SELECT * FROM tasks WHERE initiative_id = ? AND id != ? "
         "ORDER BY created_at ASC, id ASC",
@@ -15767,20 +16261,24 @@ def initiative_rollups(
     deliberately never consulted — dependencies must not influence the
     focus view.
     """
-    where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
-    params: list = []
-    if tenant:
-        # Filter over the ROOT card's tenant: the initiative belongs to its
-        # root, and legacy member rows may predate tenant inheritance.
-        where += (
-            " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
-        )
-        params.append(tenant)
-    rows = conn.execute(
-        f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
-        "ORDER BY created_at ASC, id ASC",
-        params,
-    ).fetchall()
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        rows = kanban_backend.make_pg_backend(conn).initiative_rollup_rows(tenant)
+    else:
+        where = "WHERE initiative_id IS NOT NULL AND status != 'archived'"
+        params: list = []
+        if tenant:
+            # Filter over the ROOT card's tenant: the initiative belongs to its
+            # root, and legacy member rows may predate tenant inheritance.
+            where += (
+                " AND initiative_id IN (SELECT id FROM tasks WHERE tenant = ?)"
+            )
+            params.append(tenant)
+        rows = conn.execute(
+            f"SELECT id, title, assignee, status, initiative_id FROM tasks {where} "
+            "ORDER BY created_at ASC, id ASC",
+            params,
+        ).fetchall()
     go_ids = go_gated_task_ids(conn)
 
     rollups: dict[str, dict] = {}

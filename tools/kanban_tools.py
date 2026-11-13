@@ -1671,14 +1671,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # process (re-imported per spawn), so it survives the gateway-restart
             # gap that defeats dispatcher-side fixes (cf. F19).
             if task and not (task.branch_name or "").strip():
-                ze_comments = [
-                    (r[0] or "")
-                    for r in conn.execute(
-                        "SELECT body FROM task_comments WHERE task_id = ? "
-                        "ORDER BY created_at",
-                        (tid,),
-                    ).fetchall()
-                ]
+                ze_comments = [(c.body or "") for c in kb.list_comments(conn, tid)]
                 if _card_is_zielentscheidung(
                     task.title, task.body or "", task.category, ze_comments
                 ):
@@ -1742,14 +1735,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # Worker-side (re-imported per spawn), live on the next spawn without a
             # gateway restart (cf. F19).
             if task and (task.branch_name or "").strip():
-                _ze_comments = [
-                    (r[0] or "")
-                    for r in conn.execute(
-                        "SELECT body FROM task_comments WHERE task_id = ? "
-                        "ORDER BY created_at",
-                        (tid,),
-                    ).fetchall()
-                ]
+                _ze_comments = [(c.body or "") for c in kb.list_comments(conn, tid)]
                 if _card_is_zielentscheidung(
                     task.title, task.body or "", task.category, _ze_comments
                 ):
@@ -1901,12 +1887,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 and (task.repository or "").strip()
                 and not (task.branch_name or "").strip()
             ):
-                work_children = conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE id != ? "
-                    "AND child_role = 'work' AND status != 'archived' "
-                    "AND (parent_id = ? OR family_root_id = ?)",
-                    (tid, tid, tid),
-                ).fetchone()[0]
+                work_children = kb.active_work_child_count(conn, tid)
                 if not work_children:
                     return tool_error(
                         "the orchestrator must not complete a repo work card — "
@@ -1957,14 +1938,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 and (task.repository or task.tenant or "").strip()
                 and (task.branch_name or "").strip()
             ):
-                comment_bodies = [
-                    (r[0] or "")
-                    for r in conn.execute(
-                        "SELECT body FROM task_comments WHERE task_id = ? "
-                        "ORDER BY created_at",
-                        (tid,),
-                    ).fetchall()
-                ]
+                comment_bodies = [(c.body or "") for c in kb.list_comments(conn, tid)]
                 if _card_is_build_gated(task.title, task.body or "", comment_bodies):
                     repo_key = (
                         (task.repository or task.tenant or "").strip().lower()
@@ -2050,14 +2024,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 and (task.repository or task.tenant or "").strip()
                 and (task.branch_name or "").strip()
             ):
-                noop_comments = [
-                    (r[0] or "")
-                    for r in conn.execute(
-                        "SELECT body FROM task_comments WHERE task_id = ? "
-                        "ORDER BY created_at",
-                        (tid,),
-                    ).fetchall()
-                ]
+                noop_comments = [(c.body or "") for c in kb.list_comments(conn, tid)]
                 if _completion_is_premise_noop(
                     noop_comments, summary or "", result or "", metadata
                 ):
@@ -2499,12 +2466,7 @@ def _handle_block(args: dict, **kw) -> str:
             and (task.repository or "").strip()
             and not (task.branch_name or "").strip()
         ):
-            work_children = conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE id != ? "
-                "AND child_role = 'work' AND status != 'archived' "
-                "AND (parent_id = ? OR family_root_id = ?)",
-                (tid, tid, tid),
-            ).fetchone()[0]
+            work_children = kb.active_work_child_count(conn, tid)
             if not work_children:
                 conn.close()
                 return tool_error(
@@ -3094,11 +3056,9 @@ def _handle_handoff(args: dict, **kw) -> str:
                     f"completes the card."
                 )
             if ws_kind is None and to_profile and to_profile.endswith("-coder"):
-                row = conn.execute(
-                    "SELECT tenant, repository FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                tenant = (row[0] if row else None) or ""
-                repo = (row[1] if row and len(row) > 1 else None) or ""
+                _t = kb.get_task(conn, tid)  # geguardet → sqlite|PG (B1.1)
+                tenant = (_t.tenant if _t else None) or ""
+                repo = (_t.repository if _t else None) or ""
                 # A declared repository beats the tenant default for the
                 # checkout: its repo-specific workdir has the remote the
                 # profile's base_ref/push_target name; the tenant checkout may
