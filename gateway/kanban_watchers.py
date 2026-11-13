@@ -113,9 +113,77 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+# --- Globale Infra-Crash-Bremse (2026-11-13) ---------------------------------
+# Vorfall 11.11.: bei ungültiger Codex-Anmeldung startete der Verteiler in 2 Tagen
+# 2.457 Worker, die ALLE sofort crashten. Diese Bremse erkennt reihenweise
+# Worker-CRASHES (Prozess-Tod = Infra: Anmeldung/Kontingent/Provider, NICHT
+# gave_up/blocked = Aufgaben-Inhalt) ohne jede Fertigstellung und hält nach
+# wenigen Fehlstarts in Folge an: setzt denselben <db>.halt-Flag wie von Hand +
+# Telegram mit Grund im Klartext. Kein Auto-Restart (Flag bleibt, Hand-Freigabe).
+_INFRA_CRASH_STREAK: dict = {}
+
+
+def _halt_flag_for(_kb, board):
+    p = _kb.kanban_db_path(board)
+    return p.with_name(p.name + ".halt")
+
+
+def _last_crash_reason(conn, since_ts):
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT t.last_failure_error FROM task_events e JOIN tasks t ON t.id=e.task_id "
+            "WHERE e.kind='crashed' AND e.created_at>=%s AND t.last_failure_error IS NOT NULL "
+            "ORDER BY e.id DESC LIMIT 1", (since_ts,))
+        row = cur.fetchone()
+        return (row[0] if row else None) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _infra_crash_guard(_kb, conn, board, *, now, window_s=180, crash_threshold=3,
+                       streak_limit=3, alert_fn=None):
+    """True + setzt Halt-Flag, wenn Worker reihenweise crashen ohne Fertigstellung.
+    gave_up/blocked (Aufgaben-Inhalt) zählen NICHT; eine Einzel-Crash-Karte wird
+    vom per-Task-Breaker auto-geblockt → Streak reißt ab. Nur ein anhaltendes
+    Crash-über-Karten-Muster (Infra) löst aus."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT kind, count(*) FROM task_events WHERE created_at>=%s "
+            "AND kind IN ('crashed','completed') GROUP BY kind", (now - window_s,))
+        counts = {k: n for k, n in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        return False
+    crashed, completed = counts.get("crashed", 0), counts.get("completed", 0)
+    bad = crashed >= crash_threshold and completed == 0
+    streak = (_INFRA_CRASH_STREAK.get(board, 0) + 1) if bad else 0
+    _INFRA_CRASH_STREAK[board] = streak
+    if streak < streak_limit:
+        return False
+    halt = _halt_flag_for(_kb, board)
+    reason = _last_crash_reason(conn, now - window_s) \
+        or "wiederholte Worker-Crashes beim Start (Infra: Anmeldung/Kontingent/Provider)"
+    try:
+        halt.touch()
+    except Exception:  # noqa: BLE001
+        pass
+    if alert_fn:
+        try:
+            alert_fn(
+                f"🛑 Verteiler ANGEHALTEN (Board {board}): Worker crashen reihenweise "
+                f"beim Start ({crashed} Crashes / 0 fertig). Grund: {reason}. "
+                f"Kein Auto-Restart — Freigabe nur von Hand: {halt} löschen.")
+        except Exception:  # noqa: BLE001
+            pass
+    _INFRA_CRASH_STREAK[board] = 0
+    return True
+
+
 def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
                       spawn_fn=None, max_in_progress=None,
-                      max_in_progress_per_profile=None, stale_timeout_seconds=0):
+                      max_in_progress_per_profile=None, stale_timeout_seconds=0,
+                      alert_fn=None, _now=None):
     """B1.1 PG-Dispatcher-Tick (D4). Rewired Call-Site für den Postgres-Modus:
     der strukturelle DB-Kern läuft über ``PgBackend.dispatch_once`` (Session-
     Advisory-Lock statt Datei-flock). Worker-*Spawn* und OS-Kill sind injizierte
@@ -131,6 +199,12 @@ def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
     ``max_spawn``). Inert bis Cutover (Default sqlite).
     """
     import kanban_backend as _kbk
+    import time as _time
+
+    # Halt-Flag (von Hand ODER von der Infra-Bremse gesetzt) stoppt den Tick —
+    # kein Auto-Restart, keine neuen Spawns, bis das Flag von Hand gelöscht wird.
+    if _halt_flag_for(_kb, slug).exists():
+        return _kb.DispatchResult(skipped_locked=True)
 
     if spawn_fn is None:
         def spawn_fn(task_dict):
@@ -149,6 +223,10 @@ def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
     )
     if d.get("locked_out"):
         return _kb.DispatchResult(skipped_locked=True)
+    # Globale Infra-Crash-Bremse: nach dem Tick prüfen, ob Worker reihenweise
+    # crashen (Infra) — wenn ja, Halt-Flag + Alert, nächster Tick skippt oben.
+    _infra_crash_guard(_kb, conn, slug, now=(_now or int(_time.time())),
+                       alert_fn=alert_fn)
     return _kb.DispatchResult(
         reclaimed=d.get("reclaimed", 0),
         promoted=d.get("promoted", 0),
