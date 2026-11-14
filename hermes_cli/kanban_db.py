@@ -2012,6 +2012,49 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+# ``PRAGMA integrity_check`` problem lines whose damage is confined to a
+# secondary index. In every one of these cases the table b-trees are intact,
+# so ``REINDEX`` rebuilds the indexes from the row data with ZERO data loss.
+# Anything NOT matched here (page/row/freelist/table damage, malformed header)
+# is NOT reindex-recoverable and must stay fail-closed.
+_REINDEXABLE_PROBLEM_RE = re.compile(
+    r"wrong\s+#\s+of\s+entries\s+in\s+index"
+    r"|row\s+\d+\s+missing\s+from\s+index"
+    r"|non-unique\s+entry\s+in\s+index"
+    r"|(?:corrupt|malformed)\s+index\b",
+    re.IGNORECASE,
+)
+
+
+def _try_reindex_recovery(resolved: Path, problems: list[str]) -> bool:
+    """Attempt a lossless ``REINDEX`` recovery for index-only corruption.
+
+    ``PRAGMA integrity_check`` sometimes reports damage limited to a secondary
+    index (``wrong # of entries in index …``, ``row N missing from index …``,
+    ``non-unique entry in index …``). The table rows are intact in that case,
+    so ``REINDEX`` rebuilds every index from the table b-trees with no data
+    loss — far safer than quarantining the whole board and stranding every
+    card (2026-11: one damaged ``idx_events_task`` darkened the entire Fabrik
+    and the Beobachter reported every card as ``rot-weg``).
+
+    Fires ONLY when *every* reported problem is index-structural; any
+    table/page/freelist damage falls through to the fail-closed quarantine.
+    Returns ``True`` iff the DB verifies ``ok`` afterwards.
+    """
+    if not problems or not all(_REINDEXABLE_PROBLEM_RE.search(p) for p in problems):
+        return False
+    try:
+        repair = _sqlite_connect(resolved)
+        try:
+            repair.execute("REINDEX")
+            row = repair.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            repair.close()
+    except sqlite3.DatabaseError:
+        return False
+    return bool(row) and (row[0] or "").lower() == "ok"
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -2051,20 +2094,37 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
+    problems: list[str] = []
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            rows = probe.execute("PRAGMA integrity_check").fetchall()
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        problems = [r[0] for r in rows if r and (r[0] or "").lower() != "ok"]
+        if problems:
+            reason = f"integrity_check returned {problems[0]!r}"
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        return
+    # Self-heal before failing closed: index-only corruption is losslessly
+    # recoverable via REINDEX (rebuilds indexes from intact rows). A single bad
+    # index must not strand the whole board. On success we also lift any
+    # board-scoped write-halt flag so the dispatcher + serialised writers
+    # resume instead of standing down forever on an already-repaired DB.
+    if _try_reindex_recovery(resolved, problems):
+        _log.warning(
+            "Kanban DB %s had index-only corruption (%s); REINDEX recovered it "
+            "losslessly.", resolved, reason,
+        )
+        try:
+            dispatch_halt_path(resolved).unlink(missing_ok=True)
+        except OSError:
+            pass
         return
     # Fail-closed: drop the board-scoped write-halt flag so every serialised
     # writer (CLI, voicera-api bridge, in-process worker tools) AND the gateway
