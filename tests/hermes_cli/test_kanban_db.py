@@ -4922,6 +4922,61 @@ def test_corrupt_connect_sets_write_halt_flag(tmp_path):
     assert kb.dispatch_halt_path(db_path).exists()
 
 
+# --- Write-halt flag: auto vs. manual (2026-11-14) ---------------------------
+# The integrity self-heal must never clear an operator's hand-set <db>.halt.
+
+def test_is_auto_halt_distinguishes_auto_from_manual(tmp_path):
+    halt = kb.dispatch_halt_path(tmp_path / "kanban.db")
+    assert not kb._is_auto_halt(halt)          # absent
+    halt.touch()
+    assert not kb._is_auto_halt(halt)          # empty == hand-set == manual
+    halt.unlink()
+    kb._set_auto_halt(halt, reason="corruption")
+    assert kb._is_auto_halt(halt)              # marker present == auto
+
+
+def test_set_auto_halt_does_not_clobber_manual(tmp_path):
+    halt = kb.dispatch_halt_path(tmp_path / "kanban.db")
+    halt.touch()                               # operator set it by hand (empty)
+    kb._set_auto_halt(halt, reason="x")
+    assert halt.read_text() == ""              # left untouched
+    assert not kb._is_auto_halt(halt)
+
+
+def test_manual_halt_survives_reindex_self_heal(tmp_path, monkeypatch):
+    db = tmp_path / "kanban.db"
+    _write_corrupt_db(db)
+    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+    halt = kb.dispatch_halt_path(db)
+    halt.touch()                               # BY HAND
+    monkeypatch.setattr(kb, "_try_reindex_recovery", lambda resolved, problems: True)
+    kb._guard_existing_db_is_healthy(db)       # recovery branch, no raise
+    assert halt.exists(), "manual write-halt must survive automatic REINDEX recovery"
+
+
+def test_auto_halt_lifted_on_reindex_self_heal(tmp_path, monkeypatch):
+    db = tmp_path / "kanban.db"
+    _write_corrupt_db(db)
+    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+    halt = kb.dispatch_halt_path(db)
+    kb._set_auto_halt(halt, reason="auto")     # set by the self-heal system
+    assert kb._is_auto_halt(halt)
+    monkeypatch.setattr(kb, "_try_reindex_recovery", lambda resolved, problems: True)
+    kb._guard_existing_db_is_healthy(db)
+    assert not halt.exists(), "auto write-halt should lift after successful recovery"
+
+
+def test_fail_closed_halt_is_auto_marked(tmp_path):
+    db = tmp_path / "kanban.db"
+    _write_corrupt_db(db)                       # unrecoverable -> fail closed
+    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+    halt = kb.dispatch_halt_path(db)
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb._guard_existing_db_is_healthy(db)
+    assert halt.exists() and kb._is_auto_halt(halt), \
+        "fail-closed halt must carry the auto marker so a later recovery can lift it"
+
+
 def test_corrupt_backup_new_one_only_after_throttle_window(tmp_path):
     """Once the newest backup is older than the 6h window, a changed corrupt
     file is allowed exactly one fresh backup."""

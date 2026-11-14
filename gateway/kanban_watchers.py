@@ -208,8 +208,16 @@ def _pg_dispatch_tick(_kb, conn, slug, *, max_spawn=None, failure_limit=3,
 
     if spawn_fn is None:
         def spawn_fn(task_dict):
-            t = _kb.Task.from_row(task_dict)
-            ws = task_dict.get("workspace_path") or ""
+            # B1.1: PgBackend.claim_task returns a PARTIAL dict (get_task, no
+            # body) — Task.from_row() on it raised KeyError('body') and every
+            # spawn fell through to spawn_failed. Re-fetch the FULL task via the
+            # backend-guarded get_task (works on PG and sqlite) so the worker
+            # launch gets a complete Task.
+            tid = task_dict["id"] if isinstance(task_dict, dict) else task_dict.id
+            t = _kb.get_task(conn, tid)
+            if t is None:
+                return None
+            ws = t.workspace_path or ""
             return _kb._default_spawn(t, ws, board=slug)
 
     d = _kbk.make_pg_backend(conn).dispatch_once(

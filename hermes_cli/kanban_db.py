@@ -1685,6 +1685,39 @@ def dispatch_halt_active(db_path) -> bool:
         return False
 
 
+# A write-halt flag set AUTOMATICALLY by the integrity self-heal carries this
+# marker as its first line. A hand-set flag (operator ``touch <db>.halt``) is
+# empty / lacks the marker and is treated as MANUAL: automatic recovery must
+# NEVER remove it (2026-11-14 — a REINDEX self-heal silently cleared a
+# hand-set halt and the dispatcher resumed against an operator's explicit stop).
+_HALT_AUTO_MARK = "hermes-auto-halt: set by kanban integrity self-heal"
+
+
+def _is_auto_halt(halt_path: Path) -> bool:
+    """True iff *halt_path* was set automatically (carries ``_HALT_AUTO_MARK``).
+
+    Empty/absent or any other content => MANUAL => never auto-lifted.
+    """
+    try:
+        if not halt_path.exists():
+            return False
+        head = halt_path.read_text(encoding="utf-8", errors="replace")
+        return head.startswith(_HALT_AUTO_MARK)
+    except OSError:
+        return False
+
+
+def _set_auto_halt(halt_path: Path, reason: str = "") -> None:
+    """Set the write-halt flag with the auto marker — but NEVER clobber an
+    existing (possibly hand-set) flag."""
+    try:
+        if halt_path.exists():
+            return
+        halt_path.write_text(f"{_HALT_AUTO_MARK}\n{reason}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def write_serialize_lock(db_path: Path, timeout: float = 10.0):
     """Blocking cross-process single-writer lock for EXTERNAL writers.
@@ -2121,10 +2154,18 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             "Kanban DB %s had index-only corruption (%s); REINDEX recovered it "
             "losslessly.", resolved, reason,
         )
-        try:
-            dispatch_halt_path(resolved).unlink(missing_ok=True)
-        except OSError:
-            pass
+        halt = dispatch_halt_path(resolved)
+        if _is_auto_halt(halt):
+            try:
+                halt.unlink(missing_ok=True)
+            except OSError:
+                pass
+        elif halt.exists():
+            _log.warning(
+                "Kanban DB %s: REINDEX recovered it, but the write-halt flag %s "
+                "was set BY HAND (no auto marker) — leaving it in place. Lift it "
+                "manually after verifying.", resolved, halt,
+            )
         return
     # Fail-closed: drop the board-scoped write-halt flag so every serialised
     # writer (CLI, voicera-api bridge, in-process worker tools) AND the gateway
@@ -2132,12 +2173,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     # it on every tick. The dispatcher skips ticks while this flag is present;
     # recovery removes it. (2026-11-11: without this the gateway re-probed a
     # mutating corrupt DB every ~30s and filled the disk with backups.)
-    try:
-        halt = dispatch_halt_path(resolved)
-        if not halt.exists():
-            halt.touch()
-    except OSError:
-        pass
+    _set_auto_halt(dispatch_halt_path(resolved),
+                   reason=f"integrity self-heal failed closed: {reason}")
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
