@@ -1867,39 +1867,24 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     config=diag_config,
                 )
             }
+            tasks_by_id = {args.task: task}
         else:
-            # Fleet mode: pull all non-archived tasks + their events/runs.
-            rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
-            ).fetchall())
-            ids = [r["id"] for r in rows]
-            if not ids:
-                diags_by_task = {}
-            else:
-                placeholders = ",".join(["?"] * len(ids))
-                ev_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    ev_by.setdefault(row["task_id"], []).append(row)
-                run_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    run_by.setdefault(row["task_id"], []).append(row)
-                diags_by_task = {}
-                for r in rows:
-                    tid = r["id"]
-                    dl = kd.compute_task_diagnostics(
-                        r,
-                        ev_by.get(tid, []),
-                        run_by.get(tid, []),
-                        config=diag_config,
-                    )
-                    if dl:
-                        diags_by_task[tid] = dl
+            # Fleet mode: all non-archived tasks + their events/runs, via the
+            # backend-guarded helpers (list_tasks/list_events/list_runs) so the
+            # path works under psycopg too — no inline '?'/row-shape SQL that
+            # breaks on a PG connection (B1.1).
+            fleet = kb.list_tasks(conn, include_archived=False)
+            tasks_by_id = {t.id: t for t in fleet}
+            diags_by_task = {}
+            for t in fleet:
+                dl = kd.compute_task_diagnostics(
+                    t,
+                    kb.list_events(conn, t.id),
+                    kb.list_runs(conn, t.id),
+                    config=diag_config,
+                )
+                if dl:
+                    diags_by_task[t.id] = dl
 
         # Severity filter.
         sev = getattr(args, "severity", None)
@@ -1911,17 +1896,16 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 else:
                     del diags_by_task[tid]
 
-        # Map task_id → title/status/assignee for the table output.
+        # Map task_id → title/status/assignee for the table output, reusing the
+        # Task objects already fetched above (no second DB round-trip, no inline
+        # '?'/row-shape SQL that would break under psycopg — B1.1).
         meta: dict[str, dict] = {}
-        if diags_by_task:
-            placeholders = ",".join(["?"] * len(diags_by_task))
-            for r in conn.execute(
-                f"SELECT id, title, status, assignee FROM tasks WHERE id IN ({placeholders})",
-                tuple(diags_by_task.keys()),
-            ):
-                meta[r["id"]] = {
-                    "title": r["title"], "status": r["status"],
-                    "assignee": r["assignee"],
+        for tid in diags_by_task:
+            t = tasks_by_id.get(tid)
+            if t is not None:
+                meta[tid] = {
+                    "title": t.title, "status": t.status,
+                    "assignee": t.assignee,
                 }
 
     if getattr(args, "json", False):

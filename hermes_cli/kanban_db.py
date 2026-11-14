@@ -4680,6 +4680,9 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).parent_ids(task_id)
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
         (task_id,),
@@ -4688,6 +4691,9 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 
 
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    if not isinstance(conn, sqlite3.Connection):  # B1.1 PG-Routing (inert @ sqlite)
+        import kanban_backend
+        return kanban_backend.make_pg_backend(conn).child_ids(task_id)
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
         (task_id,),
@@ -15557,12 +15563,15 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
     """
+    is_pg = not isinstance(conn, sqlite3.Connection)  # B1.1: psycopg liefert Tupel
+
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
         "WHERE status != 'archived' GROUP BY status"
     ):
-        by_status[row["status"]] = int(row["n"])
+        status = row[0] if is_pg else row["status"]
+        by_status[status] = int(row[1] if is_pg else row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
@@ -15570,16 +15579,16 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "WHERE status != 'archived' AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
-        by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+        assignee = row[0] if is_pg else row["assignee"]
+        status = row[1] if is_pg else row["status"]
+        by_assignee.setdefault(assignee, {})[status] = int(row[2] if is_pg else row["n"])
 
     oldest_row = conn.execute(
         "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
     ).fetchone()
     now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
+    oldest_ts = (oldest_row[0] if is_pg else oldest_row["ts"]) if oldest_row else None
+    oldest_ready_age = (now - int(oldest_ts)) if oldest_ts is not None else None
 
     return {
         "by_status": by_status,
@@ -16050,6 +16059,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
       the whole board.
     """
     on_disk = set(list_profiles_on_disk())
+    is_pg = not isinstance(conn, sqlite3.Connection)  # B1.1: psycopg liefert Tupel
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -16058,7 +16068,9 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
         "WHERE status != 'archived' AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
-        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+        assignee = row[0] if is_pg else row["assignee"]
+        status = row[1] if is_pg else row["status"]
+        counts.setdefault(assignee, {})[status] = int(row[2] if is_pg else row["n"])
 
     names = sorted(on_disk | set(counts.keys()))
     return [
