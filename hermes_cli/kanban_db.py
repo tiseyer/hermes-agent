@@ -13130,7 +13130,8 @@ def resolve_task_repo_profiles(
     must still route like its root. Falls back to the tenant default, then
     ``None``. Read-only; deterministic.
     """
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT title, body, tenant, repository, parent_id, initiative_id "
         "FROM tasks WHERE id = ?",
         (task_id,),
@@ -13142,7 +13143,8 @@ def resolve_task_repo_profiles(
     for rel in (row["parent_id"], row["initiative_id"]):
         if rel and rel not in seen_rel and rel != task_id:
             seen_rel.add(rel)
-            prow = conn.execute(
+            prow = _q(
+                conn,
                 "SELECT title, body, repository FROM tasks WHERE id = ?", (rel,),
             ).fetchone()
             if prow:
