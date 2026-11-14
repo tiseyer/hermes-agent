@@ -2158,6 +2158,52 @@ def backend_identity(board: Optional[str] = None) -> str:
         return "backend=sqlite file=?"
 
 
+def _is_pg_conn(conn) -> bool:
+    """True iff ``conn`` is a live psycopg connection (PG mode).
+
+    Positive detection (fail-closed to sqlite): a real ``sqlite3.Connection``
+    OR any non-psycopg object (e.g. a test wrapper that delegates to a sqlite
+    connection) stays on the sqlite path. Only an actual ``psycopg`` connection
+    takes the PG branch.
+    """
+    return (
+        not isinstance(conn, sqlite3.Connection)
+        and type(conn).__module__.split(".", 1)[0] == "psycopg"
+    )
+
+
+def _q(conn, sql: str, params=()):
+    """Execute a ``?``-placeholder statement on sqlite OR psycopg.
+
+    B1.1: ``connect()`` returns a psycopg connection in PG mode; psycopg uses
+    ``%s`` placeholders and returns tuples, not ``sqlite3.Row``. For the writer
+    paths that are ported one-by-one this bridges both: on sqlite it is
+    ``conn.execute(...)`` unchanged; on psycopg it translates ``?`` → ``%s`` and
+    uses a ``dict_row`` cursor so callers keep ``row["col"]`` / ``.keys()`` /
+    ``.rowcount`` / iteration. Only for internal kanban SQL (no literal ``?`` or
+    ``%`` in these statements).
+    """
+    if not _is_pg_conn(conn):
+        return conn.execute(sql, params)
+    import psycopg.rows  # noqa: PLC0415
+    cur = conn.cursor(row_factory=psycopg.rows.dict_row)
+    cur.execute(sql.replace("?", "%s"), tuple(params))
+    return cur
+
+
+def _q_insert(conn, sql: str, params=()) -> int:
+    """INSERT one row and return its integer ``id`` on both backends.
+
+    sqlite uses ``cursor.lastrowid``; psycopg has no lastrowid, so append
+    ``RETURNING id`` (every kanban table inserted through here has an ``id``).
+    """
+    if not _is_pg_conn(conn):
+        return conn.execute(sql, params).lastrowid
+    cur = conn.cursor()
+    cur.execute(sql.replace("?", "%s") + " RETURNING id", tuple(params))
+    return cur.fetchone()[0]
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -3186,6 +3232,23 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if _is_pg_conn(conn):
+        # B1.1: on a psycopg connection (autocommit=False) the transaction is
+        # implicit — a statement opens it. There is no ``BEGIN IMMEDIATE`` and
+        # no file-length/header invariant (that is a SQLite-only concern). The
+        # writer paths ported one-by-one (handoff_task/grant_go/… via ``_q``)
+        # reach this; commit on success, roll back on error.
+        try:
+            yield conn
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        else:
+            conn.commit()
+        return
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -3904,7 +3967,8 @@ def _blocked_card_has_zielfrage(
     Such a card is already in the correct human-decision bucket — the one the
     observer greens — so the manager must never pull it into ``human`` (F38).
     """
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
@@ -3912,7 +3976,8 @@ def _blocked_card_has_zielfrage(
     kind = row["block_kind"] if "block_kind" in row.keys() else None
     if kind not in _ZIELFRAGE_BLOCK_KINDS:
         return False
-    comments = conn.execute(
+    comments = _q(
+        conn,
         "SELECT body FROM task_comments WHERE task_id = ? "
         "ORDER BY created_at ASC",
         (task_id,),
@@ -3944,7 +4009,8 @@ def _is_protected_owner_decision(
     or still holds a non-technical business Zielfrage
     (:func:`_blocked_card_has_zielfrage`).
     """
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT status, category FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None or row["status"] != "blocked":
@@ -4257,7 +4323,8 @@ def plan_human_step(
         )
     vorgaenger = [a for a in dict.fromkeys(str(x).strip() for x in after) if a and a != task_id]
     with write_txn(conn):
-        row = conn.execute(
+        row = _q(
+            conn,
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None:
@@ -4269,7 +4336,8 @@ def plan_human_step(
             return "busy"
         offen = []
         for pid in vorgaenger:
-            prow = conn.execute(
+            prow = _q(
+                conn,
                 "SELECT status FROM tasks WHERE id = ?", (pid,)
             ).fetchone()
             if prow is None:
@@ -4278,12 +4346,14 @@ def plan_human_step(
                 offen.append(pid)
         if offen:
             for pid in vorgaenger:
-                exists = conn.execute(
+                exists = _q(
+                    conn,
                     "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
                     (pid, task_id),
                 ).fetchone()
                 if not exists:
-                    conn.execute(
+                    _q(
+                        conn,
                         "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
@@ -4299,7 +4369,8 @@ def plan_human_step(
                 sets.append("body = ?")
                 params.append(kurzbeschreibung)
             params.append(task_id)
-            conn.execute(
+            _q(
+                conn,
                 f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
             )
             _append_event(
@@ -4912,11 +4983,13 @@ def add_attachment(
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
+        if not _q(
+            conn,
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
+        new_id = _q_insert(
+            conn,
             "INSERT INTO task_attachments "
             "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -4936,7 +5009,7 @@ def add_attachment(
             "attached",
             {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
         )
-        return int(cur.lastrowid or 0)
+        return int(new_id or 0)
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -5011,7 +5084,7 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
-        conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
+        _q(conn, "DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
         )
@@ -5085,7 +5158,8 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    _q(
+        conn,
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
@@ -5112,13 +5186,15 @@ def _end_run(
     task that was never claimed).
     """
     now = int(time.time())
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    _q(
+        conn,
         """
         UPDATE task_runs
            SET status        = ?,
@@ -5143,14 +5219,16 @@ def _end_run(
             run_id,
         ),
     )
-    conn.execute(
+    _q(
+        conn,
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
@@ -5181,13 +5259,15 @@ def _synthesize_ended_run(
     function does NOT touch the tasks row.
     """
     now = int(time.time())
-    trow = conn.execute(
+    trow = _q(
+        conn,
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
-    cur = conn.execute(
+    new_id = _q_insert(
+        conn,
         """
         INSERT INTO task_runs (
             task_id, profile, step_key,
@@ -5204,7 +5284,7 @@ def _synthesize_ended_run(
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    return int(new_id or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -6051,7 +6131,8 @@ def handoff_task(
     if _to_norm == "orchestrator" or _to_norm.endswith("-orchestrator"):
         if _scope_recut_count(conn, task_id) >= _SCOPE_RECUT_CEILING:
             with write_txn(conn):
-                cur = conn.execute(
+                cur = _q(
+                    conn,
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
@@ -6079,7 +6160,8 @@ def handoff_task(
                         conn, task_id, outcome="blocked",
                         summary="scope-recut convergence ceiling → blocked@till",
                     )
-                conn.execute(
+                _q(
+                    conn,
                     "INSERT INTO task_comments "
                     "(task_id, author, body, created_at) "
                     "VALUES (?, ?, ?, ?)",
@@ -6121,7 +6203,8 @@ def handoff_task(
                 )
             return True
     with write_txn(conn):
-        cur_row = conn.execute(
+        cur_row = _q(
+            conn,
             "SELECT status, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6130,7 +6213,8 @@ def handoff_task(
         prev_assignee = (
             cur_row["assignee"] if "assignee" in cur_row.keys() else None
         )
-        cur = conn.execute(
+        cur = _q(
+            conn,
             """
             UPDATE tasks
                SET status        = 'ready',
@@ -6155,13 +6239,15 @@ def handoff_task(
         # kind is given — legacy handoffs (no args) are unchanged.
         wk = (workspace_kind or "").strip().lower()
         if wk in ("worktree", "scratch"):
-            conn.execute(
+            _q(
+                conn,
                 "UPDATE tasks SET workspace_kind = ? WHERE id = ?",
                 (wk, task_id),
             )
             wp = (workspace_path or "").strip()
             if wp:
-                conn.execute(
+                _q(
+                    conn,
                     "UPDATE tasks SET workspace_path = ? WHERE id = ?",
                     (wp, task_id),
                 )
@@ -6181,7 +6267,8 @@ def handoff_task(
             run_id=run_id,
         )
         if note and str(note).strip():
-            conn.execute(
+            _q(
+                conn,
                 "INSERT INTO task_comments "
                 "(task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
@@ -7326,7 +7413,8 @@ def cleanup_worktree_artifacts(
     ``worktree_artifacts_pruned`` event with the removed paths + sizes so
     every deletion is auditable on the card.
     """
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -7337,7 +7425,8 @@ def cleanup_worktree_artifacts(
         or row["status"] not in ("done", "archived")
     ):
         return []
-    running_children = conn.execute(
+    running_children = _q(
+        conn,
         "SELECT 1 FROM task_links l "
         "JOIN tasks t ON t.id = l.child_id "
         "WHERE l.parent_id = ? AND t.status = 'running' LIMIT 1",
@@ -8662,7 +8751,8 @@ def _go_event_records(
     conn: sqlite3.Connection,
     task_id: str,
 ) -> list[tuple[int, dict[str, Any]]]:
-    rows = conn.execute(
+    rows = _q(
+        conn,
         "SELECT id, payload FROM task_events "
         "WHERE task_id = ? AND kind = 'go_granted' ORDER BY id DESC",
         (task_id,),
@@ -8702,7 +8792,8 @@ def grant_go(
     archived_targets: list[str] = []
 
     with write_txn(conn):
-        task = conn.execute(
+        task = _q(
+            conn,
             "SELECT id, title, assignee, tenant, status, current_run_id, merge_group "
             "FROM tasks WHERE id = ?",
             (task_id,),
@@ -8710,7 +8801,8 @@ def grant_go(
         if task is None:
             raise ValueError(f"unknown task {task_id}")
 
-        gate_row = conn.execute(
+        gate_row = _q(
+            conn,
             "SELECT id, payload FROM task_events "
             "WHERE task_id = ? AND kind = 'go_gate_held' "
             "ORDER BY id DESC LIMIT 1",
@@ -8718,7 +8810,8 @@ def grant_go(
         ).fetchone()
         if gate_row is None:
             raise ValueError(f"task {task_id} has no held GO gate")
-        latest_control = conn.execute(
+        latest_control = _q(
+            conn,
             "SELECT id, kind FROM task_events "
             "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
             "ORDER BY id DESC LIMIT 1",
@@ -8795,7 +8888,8 @@ def grant_go(
         if normalized_action is not None:
             target_ids = normalized_action["target_ids"]
             placeholders = ",".join("?" for _ in target_ids)
-            rows = conn.execute(
+            rows = _q(
+                conn,
                 f"SELECT id, tenant, status, current_run_id FROM tasks "
                 f"WHERE id IN ({placeholders})",
                 tuple(target_ids),
@@ -8856,14 +8950,16 @@ def grant_go(
                 status="reclaimed",
                 summary="invariant recovery on GO grant",
             )
-        undone_parent = conn.execute(
+        undone_parent = _q(
+            conn,
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parent else "ready"
-        released = conn.execute(
+        released = _q(
+            conn,
             "UPDATE tasks SET status = ?, assignee = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL, category = NULL, "
@@ -8884,7 +8980,8 @@ def grant_go(
                         status="reclaimed",
                         summary="task archived by structured GO action",
                     )
-                    conn.execute(
+                    _q(
+                        conn,
                         "UPDATE tasks SET status = 'archived', current_run_id = NULL, "
                         "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                         "status_changed_at = ? "
@@ -8901,7 +8998,8 @@ def grant_go(
                     archived_targets.append(target_id)
                 else:
                     target_status = normalized_action["status"]
-                    conn.execute(
+                    _q(
+                        conn,
                         "UPDATE tasks SET status = ?, current_run_id = NULL, "
                         "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                         "status_changed_at = ? "
@@ -8929,7 +9027,8 @@ def grant_go(
         }
         _append_event(conn, task_id, "unblocked", {"status": new_status})
         _append_event(conn, task_id, "go_granted", audit_payload)
-        conn.execute(
+        _q(
+            conn,
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
             (
@@ -9570,21 +9669,23 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
-        row = conn.execute(
+        row = _q(
+            conn,
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        conn.execute(
+        _q(
+            conn,
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        cur = _q(conn, "DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
@@ -9599,7 +9700,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        cur = _q(conn, "DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
         # Children gated on the deleted task lose that gate. Remember them
@@ -9607,16 +9708,17 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # parent-less todo cards board-wide, so the promotion below must be
         # scoped to exactly these former children.
         former_children = [
-            r["child_id"] for r in conn.execute(
+            r["child_id"] for r in _q(
+                conn,
                 "SELECT child_id FROM task_links WHERE parent_id = ?",
                 (task_id,),
             ).fetchall()
         ]
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        _q(conn, "DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        _q(conn, "DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     # Scoped promotion for the deleted task's former children whose LAST
     # open gate was the deleted parent (i.e. no remaining unfinished
@@ -9624,7 +9726,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if former_children:
         with write_txn(conn):
             for cid in former_children:
-                open_parent = conn.execute(
+                open_parent = _q(
+                    conn,
                     "SELECT 1 FROM tasks t "
                     "JOIN task_links l ON l.parent_id = t.id "
                     "WHERE l.child_id = ? "
@@ -9632,7 +9735,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
                     (cid,),
                 ).fetchone()
                 if open_parent is None:
-                    cur = conn.execute(
+                    cur = _q(
+                        conn,
                         "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'todo'",
                         (cid,),
@@ -11522,7 +11626,8 @@ def _scope_recut_count(conn: sqlite3.Connection, task_id: str) -> int:
     scope re-cut rounds the card has already burned, driving
     :data:`_SCOPE_RECUT_CEILING`.
     """
-    rows = conn.execute(
+    rows = _q(
+        conn,
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff'",
         (task_id,),
     ).fetchall()
@@ -15904,7 +16009,8 @@ def gc_events(
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
-        cur = conn.execute(
+        cur = _q(
+            conn,
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
             (cutoff,),
@@ -16129,7 +16235,8 @@ def list_runs(
 
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
-    row = conn.execute(
+    row = _q(
+        conn,
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
