@@ -2191,18 +2191,54 @@ _PG_CFG_CACHE: Any = _PG_CFG_UNSET
 
 
 def _kanban_root_config() -> dict:
-    """INSTANCE-ROOT config.yaml, einmal pro Prozess gecacht (nur wenn die
-    Env ``HERMES_KANBAN_BACKEND`` NICHT gesetzt ist — dann entscheidet Env
-    allein und wir laden gar keine Config, bleiben also auf dem heißen
-    SQLite-Pfad kostenfrei)."""
+    """Die EINE Quelle der Wahrheit für das Kanban-Backend: die ``config.yaml``
+    im INSTANZ-ROOT (``get_default_hermes_root()``), einmal pro Prozess gecacht.
+
+    Bewusst NICHT ``load_config()``: das folgt der profil-scoped ``HERMES_HOME``
+    (bei Workern ``<root>/profiles/<rolle>``) und läse dort die Profil-Config, die
+    KEIN ``kanban.backend`` trägt → stiller SQLite-Default, während Gateway/
+    Dashboard/Bridge auf Postgres laufen (Split-Brain, 2026-11-14).
+    ``get_default_hermes_root()`` liefert auch unter profil-scoped ``HERMES_HOME``
+    den echten Root, sodass JEDER Prozess (inkl. Worker) dasselbe Backend erbt.
+    Tests bleiben isoliert: conftest sandboxed ``HERMES_HOME`` auf ein Tempdir,
+    dem ``get_default_hermes_root()`` folgt."""
     global _PG_CFG_CACHE
     if _PG_CFG_CACHE is _PG_CFG_UNSET:
+        _PG_CFG_CACHE = {}
         try:
-            from hermes_cli.config import load_config
-            _PG_CFG_CACHE = load_config() or {}
+            import yaml  # noqa: PLC0415
+            from hermes_constants import get_default_hermes_root  # noqa: PLC0415
+            p = get_default_hermes_root() / "config.yaml"
+            if p.exists():
+                _PG_CFG_CACHE = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         except Exception:
             _PG_CFG_CACHE = {}
     return _PG_CFG_CACHE
+
+
+def _guard_no_silent_sqlite_on_pg_instance() -> None:
+    """Fail-closed: ein Prozess darf NIE still auf SQLite arbeiten, während der
+    Instanz-Root ``kanban.backend=postgres`` sagt (Worker-Split-Brain-Schutz).
+
+    Greift nur, wenn KEINE explizite ``HERMES_KANBAN_BACKEND``-Env gesetzt ist
+    (die ist eine bewusste Operator-/Test-Wahl und wird geehrt). Ohne Env-Override
+    und mit Instanz-Root=postgres, aber einem SQLite-Pfad voraus → harter Abbruch
+    mit klarer Meldung statt stiller Fehlleitung."""
+    if os.environ.get("HERMES_KANBAN_BACKEND", "").strip():
+        return  # explizite Wahl (Operator/Test) — geehrt, kein Abbruch
+    try:
+        import kanban_backend  # noqa: PLC0415
+        root_is_pg = kanban_backend.is_postgres(_kanban_root_config())
+    except Exception:
+        return
+    if root_is_pg:
+        raise RuntimeError(
+            "FAIL-CLOSED: Instanz-Root sagt kanban.backend=postgres, aber dieser "
+            "Prozess würde SQLite öffnen. Abbruch statt Split-Brain — ein Worker "
+            "darf nie auf SQLite arbeiten, während die Instanz auf Postgres läuft. "
+            "Prüfe HERMES_HOME/Profil-Config, oder setze HERMES_KANBAN_BACKEND "
+            "explizit, wenn SQLite wirklich gewollt ist."
+        )
 
 
 def _kanban_is_postgres() -> bool:
@@ -2331,6 +2367,9 @@ def connect(
     """
     if _kanban_is_postgres():
         return _pg_connect()
+    # Fail-closed: never open SQLite while the instance-root says postgres and no
+    # explicit env override chose sqlite (worker split-brain guard, B1.1).
+    _guard_no_silent_sqlite_on_pg_instance()
     if db_path is not None:
         path = db_path
     else:
